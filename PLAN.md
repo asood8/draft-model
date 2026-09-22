@@ -1,10 +1,12 @@
-# Project Plan: A Distilled Draft Model for Speculative Decoding
+# Project Plan: Speculative Decoding on a Laptop CPU, from Scratch
 
-Train a small draft model that makes speculative decoding of **Qwen3-4B** measurably faster on a single
-**T4 GPU**. Along the way, build the decoder from scratch, study which distillation choices actually raise
-acceptance, and check measured speedups against a cost model.
+Build a C++ inference engine for Qwen3, add speculative decoding to it, and distill a draft model that matches it.
+All timing happens on a laptop CPU (Intel i7-13620H). Kaggle is used for training and for the PyTorch runs that
+don't fit on the laptop.
 
-This is a living document. Section 14 tracks decisions and open questions.
+This version replaces the earlier plan, which targeted a T4 GPU; it is still in the git history. Expect
+**10–14 weeks of part-time work**. **Milestones 3 and 4 are natural stopping points** that are resume-worthy on
+their own. Section 17 tracks decisions and open questions.
 
 ---
 
@@ -12,314 +14,588 @@ This is a living document. Section 14 tracks decisions and open questions.
 
 0. [TL;DR](#0-tldr)
 1. [Goal, deliverables, success criteria](#1-goal-deliverables-success-criteria)
-2. [Background: where the speedup comes from](#2-background-where-the-speedup-comes-from)
-3. [Changes from the original idea](#3-changes-from-the-original-idea)
-4. [Setup](#4-setup)
-5. [Phase 0: Feasibility](#5-phase-0-feasibility-24-evenings)
-6. [Phase 1: The decoder](#6-phase-1-the-decoder-12-weeks)
-7. [Phase 2: Distillation](#7-phase-2-distillation-23-weeks)
-8. [Phase 2b: Make the draft cheaper](#8-phase-2b-make-the-draft-cheaper-optional-1-week)
-9. [Phase 3: Experiments](#9-phase-3-experiments-2-weeks)
-10. [Phase 4: Release](#10-phase-4-release-a-few-days)
-11. [Timeline and milestones](#11-timeline-and-milestones)
-12. [Risks and mitigations](#12-risks-and-mitigations)
-13. [Positioning and related work](#13-positioning-and-related-work)
-14. [Decisions and open questions](#14-decisions-and-open-questions)
+2. [How the pieces fit](#2-how-the-pieces-fit)
+3. [The speedup model](#3-the-speedup-model)
+4. [Additions to the idea](#4-additions-to-the-idea)
+5. [Setup](#5-setup)
+6. [Milestone 0: Feasibility](#6-milestone-0-feasibility)
+7. [Milestone 1: PyTorch reference and quantization](#7-milestone-1-pytorch-reference-and-quantization)
+8. [Milestone 2: A correct C++ engine](#8-milestone-2-a-correct-c-engine)
+9. [Milestone 3: A fast engine](#9-milestone-3-a-fast-engine)
+10. [Milestone 4: Speculative decoding in the engine](#10-milestone-4-speculative-decoding-in-the-engine)
+11. [Milestone 5: Distillation on Kaggle](#11-milestone-5-distillation-on-kaggle)
+12. [Milestone 6: Write-up and release](#12-milestone-6-write-up-and-release)
+13. [Benchmarking rules](#13-benchmarking-rules)
+14. [Timeline](#14-timeline)
+15. [Risks and mitigations](#15-risks-and-mitigations)
+16. [Related work and references](#16-related-work-and-references)
+17. [Decisions and open questions](#17-decisions-and-open-questions)
 
 ---
 
 ## 0. TL;DR
 
-- **Speedup = tokens per round ÷ cost per round.** Distillation raises the first number by increasing the
-  acceptance rate α. CUDA graphs, layer pruning and vocabulary trimming lower the second by reducing the draft
-  cost ratio c. The project works on both.
-- **Pair:** Qwen3-0.6B as the draft, Qwen3-4B as the target, non-thinking mode, float16 on a T4 (Kaggle 2×T4).
-- **Main additions to the original idea:**
-  1. **An offline round simulator.** It is exact for greedy decoding and exact in distribution for sampling. γ
-     sweeps, the loss × data grid and checkpoint selection then cost one forward pass per model instead of full
-     decoding runs, which is what makes the experiment grid fit in Kaggle's GPU quota.
-  2. **A cost model with verification and overhead terms**, measured against a target baseline that is optimized
-     just as much (static cache + CUDA graphs), so speedups aren't inflated.
-  3. **A track for lowering c:** layer-pruned drafts recovered by distillation, a trimmed draft vocabulary, and
-     confidence-based early stopping. Together they give an α-versus-c Pareto plot.
-  4. **An SFT-on-target-text baseline loss**, to answer whether matching the target's full distributions is worth
-     it compared with plain fine-tuning on the target's outputs.
-  5. **Engineering scaffolding:** a compute budget, a dev set kept separate from Spec-Bench, tests that run on a
-     CPU with tiny models, and a minimum viable project (MVP) cut line.
-- **Timeline:** about 9–10 weeks part-time. The MVP is done at about week 6.
+- **What you build**
+  - *C++ engine:* weight loading, the forward pass, 4-bit and 8-bit SIMD kernels, a thread pool that knows about
+    the CPU's two core types, KV cache, sampling, and the speculative decoding loop.
+  - *Python side:* a Qwen3 reference written from scratch, a quantization "twin" that reproduces the engine's
+    arithmetic, an export script, distillation (on Kaggle), and all testing and benchmarking.
+  - *Bridge:* pybind11. Python tokenizes and passes token IDs in. The whole generation loop runs in C++, so Python
+    overhead never touches the timings.
+- **The formula you're testing.** On a CPU, checking k tokens costs more than one normal step, so the formula gets
+  a measured verification term v(k):
+
+  speedup(γ) = τ(γ) ÷ (γ·c + v(γ+1)), where τ(γ) = (1 − α^(γ+1)) / (1 − α)
+
+- **Headline results you'll end up with**
+  - tokens per second for both models as a percentage of the laptop's memory-bandwidth ceiling, next to llama.cpp;
+  - the v(k) curve;
+  - predicted versus measured speedup across γ;
+  - a comparison of core and thread configurations;
+  - the speedup from distilled drafts on each Spec-Bench category.
+- **Main additions to the idea** (§4)
+  1. A quantization twin that also quantizes activations and the KV cache, so PyTorch predicts what the engine
+     computes.
+  2. The offline round simulator, so acceptance for every configuration is computed on Kaggle instead of by slow
+     decoding on the CPU.
+  3. One k-token kernel used for normal decoding, verification and prompt processing, which makes greedy
+     equivalence bit-exact by construction.
+  4. c measured as a function of context length, because the draft's KV cache is nearly as large as the target's.
+  5. The draft's precision (4-bit vs 8-bit) treated as a trade-off between c and α.
+  6. The distillation track run in parallel with the engine work.
 
 ---
 
 ## 1. Goal, deliverables, success criteria
 
-**Headline question:** How much can distillation, together with making the draft cheaper, speed up Qwen3-4B on
-a T4? And which training-data and loss choices matter under greedy decoding versus sampling?
+**Headline question:** How close can a from-scratch CPU engine get to the laptop's memory-bandwidth ceiling, and
+how much faster can speculative decoding with a distilled draft make Qwen3-4B on it? Checking γ+1 tokens isn't
+free on a CPU, so part of the answer is how much each extra guess costs.
 
 **Deliverables**
 
-- A Python package (working name `specdraft`) containing the speculative decoder (dynamic- and static-cache
-  backends), the distillation trainer, the offline evaluator and the benchmark harness, all with tests.
-- One or more distilled drafts on the Hugging Face Hub, with model cards.
-- A README and write-up built around a headline table and a handful of plots (listed in §9.4).
-- Reproducible results: every number traces back to a config, a git commit and a hardware record.
+- A C++ engine with Python bindings. It builds with `pip install -e .` on Windows and has tests at every layer.
+- A PyTorch Qwen3 reference, a quantization twin and an export script.
+- Distilled drafts on the Hugging Face Hub, in safetensors, in the engine's format and as GGUF.
+- A README and write-up that open with tokens per second, the percentage of the bandwidth ceiling, and the
+  speedup, and that include a "what didn't work" section.
 
-**Success criteria** (replace the placeholders with real numbers after Phase 0)
+**Success criteria** (replace the placeholders after Milestone 0)
 
-- **Correct.** Greedy output is identical to plain greedy decoding, apart from documented float16 near-ties.
-  The acceptance-rule and end-to-end distribution tests pass.
-- **Consistent.** Offline simulated tokens per step match online decoding exactly for greedy, and within Monte
-  Carlo error for sampling.
-- **Better.** The distilled draft beats the off-the-shelf draft on tokens per target step in at least 5 of the 6
-  Spec-Bench categories, and on wall-clock speedup on average.
-- **Explained.** Predicted speedup is within about 10% of measured speedup for the main configurations, or the gap
-  is explained.
-- **Competitive.** The custom decoder is at least as fast as Hugging Face's assisted generation with the same
-  draft and γ.
-
----
-
-## 2. Background: where the speedup comes from
-
-Each round, the draft proposes γ tokens autoregressively and the target scores all of them in one forward pass.
-Each guess is accepted with probability min(1, p/q), where p and q are the target's and draft's probabilities.
-At the first rejection, a replacement is sampled from max(0, p − q), renormalized. If every guess is accepted,
-the target's final position supplies one bonus token. The output distribution is exactly the target's
-(Leviathan et al., 2023; Chen et al., 2023), so quality cannot change. Only speed does.
-
-**Tokens per round.** With an i.i.d. per-token acceptance rate α and γ guesses per round:
-
-$$\tau(\gamma) = \frac{1 - \alpha^{\gamma+1}}{1 - \alpha}$$
-
-- **Sampling:** the acceptance probability at a position is Σₓ min(p(x), q(x)) = 1 − TVD(p, q).
-- **Greedy:** a guess is accepted exactly when argmax p = argmax q.
-
-**Cost per round.** Let t_T be one target decode step, t_D one draft step, t_V(k) a target forward pass over k
-tokens, and t_O the per-round overhead (sampling, the acceptance test, cache bookkeeping, Python). With
-c = t_D/t_T, v = t_V(γ+1)/t_T and o = t_O/t_T:
-
-$$S(\gamma) = \frac{\tau(\gamma)}{\gamma c + v + o}$$
-
-Leviathan et al.'s formula is the special case v = 1, o = 0. At batch size 1 on a T4, v should be close to 1
-because the step is memory-bound, but not exactly 1. Kaggle's CPUs are slow, so o can matter. Measure both
-rather than assuming them.
-
-**Predicted speedup at the best γ** (v = 1, o = 0, γ ≤ 10; the best γ is in parentheses):
-
-| α \ c | 0.05 | 0.10 | 0.15 | 0.20 | 0.30 | 0.45 | 0.60 |
-|---|---|---|---|---|---|---|---|
-| 0.6 | 1.92× (4) | 1.67× (3) | 1.51× (2) | 1.40× (2) | 1.23× (1) | 1.10× (1) | 1.00× (1) |
-| 0.7 | 2.35× (6) | 1.98× (4) | 1.75× (3) | 1.58× (3) | 1.37× (2) | 1.17× (1) | 1.06× (1) |
-| 0.8 | 3.09× (8) | 2.47× (6) | 2.11× (5) | 1.87× (4) | 1.55× (3) | 1.28× (2) | 1.12× (1) |
-| 0.9 | 4.57× (10) | 3.43× (10) | 2.78× (8) | 2.37× (7) | 1.87× (5) | 1.46× (3) | 1.23× (2) |
-
-Two things to read from this table:
-
-- At c ≈ 0.45, even a strong draft (α = 0.8) gives only about 1.3×. Cost has to come down before acceptance
-  matters much.
-- At c ≈ 0.15–0.2, cutting c in half is worth about as much as raising α from 0.7 to 0.8.
-
-**Back-of-envelope for this pair on a T4.** These are predictions for Phase 0 to check.
-
-| | Qwen3-0.6B | Qwen3-4B |
-|---|---|---|
-| Layers / hidden size | 28 / 1024 | 36 / 2560 |
-| Parameters (lm_head is tied to the embedding) | ~0.60B (0.44B non-embedding) | ~4.0B (3.6B non-embedding) |
-| Bytes read per decode step in fp16 | ~1.2 GB (the lm_head alone is ~0.31 GB) | ~8.0 GB |
-| Memory-bound step at ~250 GB/s effective | ~5 ms | ~32 ms |
-
-- **Memory bandwidth** alone gives c ≈ 0.15.
-- **In eager PyTorch** each layer launches dozens of small kernels, so a draft step issues on the order of a
-  thousand launches. That puts the draft at roughly 10–25 ms per step, bound by the CPU rather than the GPU,
-  for an **eager c of about 0.4–0.7**, which is where speculative decoding stops paying off. The target's ~32 ms
-  of GPU work hides most of its own launch overhead.
-- **CUDA graphs** therefore mostly help the draft. Expect a **compiled c of about 0.15–0.25**.
+- **Correct**
+  - The reference model matches Hugging Face within float32 rounding.
+  - The engine's greedy output matches the PyTorch model token for token.
+  - Speculative greedy output matches plain greedy **bit for bit**.
+  - The sampling tests pass.
+- **Fast**
+  - Engine generation speed is at least X% of the measured bandwidth ceiling for both models.
+  - The gap to llama.cpp at the same quantization and thread count is explained.
+- **Explained:** predicted speedup is within about 10% of measured speedup across γ, or the gap is explained.
+- **Better:** the distilled draft beats the off-the-shelf draft on tokens per round and end-to-end speedup,
+  averaged over Spec-Bench categories.
 
 ---
 
-## 3. Changes from the original idea
+## 2. How the pieces fit
 
-| Change | Why |
-|---|---|
-| Add an **offline round simulator** (§7.5) that is exact for greedy and exact in distribution for sampling | The original plan's online grid (drafts × losses × 3 decoding modes × γ 1–8 × 6 categories) would take hundreds of T4 GPU-hours. Offline, the whole grid costs minutes per draft, and online runs only confirm and time selected points. |
-| **Refine the cost model** with a verification term v and an overhead term o | Makes the predicted-vs-measured plot explainable instead of just "close" or "off". |
-| **Compare against an equally optimized target** (static cache + `torch.compile`) | Otherwise part of the reported "speculative" speedup is really a compile speedup. |
-| Add **SFT on target text** (sequence-level KD) as a baseline loss, and JSD as an optional one | Answers "are the target's full distributions worth it?". JSD is one of DistillSpec's candidates. |
-| **Trim the training grid**: 4 losses on target-generated data, then the best 2 losses on the other sources | Fits the Kaggle quota (§4.3) while keeping both comparisons. |
-| Add a **cost-reduction track** (§8): layer pruning + distillation, vocab trimming, confidence-based early stopping | The 0.6B draft has 28 layers against the target's 36, so c is the binding constraint on a T4. This track also produces an α–c Pareto plot. |
-| Keep a **dev set separate from Spec-Bench** | Model selection on Spec-Bench would contaminate the final numbers. |
-| Add **on-policy distillation** as a stretch goal | Regenerating draft outputs during training (GKD/DistillSpec style) is the natural next step after fixed draft-generated data. |
-| Make the **tests run on a CPU with tiny random Qwen3 configs** | Development happens on a laptop, and Kaggle is used only for GPU work. |
-| Define an **MVP cut line** (§11) | Keeps a finished, publishable project if time runs short. |
-| **Time on a single GPU** (both models on one T4) | Matches real deployment. Two GPUs are for training and generating data only. |
+```mermaid
+flowchart LR
+  subgraph PY["Python"]
+    TOK["HF tokenizer + chat template"]
+    REF["PyTorch reference + quantization twin"]
+    EXP["Export script"]
+    DIST["Distillation (Kaggle)"]
+    BENCH["Tests, benchmarks, plots"]
+  end
+  subgraph CPP["C++ engine (pybind11 module)"]
+    GEN["generate(): plain or speculative loop"]
+    FWD["Forward pass: kernels, KV cache, thread pool"]
+  end
+  TOK -->|token IDs| GEN
+  GEN -->|token IDs + timings| BENCH
+  DIST -->|distilled draft| EXP
+  EXP -->|model.bin| FWD
+  GEN --> FWD
+  REF -.->|compare per-layer hidden states| FWD
+```
 
----
+- **Development model:** do all development on **Qwen3-0.6B**, and bring in the 4B once quantization works.
+- **Why the 4B needs special handling:** it takes 16 GB in float32, which the laptop (16 GB of RAM) can't hold. Run
+  its PyTorch reference in bfloat16 locally, or in fp32 on Kaggle.
 
-## 4. Setup
-
-### 4.1 Models
-
-- **Target:** `Qwen/Qwen3-4B`. **Draft initialization:** `Qwen/Qwen3-0.6B`. Both are Apache-2.0, share the
-  tokenizer and chat template, and run in **non-thinking mode** (`enable_thinking=False`).
-- **Why stay with Qwen3:** it is pure attention, so rolling a cache back is just a crop. Families that mix in
-  linear-attention or recurrent layers can't be cropped and need state snapshots per drafted token, which is a
-  different project.
-- **Why not Qwen3-1.7B as the draft:** it has the same 28 layers and about three times the bytes per step, so its
-  cost ratio would be far worse.
-- **Variant to consider:** `Qwen3-4B-Instruct-2507`, a stronger target that has no thinking mode. There is no
-  matching 0.6B update, so the draft–target mismatch is larger and distillation matters more. Its tokenizer
-  should match, but its chat template differs, so verify both before using it. Decide in Phase 0 by measuring
-  baseline acceptance (§14).
-
-### 4.2 Day-one gotchas (checklist)
-
-- [ ] **Vocabulary padding.** Both configs pad the embedding to 151,936 rows, while `len(tokenizer)` is about
-      151,669. Slice logits to `len(tokenizer)` everywhere (decoding, losses, metrics) through **one shared
-      helper**. The padded rows carry junk logits that would otherwise receive probability mass.
-- [ ] **Thinking mode.** Pass `enable_thinking=False` for both models. The non-thinking template inserts an empty
-      `<think></think>` block into the generation prompt, so build every prompt through the same
-      `apply_chat_template` call.
-- [ ] **Tokenizer and template identity.** Assert the same vocabulary, the same special tokens and byte-identical
-      template output for a few conversations, including multi-turn ones.
-- [ ] **End-of-sequence.** Stop on `<|im_end|>` (and `<|endoftext|>`). Handle an EOS that lands in the middle of
-      an accepted draft block, and truncate at `max_new_tokens` partway through a round.
-- [ ] **float16.** The T4 has no bfloat16, and Qwen3 was trained in bfloat16. Compare fp16 against fp32 logits for
-      both models and look for inf/NaN and very large activations (§5).
-- [ ] **Sampling warps.** If you use top-p or top-k, p must be the *warped* target distribution and q must be
-      *exactly* the distribution the draft sampled from. Correctness only needs that; efficiency needs the two to
-      be similar.
-- [ ] **Tied embeddings.** Both models tie the input embedding to the lm_head. This matters for freezing
-      embeddings during training and for vocab trimming (§8.2).
-
-### 4.3 Hardware and compute budget
-
-- **Kaggle, 2×T4 (16 GB each).** About 30 GPU-hours a week, with sessions capped at around 12 hours (check the
-  current limits).
-  - *Training:* GPU0 runs the target (inference only) and GPU1 trains the draft.
-  - *Timing:* put both models on **one** T4, as in deployment. Together they take about 9.2 GB of weights.
-- **Local Windows laptop:** CPU-only development and tests with tiny random models. No `torch.compile` is needed
-  locally.
-- **Fallbacks:** Colab (T4 or L4), or a few hours on a rented GPU. An L4 also supports bfloat16 if fp16 turns out
-  to be broken (§12).
-
-**Rough GPU budget.** Replace these estimates with Phase 0 measurements.
-
-| Job | Estimate |
-|---|---|
-| Phase 0 measurements and dev-set references | ~3 h |
-| Spec-Bench target references (greedy, T=0.7, T=1.0) | 2–5 h |
-| Target-generated training data (~30k responses, ~12M tokens) | 3–8 h (vLLM if it runs on a T4 in your version; otherwise batched HF `generate` on both GPUs) |
-| Draft-generated training data | 1–2 h |
-| Pilot run plus 8 grid runs of ~10M response tokens each | 15–20 h |
-| Scale-up run (~50M tokens) | 7–10 h |
-| Phase 2b pruning runs (3 × ~15M tokens, on smaller models) | 5–8 h |
-| Offline evaluation (one forward pass per model per reference set) | 3–5 h in total |
-| Online timing runs | 12–20 h |
-| **Total** | **~50–75 GPU-hours**, about 2–3 weeks of quota spread over the project |
-
-Start generating target data during Phase 1. It only needs the GPU, not the decoder.
-
-### 4.4 Software and workflow
-
-- Python 3.11, PyTorch 2.x and `transformers`. **Pin exact versions** in `pyproject.toml`, because the cache API
-  changes between releases. Other dependencies: `datasets`, `bitsandbytes` (8-bit AdamW), `scipy` (chi-square
-  tests), `pytest` and `matplotlib`. Optional: `vllm` for fast data generation and `wandb` for logging.
-- **Loop:** write code in this repo → a Kaggle notebook runs
-  `pip install git+https://github.com/asood8/draft-model@<commit>` → checkpoints and large artifacts go to the
-  HF Hub (the token lives in Kaggle Secrets) → small JSON results get committed to `results/`.
-- **Every run writes a JSON record** containing the config, git commit, torch/transformers/CUDA versions, GPU name
-  and seeds.
-
-### 4.5 Proposed repo layout
+**Proposed repo layout**
 
 ```
 draft-model/
 ├── PLAN.md
 ├── README.md
-├── pyproject.toml
-├── src/specdraft/
-│   ├── models.py      # loading, vocab slicing, chat templates, fp16 checks
-│   ├── sampling.py    # temperature/top-p/top-k warps, accept_or_resample
-│   ├── decode.py      # speculative loop; DynamicCache and StaticCache backends
-│   ├── baselines.py   # plain target, HF assisted generation, prompt lookup
-│   ├── offline.py     # 1-TVD, top-1 match, round simulator, predicted speedup
-│   ├── data.py        # prompt mixing, decontamination, response generation
-│   ├── losses.py      # sft, fkl, rkl, tvd, jsd (chunked)
-│   ├── train.py       # two-GPU distillation loop, checkpoint/resume
-│   ├── prune.py       # layer pruning, vocab trimming
-│   └── bench.py       # Spec-Bench runner, timing protocol
-├── configs/           # one YAML file per experiment
-├── scripts/           # CLI entry points
-├── notebooks/         # thin Kaggle notebooks that install this repo
-├── tests/             # CPU tests with tiny random Qwen3 models
-└── results/           # JSON records and plots (small files only)
+├── pyproject.toml            # scikit-build-core: `pip install -e .` builds the C++ extension
+├── CMakeLists.txt
+├── engine/
+│   ├── src/
+│   │   ├── model_file.cpp    # memory-mapped weights file + tensor directory
+│   │   ├── forward.cpp       # layers, attention, KV cache, forward(tokens[k], pos)
+│   │   ├── kernels/          # scalar reference, AVX2 + AVX-VNNI; Q8/Q4, k-token versions
+│   │   ├── threadpool.cpp    # persistent threads, spin barriers, core pinning
+│   │   ├── sampling.cpp      # warps, softmax, accept_or_resample
+│   │   └── speculative.cpp   # round loop
+│   ├── bindings.cpp          # pybind11 module
+│   └── tests/                # C++ unit tests (SIMD kernels vs scalar reference)
+├── python/specdraft/
+│   ├── reference.py          # Qwen3 from scratch
+│   ├── quant.py              # the engine's number formats, bit for bit
+│   ├── twin.py               # reference + weight/activation/KV quantization
+│   ├── export.py             # fuse QKV and gate/up, quantize, write model.bin
+│   ├── sampling.py           # Python accept_or_resample (test oracle)
+│   ├── offline.py            # 1 − TVD, top-1 match, round simulator
+│   ├── data.py, losses.py, train.py   # distillation
+│   └── bench.py              # benchmark harness for the engine and llama.cpp
+├── tests/                    # pytest: reference vs HF, engine vs twin, sampling
+├── notebooks/                # Kaggle
+├── configs/
+└── results/                  # JSON records, plots, milestone notes
 ```
 
 ---
 
-## 5. Phase 0: Feasibility (2–4 evenings)
+## 3. The speedup model
 
-**Goal:** know c, v, o, the baseline α and whether fp16 works before writing the real decoder.
+Speculative decoding, briefly: the draft guesses γ tokens, the target checks all of them in one pass, and each
+guess is accepted with probability min(1, p/q). At the first rejection, a replacement is sampled from
+max(0, p − q), renormalized. If every guess is accepted, the target adds one bonus token. The output follows the
+target's distribution exactly.
 
-1. **Sanity checks.**
-   - Load both models in fp16 and run the §4.2 checklist.
-   - On about 20 prompts, compare fp16 and fp32 logits: max absolute difference, top-1 agreement, and any inf or
-     NaN.
-   - Record the largest activation in each layer with forward hooks. The 4B model in fp32 won't fit on a T4, so
-     use the CPU for its fp32 reference; a handful of prompts is enough.
-2. **Microbenchmarks.**
-   - Measure t_T, t_D and t_V(k) for k = 1…9, at context lengths of about 256 and 1024.
-   - Run each in eager mode and with a static cache plus `torch.compile(mode="reduce-overhead")`.
-   - Protocol: warm up first, call `torch.cuda.synchronize()` around the timed region, and take the median of at
-     least 20 runs.
-3. **End-to-end baselines** on a small dev subset (not Spec-Bench):
-   - plain target, both eager and compiled;
-   - HF assisted generation, once with a fixed γ = 4 (set `num_assistant_tokens`, a `"constant"` schedule, and
-     disable `assistant_confidence_threshold` in the assistant's generation config) and once with the defaults;
-   - prompt lookup decoding (`prompt_lookup_num_tokens`).
-4. **Baseline acceptance.**
-   - Generate target references (greedy and T=1.0) for about 50 dev prompts per category.
-   - Compute the top-1 match rate, the mean 1 − TVD, and simulated τ(γ) for γ = 1…8.
-   - Write the simulator now (§7.5). It is about 30 lines.
-5. **Predict.** Plug the measurements into S(γ) and write a one-page `results/phase0.md`.
+$$\text{speedup}(\gamma) = \frac{\tau(\gamma)}{\gamma c + v(\gamma+1) + o}, \qquad \tau(\gamma) = \frac{1-\alpha^{\gamma+1}}{1-\alpha}$$
+
+- **α:** per-token acceptance. For sampling it is 1 − TVD(p, q); for greedy it is the top-1 match rate.
+- **c:** time for one draft step ÷ time for one target step.
+- **v(k):** time for the target to process k tokens in one pass ÷ time for one normal target step. The original
+  formula assumes v = 1.
+- **o:** per-round overhead ÷ one target step. On a CPU the main part is **sampling**: each round needs about 2γ+1
+  softmaxes over 151,669 entries, which can be a few percent of a target step. Measure o, and parallelize the
+  softmax if it matters.
+
+**Why v(k) > 1 on a CPU.**
+
+- A single-token step is memory-bound: it streams all the weights once and does little math per byte.
+- With k tokens, each weight block is unpacked once and multiplied into k activation vectors. Bytes stay the same,
+  but integer math grows with k.
+- Once the math takes longer than streaming the weights, v(k) climbs roughly linearly.
+- **The better your k-token kernel, the flatter v(k), the larger the best γ, and the bigger the speedup.** Kernel
+  quality turns directly into speculative speedup.
+
+**Example with made-up numbers (α = 0.7, c = 0.15):**
+
+- *Four guesses per round:* if v(5) = 1.5, the speedup is 1.32×.
+- *Two guesses per round:* if v(3) = 1.2, the speedup is 1.46×.
+
+As checking more tokens gets more expensive, the best γ drops.
+
+**Best-γ speedup with a linear model v(k) = 1 + s·(k − 1)** (o = 0; best γ in parentheses):
+
+| c | α | s = 0 (the original formula) | s = 0.05 | s = 0.10 | s = 0.20 |
+|---|---|---|---|---|---|
+| 0.15 | 0.6 | 1.51× (2) | 1.40× (2) | 1.31× (2) | 1.19× (1) |
+| 0.15 | 0.7 | 1.75× (3) | 1.58× (3) | 1.46× (2) | 1.29× (2) |
+| 0.15 | 0.8 | 2.11× (5) | 1.87× (4) | 1.69× (3) | 1.44× (3) |
+| 0.22 | 0.7 | 1.53× (3) | 1.42× (2) | 1.34× (2) | 1.20× (1) |
+| 0.22 | 0.8 | 1.79× (4) | 1.63× (3) | 1.51× (3) | 1.33× (2) |
+| 0.30 | 0.7 | 1.37× (2) | 1.29× (2) | 1.22× (2) | 1.13× (1) |
+| 0.30 | 0.8 | 1.55× (3) | 1.44× (3) | 1.36× (2) | 1.22× (2) |
+
+Realistic targets on this laptop are about 1.3–1.7× with the off-the-shelf draft, and closer to 2× only if
+distillation pushes α toward 0.8 *and* the k-token kernel keeps s small. The table is the prediction the
+measurements get checked against.
+
+**Back-of-envelope for this laptop.** The bandwidth figure is an assumption until Milestone 0 measures it.
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| Layers / hidden / head_dim / query heads : KV heads | 28 / 1024 / 128 / 16 : 8 | 36 / 2560 / 128 / 32 : 8 |
+| Weights read per token, 4-bit (4.5 bits/weight incl. scales) | ~0.34 GB | ~2.26 GB |
+| Weights read per token, 8-bit (8.5 bits/weight) | ~0.63 GB | ~4.27 GB |
+| fp16 KV cache per token of context | ~115 KB | ~147 KB |
+| KV cache read per step at 2k context | ~0.23 GB | ~0.30 GB |
+| Speed ceiling at 40 GB/s, 4-bit, 256-token context | ~110 tok/s | ~17 tok/s |
+
+**c grows with context length.** The draft has almost as much KV cache per token as the target (28 × 8 × 128
+against 36 × 8 × 128), but only about a seventh of the weight bytes. With 4-bit weights for both models, the
+bandwidth-bound c is:
+
+| Context | 256 | 1k | 2k |
+|---|---|---|---|
+| c, draft 4-bit / target 4-bit | ~0.16 | ~0.19 | ~0.22 |
+| c, draft 8-bit / target 4-bit | ~0.29 | ~0.31 | ~0.34 |
+
+A float32 KV cache would make this worse: at 2k context the draft's KV bytes would exceed its 4-bit weights. So
+the KV cache is stored in fp16, and 8-bit KV for the draft is a stretch goal.
+
+---
+
+## 4. Additions to the idea
+
+| Addition | Why |
+|---|---|
+| A **quantization twin**: fake-quantize activations (8-bit blocks at every matmul input) and round the KV cache to fp16, not just the weights | The engine quantizes activations too. With the twin, PyTorch logits track the engine closely, perplexity numbers describe what the engine actually runs, and acceptance measured on Kaggle transfers to the engine. |
+| **An offline round simulator** (§11.6), run on the twin | Online decoding on the laptop runs at about 15–30 tok/s, so a full Spec-Bench pass per configuration would take hours. Offline, acceptance for every draft × decoding mode × γ × category takes minutes on Kaggle. The engine confirms a subset and does all the timing. |
+| **One templated k-token kernel** for single tokens, verification and prompt processing | Same code, same summation order, so greedy speculative decoding is bit-exact by construction. Prompt processing comes for free. |
+| **c measured against context length**; 8-bit draft KV as a stretch goal | The draft's KV cache is nearly as large as the target's (§3). |
+| **Draft precision as a trade-off** (4-bit vs 8-bit; 8-bit output layer) | Going from 4-bit to 8-bit roughly doubles c (0.16 → 0.29), but a 4-bit 0.6B may lose acceptance. Measure both. |
+| **Thread configuration per phase** | Draft steps are limited by thread synchronization, target steps by bandwidth, and verification by compute. The best cores and thread counts may differ for each. |
+| **A read-only bandwidth test** next to STREAM | Inference only *reads* weights. STREAM's copy and triad kernels include writes and understate the ceiling. |
+| **Q4_0 and Q8_0 in llama.cpp** | The engine uses the same block layouts, so the comparison is like for like. K-quants would not be. |
+| **The offset trick** as an alternative to the sign trick | w·x = q·x − 8·Σx with precomputed activation block sums skips the abs/sign work in every block. Try both. |
+| **Sampling overhead o** in the formula | Softmax over a 152k vocabulary for about 2γ+1 positions per round isn't free on a CPU. |
+| **The distillation track runs in parallel** | It only depends on Milestone 1's twin, so Kaggle jobs can start around week 3 while the engine is being written. |
+| **Tiny random models** exported to the engine format | Enable exact-enumeration sampling tests and a fast CI. |
+| **Toolchain setup in Milestone 0** | No compiler, CMake or Ninja is installed yet (checked 2026-09-21). |
+
+---
+
+## 5. Setup
+
+### 5.1 Hardware (checked 2026-09-21)
+
+- **CPU:** Intel Core i7-13620H (Raptor Lake).
+  - 6 performance cores with hyperthreading plus 4 efficiency cores: 10 cores, 16 threads.
+  - Supports AVX2, FMA, F16C and **AVX-VNNI**, but **not AVX-512**. 24 MB L3 cache.
+- **Memory:** 16 GB DDR4-3200 as two 8 GB modules (dual channel).
+  - **51.2 GB/s theoretical.** Expect about 35–45 GB/s of measured read bandwidth.
+- **No NVIDIA GPU.** Kaggle (2×T4) handles training, full-size PyTorch runs of the 4B, and offline evaluation.
+- **RAM limits:**
+  - 4B in fp32 (16 GB): doesn't fit.
+  - 4B in bfloat16 (8 GB): fits for short forward passes with other programs closed.
+  - The engine's 4-bit models (2.3 GB + 0.34 GB): fit easily.
+
+### 5.2 Toolchain
+
+- **Visual Studio Build Tools** (2022 or newer), with the "Desktop development with C++" workload plus "C++ Clang
+  tools for Windows". This provides MSVC, clang-cl, CMake and Ninja.
+- **Build natively, not in WSL.** The experiments with the two core types need real control over which cores
+  threads run on (`GetSystemCpuSetInformation`, `SetThreadAffinityMask`, `SetThreadSelectedCpuSets`).
+- **Compiler flags**
+  - MSVC: `/O2 /arch:AVX2`. clang-cl: `-O2 -mavx2 -mfma -mf16c -mavxvnni`.
+  - **Never use `/fp:fast` or `-ffast-math`.** Reordered floating-point math breaks bit-exactness.
+  - Check for AVX-VNNI at runtime with CPUID and fall back to the scalar kernel.
+- **MSVC quirks:** there is no `std::aligned_alloc`, so use `_aligned_malloc`/`_aligned_free` (or rely on the
+  memory-mapped file's alignment). MSVC's OpenMP is old, which is one more reason for a custom thread pool.
+- **Python:** a venv with `torch` (CPU build), `transformers`, `tokenizers`, `safetensors`, `numpy`, `scipy`,
+  `pytest`, `pybind11`, `scikit-build-core` and `datasets`. Python 3.14 is installed. If any wheel is missing for
+  it, use a 3.12 or 3.13 venv.
+- **Profiling:** Intel VTune (free) for hotspots and memory bandwidth, plus the engine's own per-operation timers.
+- **llama.cpp:** use a prebuilt Windows CPU release or build it. Convert with `convert_hf_to_gguf.py` and quantize
+  to Q4_0 and Q8_0 with `llama-quantize`.
+
+### 5.3 Models
+
+- **Draft:** `Qwen/Qwen3-0.6B`. **Target:** `Qwen/Qwen3-4B`. Both are Apache-2.0, share a tokenizer, and run in
+  non-thinking mode.
+- **Why Qwen3:** it is pure attention, so rolling back rejected guesses just means moving a position counter.
+  Architectures with linear-attention or recurrent layers can't be rolled back that way.
+- **Variant to consider:** `Qwen3-4B-Instruct-2507`, a stronger target with no thinking mode. There's no matching
+  0.6B, so distillation has more to fix. Check that its tokenizer and chat template are compatible first (§17).
+
+### 5.4 Checklist of things that break from-scratch Qwen3s
+
+- [ ] **`head_dim` = 128 comes from the config.** It isn't hidden ÷ heads, which would give 64 for the 0.6B and 80
+      for the 4B.
+- [ ] **Queries and keys each get their own RMSNorm**, applied per head (the weight has shape `[head_dim]`)
+      **before RoPE**.
+- [ ] **RoPE rotates the two halves of each head** (element i pairs with i + 64), not adjacent pairs.
+      `rope_theta` = 1,000,000.
+- [ ] **RMSNorm:** eps 1e-6, computed in fp32, with a plain weight multiply (not Gemma's 1 + w).
+- [ ] **Attention:** no biases; scale 1/√128; grouped-query attention with 2 query heads per KV head (0.6B) or 4
+      (4B).
+- [ ] **MLP:** `down(silu(gate(x)) * up(x))`.
+- [ ] **Tied embeddings:** both models reuse the embedding matrix as the output layer
+      (`tie_word_embeddings: true`).
+- [ ] **Vocabulary padding:** there are 151,936 embedding rows but only about 151,669 tokenizer entries. Never
+      sample from, or compute, rows past `len(tokenizer)`.
+- [ ] **Thinking mode:** build every prompt in Python with `apply_chat_template(..., enable_thinking=False)` and
+      pass the same token IDs to the engine and to llama.cpp.
+- [ ] **End-of-sequence:** stop on `<|im_end|>` (151645) and `<|endoftext|>` (151643).
+- [ ] **Sampling warps:** p is the *warped* target distribution and q is *exactly* the distribution the draft
+      sampled from.
+
+---
+
+## 6. Milestone 0: Feasibility
+
+*Estimated time: an evening or two, plus toolchain setup.*
+
+1. **Toolchain.** Install everything in §5.2, then build a hello-world pybind11 module through scikit-build-core to
+   prove the build pipeline works.
+2. **Memory bandwidth.**
+   - Build STREAM (with `/openmp` or `-fopenmp`, arrays far larger than the L3 cache).
+   - Also write a **read-only** multi-threaded reduction benchmark.
+   - Run both at 6, 10 and 16 threads. The best read bandwidth is **your speed ceiling for the rest of the
+     project.**
+3. **llama.cpp baseline.**
+   - Convert both models to GGUF and quantize them to **Q4_0** and **Q8_0**.
+   - Use `llama-bench` to get generation and prompt-processing speed at 6, 10 and 16 threads.
+   - Run speculative decoding (4-bit target, 4-bit and 8-bit draft) at draft lengths 1–8, greedy, on about 20
+     chat-template prompts. Record the speedup over the 4B alone. Flag names change between versions, so check
+     `--help`.
+4. **Ceiling check.** Compute llama.cpp's generation speed as a percentage of the ceiling: tok/s × bytes per
+   token ÷ bandwidth.
+5. **Write it up** in `results/m0.md`.
 
 **Decision gates**
 
 | Observation | Action |
 |---|---|
-| fp16 overflows in the 4B | Keep the offending modules in fp32. If that fails, move to a bfloat16-capable GPU (L4) and note it in the write-up. |
-| Compiled c ≤ 0.2 | Proceed as planned. |
-| Compiled c > 0.3 | Pull Phase 2b (pruning) forward. It is the main lever. |
-| CUDA graphs don't work with HF's static cache in the pinned version | Try another `transformers` version, or capture the step manually with `torch.cuda.graphs`. If both fail, continue in eager mode and make pruning central. |
-| Baseline α is already very high in a category | Expect little distillation gain there, and say so in the write-up rather than chasing it. |
+| llama.cpp speculative decoding is clearly faster (≥ 1.2×) | Proceed as planned. |
+| Roughly break-even | Proceed, but lean on a cheaper draft (4-bit, trimmed vocabulary) and a flatter v(k). Beating llama.cpp's break-even would itself be a result. |
+| Slower at every draft length | The headline would become explaining why, which is weaker. Choose between continuing, splitting into two projects (the engine, and the GPU distillation plan in git history), or picking one. |
+| Measured bandwidth well below ~35 GB/s | Check the power mode and that both memory channels are in use before going further, because the ceiling sets every other number. |
 
 ---
 
-## 6. Phase 1: The decoder (1–2 weeks)
+## 7. Milestone 1: PyTorch reference and quantization
 
-### 6.1 Design
+*Estimated time: 1–2 weeks.*
 
-`seq` is the full token list (prompt plus generated tokens). **Invariant:** each model's KV cache holds a prefix of
-`seq`, and before any forward pass you feed exactly the tokens that cache is missing.
+### 7.1 Reference model
 
+- **What to build:** Qwen3 from scratch (embedding, RMSNorm, grouped-query attention with the q/k norms and RoPE,
+  SwiGLU MLP, tied output layer). Load the safetensors weights directly. This takes about 200 lines.
+- **Mirror the engine's interface:** give it `forward(tokens[k], pos)` with an explicit KV cache, so it can serve
+  as the oracle for normal decoding, verification and prompt processing later.
+- **Done when:** logits match Hugging Face's `Qwen3ForCausalLM` in fp32 within float32 rounding (max absolute
+  logit difference around 1e-3 or better), and a greedy continuation of more than 100 tokens is identical.
+- **Where to run it:** the 0.6B in fp32 on the laptop. The 4B in bfloat16 on the laptop, or in fp32 on Kaggle
+  (split across both T4s, or on Kaggle's CPU).
+
+### 7.2 Quantization that reproduces the engine exactly
+
+**Formats** (the same block layouts as ggml's Q8_0 and Q4_0):
+
+| Format | Layout | Size |
+|---|---|---|
+| 8-bit weights | 32 × int8 plus an fp16 scale | 34 bytes, 8.5 bits/weight |
+| 4-bit weights | 16 bytes of nibbles plus an fp16 scale; low nibbles are weights 0–15, high nibbles are weights 16–31; value = (q − 8)·d | 18 bytes, 4.5 bits/weight |
+| 8-bit activations | 32 × int8 in [−127, 127] plus an fp32 scale (and optionally the block sum, for the offset trick) | quantized once per matmul input |
+
+**Pin down the exact rounding rules and use them in both Python and C++.**
+
+- *8-bit:* d = max|w|/127, q = round(w/d) with halves rounded away from zero.
+- *4-bit:* following ggml's Q4_0, d = (the value with the largest magnitude, sign kept) / −8, then
+  q = clamp(floor(w/d + 8.5), 0, 15).
+- *Scales:* always dequantize with the **fp16-rounded** scale, exactly as the engine does.
+- *Test:* the C++ and Python quantizers must produce **identical bytes** on random tensors.
+
+**The twin** is the reference model plus three changes:
+
+1. weights fake-quantized;
+2. activations fake-quantized to 8-bit blocks at every matmul input;
+3. the KV cache rounded to fp16.
+
+Run in fp32, the twin matches the engine except for floating-point summation order.
+
+**Perplexity table.** Measure WikiText-2 (test split, 2048-token windows) for both models in five
+configurations: fp32, 8-bit, 4-bit, 4-bit with an 8-bit output layer, and the full twin. Run the 4B on Kaggle.
+Expect the 0.6B to lose more at 4-bit. That result feeds the choice of draft precision.
+
+### 7.3 Export script
+
+- **Fuse matrices:** Q, K and V into one `[q_dim + 2·kv_dim, hidden]` matrix, and gate and up into one
+  `[2·intermediate, hidden]` matrix. Fewer matrices means fewer points where threads wait on each other.
+  - *Option:* interleave gate and up rows in blocks, so each thread can apply silu(gate)·up to its own rows before
+    the barrier.
+- **Tied embedding:** store it once, and use it both for the embedding lookup (dequantize one row) and as the
+  output layer.
+- **Formats per tensor:** norm weights in fp32. Each matrix gets its own format, which allows mixes such as a
+  4-bit body with an 8-bit output layer. Also export an **all-fp32** file for debugging in Milestone 2.
+- **File layout:** one binary file. It starts with a header (magic number, version, config, and a tensor
+  directory giving each tensor's name, format, shape and offset). The data follows at **64-byte-aligned offsets**.
+  C++ memory-maps it (`CreateFileMapping`/`MapViewOfFile`).
+- **Test:** reload the file in Python, dequantize it, and compare with the twin's weights (they must be exact).
+
+**Done when:** the reference matches Hugging Face, the perplexity table exists, and export round-trips byte for
+byte.
+
+---
+
+## 8. Milestone 2: A correct C++ engine
+
+*Estimated time: 2–3 weeks.*
+
+- **Build setup:** CMake and pybind11, built through scikit-build-core, so `pip install -e .` rebuilds the
+  extension.
+- **Forward pass, correctness first**
+  - Start with **plain float32 loops**: no SIMD, no threads, and the all-fp32 weights file.
+  - Then add **scalar** 8-bit and 4-bit kernels (below) before any SIMD.
+  - Use a KV cache per layer laid out as `[kv_head][position][head_dim]`, with a position counter.
+  - Write `forward(tokens[k], pos)` for **k tokens from day one** (k = 1 for normal decoding). Verification and
+    prompt processing need it later.
+- **Sampling:** greedy, temperature, top-k and top-p. Use a seeded RNG (e.g., PCG) whose seed is set from Python,
+  for reproducibility.
+- **Debug hooks:** a pybind function that returns the hidden states after every layer as numpy arrays.
+- **Testing**
+  - Compare hidden states layer by layer against the PyTorch reference in fp32. The first layer that diverges is
+    where the bug is.
+  - Then compare the quantized formats against the twin.
+- **Done when:** greedy generation matches PyTorch token for token. The fp32 engine is compared with the fp32
+  reference, and the quantized engine with the twin; any mismatches must be documented near-ties.
+
+**Scalar reference kernel.** This becomes the oracle for the SIMD version.
+
+```cpp
+#include <cstdint>
+
+struct BlockQ4 { uint16_t scale; uint8_t q[16]; };  // 32 weights at 4 bits + fp16 scale
+struct BlockQ8 { float scale; int8_t q[32]; };      // 32 activations at 8 bits
+
+// Scalar reference for testing the SIMD kernel. fp16_to_fp32 can use F16C's _cvtsh_ss.
+float dot_q4_q8(const BlockQ4* w, const BlockQ8* x, int nblocks) {
+    float sum = 0.0f;
+    for (int b = 0; b < nblocks; ++b) {
+        int32_t acc = 0;
+        for (int i = 0; i < 16; ++i) {
+            int lo = (w[b].q[i] & 0x0F) - 8;   // weight i
+            int hi = (w[b].q[i] >> 4) - 8;     // weight i + 16
+            acc += lo * x[b].q[i] + hi * x[b].q[i + 16];
+        }
+        sum += fp16_to_fp32(w[b].scale) * x[b].scale * acc;
+    }
+    return sum;
+}
 ```
-prefill: target and draft each process prompt[:-1]      # later rounds have fixed shapes
-loop:
-    feed the draft the tokens its cache is missing        # 1 token, or 2 after an all-accepted round
-    sample d_1 from q_1; for j = 2..γ: feed d_{j-1}, sample d_j from q_j
-    feed the target [seq[-1], d_1, ..., d_γ]  →  p_1 .. p_{γ+1}
-    n, y = accept_or_resample(p, q, d)
-    seq += d_1..d_n, y                          # stop at EOS or max_new_tokens
-    crop the target cache to len(seq) - 1
-    crop the draft cache to min(draft_len, len(seq) - 1)
+
+---
+
+## 9. Milestone 3: A fast engine
+
+*Estimated time: 2–3 weeks.*
+
+**Measure before optimizing.** Add per-operation timers and counters of bytes moved, so every operation reports
+its percentage of the bandwidth ceiling. Use VTune for hotspots.
+
+These steps are in rough order of payoff.
+
+1. **Thread pool**
+   - Keep threads alive between operations and have them **spin-wait** at barriers.
+   - Split each matrix-vector product across threads **by output rows**.
+   - A 0.6B model hits well over a hundred synchronization points per token, so waking threads through the OS each
+     time would eat much of the speedup.
+2. **Quantized kernels.** Do 8-bit first, then 4-bit.
+   - Quantize each activation vector into 8-bit blocks once per matmul input, so the inner loop is integer
+     multiply-adds.
+   - For SIMD, use AVX-VNNI's **`_mm256_dpbusd_avx_epi32`**. The `_avx_` in the name matters: the version without
+     it requires AVX-512.
+   - It multiplies *unsigned* bytes by *signed* bytes, hence one of these tricks:
+     - *Sign trick:* take |w| and move w's sign onto x with `_mm256_sign_epi8`.
+     - *Offset trick:* use the raw nibbles q ∈ [0, 15] as the unsigned operand, and subtract 8·Σx using block sums
+       precomputed when the activations are quantized.
+
+     Benchmark both.
+   - Blocks are 18 bytes, so loads are unaligned (`_mm_loadu_si128`). If profiles show loads or shuffles
+     dominating, try repacking (scales stored separately from nibbles, or several rows interleaved).
+   - Test every SIMD kernel against the scalar reference on random blocks.
+
+   ```cpp
+   // Sketch: one 4-bit block times one 8-bit block with AVX2 + AVX-VNNI (sign trick).
+   __m128i packed = _mm_loadu_si128((const __m128i*)w.q);            // 32 nibbles
+   __m256i nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(packed, 4), packed),
+                                  _mm256_set1_epi8(0x0F));            // w0..15 | w16..31, as 0..15
+   __m256i wq = _mm256_sub_epi8(nib, _mm256_set1_epi8(8));            // signed weights in [-8, 7]
+   __m256i xq = _mm256_loadu_si256((const __m256i*)x.q);
+   __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(),
+                                         _mm256_sign_epi8(wq, wq),   // |w|, unsigned
+                                         _mm256_sign_epi8(xq, wq));  // x with w's sign
+   sum = _mm256_fmadd_ps(_mm256_set1_ps(fp16_to_fp32(w.scale) * x.scale),
+                         _mm256_cvtepi32_ps(acc), sum);              // 8 float lanes per row
+   ```
+
+3. **KV cache and attention**
+   - Store the KV cache in **fp16**, which F16C converts cheaply.
+   - Process **all query heads that share a KV head together**, so each K/V row is read from memory once.
+   - For the 0.6B draft at 2k context, a float32 KV cache would add more bytes per token than the 4-bit weights.
+4. **Using both core types.** Compare four setups:
+   - the 6 performance cores alone;
+   - all 10 cores with the rows split evenly;
+   - all 10 cores with **dynamic chunks**, where threads grab the next block of rows from an atomic counter so the
+     fast cores do more;
+   - 16 threads with hyperthreading.
+
+   Then check whether the best setup differs between **draft steps** (small matrices, dominated by
+   synchronization), **target steps** (bandwidth-bound) and **verification** (compute-bound). If it does, the
+   engine should use a different configuration for each.
+
+   On Windows, `GetSystemCpuSetInformation` reports each logical processor's `EfficiencyClass`. Pin threads with
+   `SetThreadAffinityMask` (hard) or `SetThreadSelectedCpuSets` (soft).
+5. **Optional polish:** fuse RMSNorm with activation quantization; fuse silu·up into the gate/up kernel; parallelize
+   the softmax; add prefetching; try large pages; parallelize attention across positions at long contexts.
+
+**Done when** you have a table of tokens per second for both models at 256, 1k and 2k context, in 8-bit and 4-bit,
+where each result is:
+
+- shown as a percentage of the bandwidth ceiling;
+- next to llama.cpp at the same quantization and thread count;
+- accompanied by an explanation of the remaining gap from the per-operation breakdown.
+
+**This is stopping point A:** a fast, tested CPU inference engine.
+
+---
+
+## 10. Milestone 4: Speculative decoding in the engine
+
+*Estimated time: 1–2 weeks.*
+
+### 10.1 The k-token kernel
+
+- Unpack each weight block once and reuse it for all k activation vectors. This kernel is what sets v(k).
+- **Use one kernel, templated on k (1–16), for normal decoding, verification and prompt processing.** Each token's
+  result then adds up in the same order whatever k is, so greedy speculative decoding matches plain decoding
+  **bit for bit**. That is a much stronger test than a tolerance.
+  - *Also required:* the same thread split per row, attention accumulated in the same order, and no fast-math.
+- Prompt processing runs in chunks of k. Report its speed separately from generation.
+
+### 10.2 The round loop
+
+Rolling back rejected guesses just means resetting position counters. Attention only reads up to the counter, and
+stale entries get overwritten later.
+
+```cpp
+// Invariant at the start of a round: the target's KV cache holds every token but the
+// last, and the draft's holds some prefix of them. Prefill both with prompt[:-1].
+void spec_round(Model& draft, Model& target, std::vector<int>& tokens, int gamma, Rng& rng) {
+    const int n0 = (int)tokens.size();
+    draft.catch_up(tokens);                        // feed any tokens the draft hasn't seen
+    std::vector<Probs> q;
+    std::vector<int> guesses;
+    for (int i = 0; i < gamma; ++i) {
+        q.push_back(draft.last_probs());
+        guesses.push_back(sample(q.back(), rng));
+        if (i + 1 < gamma) draft.feed(guesses.back());
+    }
+    // One pass over gamma + 1 tokens: the last real token plus every guess.
+    std::vector<Probs> p = target.forward(tokens.back(), guesses);
+    auto [n, next] = accept_or_resample(p, q, guesses, rng);
+    tokens.insert(tokens.end(), guesses.begin(), guesses.begin() + n);
+    tokens.push_back(next);
+    target.set_pos(n0 + n);                        // rollback = move the counter
+    draft.set_pos(std::min(draft.pos(), n0 + n));  // after an all-accepted round the draft is 2 short
+}
 ```
 
-After an all-accepted round the draft cache is two tokens short, because d_γ was never fed back in. The "feed
-what's missing" rule handles that case with no special code.
+The caller stops at an end-of-sequence token, even one that lands inside an accepted block, and truncates at
+`max_new_tokens`. Greedy mode replaces sampling with argmax on both sides.
 
-### 6.2 The acceptance rule
+### 10.3 Tests
 
-This version adds a greedy branch, avoids dividing by q, and guards the residual against floating-point
-round-off:
+1. **Greedy is bit-exact.** Speculative output must equal plain output bit for bit, for γ = 1–8 on many prompts,
+   with no tolerance.
+2. **The sampling rule.** The Python function below is the reference. Expose the C++ version through pybind11 and
+   chi-square-test both on toy distributions (vocab 8–16, about 100k draws). The first emitted token must follow
+   p. With top-k or top-p, run the test on the *filtered* distributions.
+3. **End-to-end distribution.** Export a tiny random Qwen3 (vocab 16, 2 layers) to the engine format. Compute the
+   exact probability of every length-2 continuation in PyTorch, then chi-square-test the engine's speculative
+   samples against them. This catches rollback and bonus-token bugs that test 2 can't see.
+4. **Offline and online agree.** Greedy tokens per round from the simulator (run on twin references) must match
+   the engine's accepted counts, apart from documented near-ties between twin and engine.
+5. **Edge cases:** end-of-sequence inside an accepted block; `max_new_tokens` reached mid-round; γ = 1; several
+   all-accepted rounds in a row.
 
 ```python
 import torch
@@ -347,81 +623,81 @@ def accept_or_resample(p, q, draft_tokens, greedy=False):
     return draft_tokens[:n], next_token
 ```
 
-### 6.3 Two cache backends
+### 10.4 Measurements
 
-- **`DynamicCache`** comes first, for correctness. Rollback is `crop()`.
-- **`StaticCache` + `torch.compile(mode="reduce-overhead")`** comes second, for speed.
-  - Rolling back just moves the write position (pass `cache_position` explicitly). Stale entries past that
-    position are hidden by the causal mask. Test this against a fresh forward pass rather than assuming it.
-  - Keep the number of shapes small, since each one is a separate graph capture. The draft always makes 1-token
-    calls (do the 2-token catch-up as two calls). The target makes 1-token calls (baseline) and (γ+1)-token calls
-    (verification). Run the prefill eagerly.
-- **The target-alone baseline must use the same static cache and compile.**
+- **v(k)** for k = 1–16, at 256, 1k and 2k context, for each thread configuration.
+- **c** at the same context lengths, for 4-bit and 8-bit drafts.
+- **o**, the per-round overhead of sampling and acceptance.
+- **Acceptance for each Spec-Bench category** with the off-the-shelf draft, under greedy decoding and at
+  temperatures 0.7 and 1.0.
+  - *Offline:* on Kaggle using the twin, for every γ (§11.6).
+  - *Online:* in the engine, on a stratified subset of about 20 prompts per category.
+- **Generation speed reported separately from prompt processing.**
+- **Baselines**
+  - the engine running the target alone;
+  - llama.cpp's target alone and its speculative decoding, with the same quantization, threads and prompts;
+  - *optional:* prompt lookup decoding in the engine (guesses copied from n-grams in the prompt, so c ≈ 0), which
+    is a strong baseline on summarization and retrieval-augmented prompts.
 
-### 6.4 Tests
+**Done when** you have a plot of predicted versus measured speedup across γ, and know the best γ for this CPU,
+overall and per category.
 
-These run on a CPU with `pytest`, using tiny random `Qwen3ForCausalLM` models (2 layers, hidden size 64, small
-vocab). Make the draft a *noised copy* of the target so that acceptance is neither near 0 nor near 1 and both
-the accept and reject paths get exercised.
+### 10.5 Stretch goals
 
-1. **Acceptance-rule chi-square.** Draw random p and q over a vocab of 8–16 and run the rule about 100k times. The
-   first emitted token must follow p (chi-square test at a significance level of 0.001). Also test the greedy
-   branch.
-2. **End-to-end distribution.** Use a vocab of 16 and continuations of length 2. Compute the exact target
-   probabilities of all 256 sequences by enumeration, then chi-square-test about 20k speculative samples against
-   them. This catches cache, bonus-token and warping bugs that test 1 can't see.
-3. **Greedy equivalence.** With tiny fp32 models, output must be identical to plain greedy for γ = 1…8 over many
-   prompts. On the GPU with the real fp16 models, run a dev subset and check the top-2 logit gap at any
-   divergence, then document the near-ties.
-4. **Cache consistency.** After every round, next-token logits from the cache must match a fresh full-sequence
-   forward pass (within tolerance). Run this for both backends.
-5. **Offline/online agreement.** Greedy τ from the simulator must equal the online accepted counts exactly.
-   Sampling τ must agree within Monte Carlo error.
-6. **Edge cases.** EOS inside an accepted block; `max_new_tokens` hit mid-round; γ = 1; a 1-token prompt; several
-   all-accepted rounds in a row.
+- **Vocabulary trimming.** The draft's output layer covers all ~152k tokens and makes up about a quarter of its
+  weights. Limit it to the most frequent tokens (e.g., 32k), with q = 0 everywhere else.
+  - *Still exact:* the draft never proposes a trimmed token, and the residual max(0, p − q) covers them.
+  - *Caveat:* a trimmed draft doesn't work in llama.cpp.
+- **Confidence-based early stopping:** stop drafting when the draft's top probability drops below a threshold.
+- **8-bit KV cache for the draft**, to flatten c(context).
 
-### 6.5 Instrumentation
-
-Record, for each round: the number accepted; draft, verify and overhead times (CUDA events, switched off during
-headline timing runs); and each rejected token with its context, for the failure analysis.
-
-**Done when** all tests pass, the GPU greedy check is clean, the decoder is at least as fast as HF assisted
-generation at the same γ, and online τ matches offline τ.
+**This is stopping point B:** the engine plus speculative decoding plus the v(k) analysis.
 
 ---
 
-## 7. Phase 2: Distillation (2–3 weeks)
+## 11. Milestone 5: Distillation on Kaggle
 
-### 7.1 Data
+*Estimated time: 2–3 weeks. The GPU jobs can start around week 3, in parallel with Milestones 2–4.*
+
+### 11.1 What's specific to this project
+
+- **Two teachers.** The engine runs a *4-bit* target, and the output follows *that* model's distribution. So
+  distill against both the full-precision 4B and the 4-bit twin, and compare.
+- **The draft runs quantized.** Score drafts with the draft twin at the precision the engine will use (4-bit or
+  8-bit).
+- **Stretch:** make the draft aware of its own quantization by fake-quantizing its weights during training, with
+  a straight-through estimator for the gradients.
+
+### 11.2 Data
 
 - **Training prompts (~30–60k):**
   - chat: `HuggingFaceH4/ultrachat_200k`
   - code: e.g. `ise-uiuc/Magicoder-Evol-Instruct-110K`
   - math: the `openai/gsm8k` **train** split plus a subset of `meta-math/MetaMathQA`
 
-  Keep the mix generic. Adding summarization and translation prompts from train splits would target Spec-Bench
-  categories directly, so run that only as a labeled ablation.
-- **Decontamination.** Normalize text, then drop any training prompt that shares a 13-gram with a Spec-Bench
-  prompt. Also exact-match against the GSM8K test questions and the CNN/DM test articles.
+  Summarization and translation prompts from train splits would target Spec-Bench categories directly, so use
+  them only as a labeled ablation.
+- **Decontamination.** Normalize text and drop any training prompt that shares a 13-gram with a Spec-Bench
+  prompt. Also exact-match against GSM8K test questions and CNN/DM test articles.
 - **Splits:**
   - *train*
-  - *dev* (~300 prompts, about 50 per Spec-Bench-like category, drawn from held-out and validation data): used
-    for model selection
+  - *dev* (~300 prompts, about 50 per Spec-Bench-like category, from held-out and validation data): used for
+    model selection
   - *Spec-Bench* (480 prompts in 6 categories): used **only** for final numbers
 
-### 7.2 Where training responses come from
+### 11.3 Where training responses come from
 
 | Source | How | Cost | Notes |
 |---|---|---|---|
 | Fixed text | The dataset's own responses | Free | Off-policy for both models (UltraChat responses came from ChatGPT) |
-| Target-generated | Qwen3-4B samples at T=1.0 | Most expensive to generate | Closest to what the draft sees during decoding |
-| Draft-generated | Qwen3-0.6B samples, scored by the target | About 5× cheaper | DistillSpec found it works well |
+| Target-generated | The 4B's samples at T=1.0 (fp16 on a T4; vLLM if it runs, otherwise batched HF `generate`) | Most expensive to generate | Closest to what the draft sees during decoding |
+| Draft-generated | The 0.6B's samples, scored by the target | About 5× cheaper | DistillSpec found this works well |
 | *Stretch:* on-policy | Regenerate from the current draft every N steps | More moving parts | GKD/DistillSpec style |
 
 In every case, run both models over the same text (teacher forcing) and compute the loss only at positions whose
 next token is part of the response.
 
-### 7.3 Losses
+### 11.4 Losses
 
 | Loss | What it optimizes |
 |---|---|
@@ -456,50 +732,51 @@ def distill_loss(draft_logits, target_logits, labels=None, kind="fkl", T=1.0):
     return per_pos.mean()
 ```
 
-Apply the loss over **chunks of about 256 positions**, with each chunk's lm_head and loss wrapped in
-`torch.utils.checkpoint`, so full `[N, 151,669]` fp32 tensors never exist at the same time. Distill at T=1 by
-default. As an ablation, distill at the decoding temperature for the T=0.7 mode.
+Apply the loss over chunks of about 256 positions, with each chunk's output layer and loss wrapped in
+`torch.utils.checkpoint`, so full `[N, 151,669]` fp32 tensors never exist at the same time.
 
-### 7.4 Training setup
+### 11.5 Training setup
 
-- **Two-GPU pipeline.** GPU0 runs the target forward pass (`no_grad`, fp16) and sends response-position logits
-  (fp16, sliced) to GPU1, which runs the draft's forward and backward passes. Launch the target pass for the
-  *next* micro-batch before the draft step for the current one, so both GPUs stay busy.
-- **Precision.** fp32 master weights, fp16 autocast and a `GradScaler`, with losses computed in fp32. If a loss is
-  not finite, skip the step, log it, and watch the scaler's scale.
-- **Memory.** 0.6B parameters with fp32 weights, gradients and 8-bit AdamW states come to about 6 GB before
-  activations. To fit:
-  - micro-batches of 1–2 sequences of at most about 2k tokens, with gradient accumulation to about 64–128k
-    tokens per optimizer step;
+- **Two-GPU pipeline.** GPU0 runs the teacher's forward pass (`no_grad`, fp16) and sends response-position logits
+  (fp16, sliced) to GPU1, which trains the draft. Launch the teacher pass for the next micro-batch before the
+  draft step for the current one, so both GPUs stay busy.
+  - *The 4-bit teacher:* the twin's dequantized 4-bit weights in fp16. That's close enough for training, even
+    though it isn't bit-exact. Activation fake-quantization is optional here.
+- **Precision.** T4s have no bfloat16, so use fp32 master weights, fp16 autocast and a `GradScaler`, with losses
+  computed in fp32. If a loss is not finite, skip the step and log it. Check for NaNs on day one, because Qwen3 was
+  trained in bfloat16 and may overflow in fp16.
+- **Memory.** The 0.6B's fp32 weights, gradients and 8-bit AdamW states come to about 6 GB before activations. To
+  fit:
+  - micro-batches of 1–2 sequences of at most about 2k tokens, with gradient accumulation to about 64–128k tokens
+    per optimizer step;
   - gradient checkpointing;
-  - `logits_to_keep` or a response-only lm_head, plus the chunked loss above.
+  - `logits_to_keep` plus the chunked loss above.
 
-  If memory is still tight, freeze the tied embedding (~155M of the 0.6B parameters) and treat that as an
-  ablation.
-- **Hyperparameters (starting point).** AdamW, lr 2e-5 (also try 1e-5 and 5e-5 in a 2M-token pilot), cosine
-  decay, 2% warmup, no weight decay, gradient clipping at 1.0, one epoch.
-- **Checkpointing.** Push to the HF Hub every 30–45 minutes: model, optimizer, scaler, data cursor and RNG
-  state. Resume automatically, because Kaggle sessions die.
-- **Throughput estimate.** About 5–8M response tokens per hour with the pipeline, so roughly 1.5–2 hours per
-  10M-token run. Confirm this in the pilot.
+  If memory is still tight, freeze the tied embedding and treat that as an ablation.
+- **Hyperparameters (starting point).** AdamW, lr 2e-5 (also try 1e-5 and 5e-5 in a pilot), cosine decay, 2%
+  warmup, no weight decay, gradient clipping at 1.0, one epoch.
+- **Checkpointing.** Push to the HF Hub every 30–45 minutes (model, optimizer, scaler, data cursor and RNG state)
+  and resume automatically, because Kaggle sessions time out.
+- **Throughput estimate.** About 5–8M response tokens per hour, so roughly 1.5–2 hours per 10M-token run.
 
-### 7.5 Offline evaluation (the workhorse)
+### 11.6 Offline evaluation and the round simulator
 
-For each checkpoint, on dev references generated by the target (greedy, T=0.7 and T=1.0), compute:
+For each checkpoint, on dev references generated by the target (greedy, T=0.7 and T=1.0), compute with the twins
+at engine precision:
 
-- **top-1 match rate**, which is α for greedy decoding;
-- **mean 1 − TVD** at T=0.7 and T=1.0, which is α for sampling;
-- **simulated τ(γ)** for γ = 1…8, and from it the predicted speedup S(γ) using the measured c, v and o.
+- the **top-1 match rate** (α for greedy decoding);
+- the **mean 1 − TVD** (α for sampling);
+- **simulated tokens per round τ(γ)** for γ = 1–8, which turns into a predicted speedup through §3's formula with
+  the engine's measured c, v(k) and o.
 
 **Why the simulator is exact.**
 
 - *Greedy.* The speculative output is the target's greedy text, and the draft's context at every position is the
   accepted prefix of that text. The teacher-forced top-1 matches therefore determine every round exactly.
-- *Sampling.* In one speculative step, the probability that the emitted token x came from an accepted draft guess
-  is min(p(x), q(x)) / p(x). So if the reference text is sampled from the target (with the same temperature and
-  warps), drawing an independent Bernoulli with probability min(1, qᵢ(xᵢ)/pᵢ(xᵢ)) at each drafted position
-  reproduces the joint distribution of outputs and round boundaries. Averaging over draws gives the expected τ.
-  The mean of those probabilities over x ~ p is exactly 1 − TVD.
+- *Sampling.* In one speculative step, the probability that the emitted token x came from an accepted guess is
+  min(p(x), q(x)) / p(x). So if the reference text is sampled from the target with the same settings, drawing an
+  independent Bernoulli with probability min(1, qᵢ(xᵢ)/pᵢ(xᵢ)) at each drafted position reproduces the joint
+  distribution of outputs and round boundaries. The mean of those probabilities is exactly 1 − TVD.
 
 ```python
 import random
@@ -522,241 +799,156 @@ def simulate_tokens_per_step(accept_prob, gamma, draws=20, seed=0):
     return draws * T / steps
 ```
 
-**Caveats**
-
-- The reference must come from the target with the same decoding settings.
-- Batched (padded) fp16 generation can differ slightly from batch-1 decoding. For the exact greedy agreement test,
-  generate references at batch size 1.
-- Rare fp16 near-ties still apply.
-
-### 7.6 Phase 2 grid (budget-aware)
+### 11.7 Grid (budget-aware)
 
 | Stage | Runs | Purpose |
 |---|---|---|
-| A. Pilot | 1 × ~2M tokens | lr sanity, NaN check, throughput → recalibrate the budget |
-| B. Loss comparison | `sft`, `fkl`, `rkl`, `tvd` on target-generated data, ~10M tokens each | Which loss for which decoding mode |
-| C. Data comparison | Best 2 losses from B on fixed text and draft-generated data | Which data source |
-| D. Scale-up | Best (source, loss) pair to ~50M tokens, evaluating checkpoints along the way | Final draft, plus the acceptance-vs-training-tokens curve |
-| *E. Stretch* | On-policy distillation; a code-only draft | Beyond fixed data; cross-domain transfer |
+| A. Pilot | 1 × ~2M tokens | lr sanity, NaN check, throughput |
+| B. Losses | `sft`, `fkl`, `rkl`, `tvd` on target-generated data, 4-bit teacher, ~10M tokens each | Which loss for which decoding mode |
+| C. Teachers | Best loss with the full-precision teacher vs the 4-bit teacher | Does matching the engine's target pay off? |
+| D. Data | Best loss on fixed text and on draft-generated data | Which data source |
+| E. Scale-up | Best recipe to ~50M tokens, with checkpoints evaluated along the way | Final draft, plus a curve of acceptance against training tokens |
+| *Stretch* | Quantization-aware training; on-policy distillation; **layer pruning** (fewer layers means fewer bytes *and* fewer thread barriers, which directly lowers c on a CPU) | |
 
-Evaluate every run offline on the dev set for greedy, T=0.7 and T=1.0, per category.
+**Kaggle GPU budget (rough)**
 
----
-
-## 8. Phase 2b: Make the draft cheaper (optional, ~1 week)
-
-Pull this phase forward if compiled c comes out above 0.3.
-
-### 8.1 Layer pruning plus distillation
-
-- **Score the layers.** Block influence (ShortGPT) is BIₗ = 1 − mean cos(hₗ_in, hₗ_out) on calibration text. Drop
-  the lowest-scoring layers and always keep the last one.
-- **Variants:** 28 layers (unpruned), 20, 14 and 10.
-- **Recover** each variant with the best distillation recipe, using about 10–15M tokens. These runs are cheap
-  because the models are smaller.
-- **Bandwidth-bound c:** 14 layers ≈ 0.09 and 10 layers ≈ 0.08 before vocab trimming, and 10 layers ≈ 0.05 with
-  a 32k vocab.
-- **Plot:** compiled c against offline α for each variant, with iso-speedup contours from S(γ*). **This α–c Pareto
-  plot is the centerpiece of the write-up.**
-
-### 8.2 Draft vocab trimming (FR-Spec style)
-
-- **How:** restrict the draft's lm_head to the K most frequent tokens in target-generated text (K = 16k or 32k),
-  and set q = 0 everywhere else.
-- **Why it stays exact:** the draft never proposes a trimmed token, and the residual max(0, p − q) is just p on
-  those tokens.
-- **What it saves:** the lm_head is about 26% of the draft's bytes per step, and a larger share after pruning.
-- **What it costs:** α drops by the target probability mass that falls outside the kept set. Measure it.
-- **Training:** train with the trimmed head, untied from the embedding.
-- **Caveat:** a trimmed draft no longer matches the target's vocabulary, so it won't work in llama.cpp. Release
-  the untrimmed version for GGUF.
-
-### 8.3 Confidence-based early stopping (dynamic γ)
-
-- **Rule:** stop drafting when the draft's top probability falls below a threshold h. Sweep h from 0.2 to 0.6 and
-  compare with a fixed γ (see SpecDec++, and HF's `assistant_confidence_threshold`).
-- **Offline:** the simulator still gives τ exactly, but the draft's cost only approximately. After a rejection
-  the draft keeps going on its own wrong continuation, and teacher forcing can't observe how far. Confirm online.
-
----
-
-## 9. Phase 3: Experiments (~2 weeks)
-
-### 9.1 Methods
-
-| Method | Role |
+| Job | Estimate |
 |---|---|
-| Target alone, compiled (static cache + CUDA graphs) | **The reference for every speedup** |
-| Target alone, eager | Shows how much compiling alone buys |
-| HF assisted generation with the off-the-shelf 0.6B (defaults, and fixed γ) | Checks the custom decoder's speed |
-| Prompt lookup decoding (mainly greedy) | Strong copy-based baseline; hard to beat on summarization and RAG |
-| Custom decoder + off-the-shelf 0.6B | What distillation has to beat |
-| Custom decoder + best distilled draft | Main result |
-| Custom decoder + best pruned/trimmed draft | Result of the cost track, if Phase 2b ran |
-| HF assisted generation + distilled draft | Shows the draft helps in stock HF too |
+| 4B references, perplexity and twin checks | 3–5 h |
+| Target-generated training data (~30k responses, ~12M tokens) | 3–8 h |
+| Draft-generated training data | 1–2 h |
+| Pilot plus about 9 grid runs of ~10M tokens each | 15–20 h |
+| Scale-up run | 7–10 h |
+| Offline evaluation passes | 3–5 h |
+| **Total** | **~35–50 GPU-hours**, spread over several weeks of Kaggle's ~30 h/week quota |
 
-**Decoding modes:** greedy, T=0.7 and T=1.0 (pure temperature). Also run one realistic configuration for the best
-draft: Qwen's recommended non-thinking settings (T=0.7, top-p 0.8, top-k 20).
+### 11.8 Measure in the engine
 
-### 9.2 Protocol
-
-- **Offline, on all of Spec-Bench** (480 prompts; every draft × mode × γ = 1…8 × category).
-  - Generate target references once per mode (greedy, T=0.7, T=1.0) and reuse them everywhere.
-  - Outputs: τ, α and predicted speedup.
-- **Online wall-clock, on selected configurations.**
-  - Each method at its best γ, plus a full γ sweep for the off-the-shelf and best distilled drafts.
-  - Use a stratified Spec-Bench subset of about 40 prompts per category, with `max_new_tokens=512`.
-  - Both models on one T4.
-- **Timing hygiene.**
-  - Warm up first, including graph capture, and call `torch.cuda.synchronize()` before reading the clock.
-  - **Interleave methods** (A, B, A, B, …) so thermal throttling and noisy neighbours don't bias any one method.
-  - Run at least 3 repeats and report the median and interquartile range.
-  - Log `nvidia-smi` clocks and temperature.
-- **Metrics**
-  - **τ:** tokens per target forward pass during decoding.
-  - **α:** the MLE, accepted ÷ (accepted + rejections).
-  - **c, v, o**, tokens per second, speedup over the compiled target, and predicted speedup.
-  - Sampling runs use several seeds.
-
-### 9.3 Failure analysis
-
-This is computed from the offline passes, so it covers the whole evaluation set.
-
-- **Where rejections happen:**
-  - *By token class:* digits, capitalized or name-like tokens, sentence openings, punctuation, whitespace and
-    newlines, code identifiers.
-  - *By position:* the first few tokens of the response versus later ones.
-  - *By category.*
-- **Calibration:** plot the draft's top probability against the acceptance rate. This motivates §8.3.
-- **What distillation fixed:** the change in α per token class, before versus after training.
-
-### 9.4 Plots and tables for the write-up
-
-1. **Headline table:** τ and speedup per method per Spec-Bench category, for each decoding mode.
-2. **Predicted vs measured speedup:** a scatter against the y = x line, with gaps explained by v and o.
-3. **Loss × data-source heatmaps**, one per decoding mode. Does TVD win for sampling and SFT/FKL for greedy?
-4. **τ and speedup vs γ**, with the optimal γ per category.
-5. **α–c Pareto frontier** with iso-speedup contours (Phase 2b).
-6. **Acceptance vs training tokens.**
-7. **Rejection rate by token class**, before and after distillation.
+Export the best drafts at 4-bit and 8-bit. **Done when** one table shows tokens per round and end-to-end speedup
+for each draft variant on each Spec-Bench category. It combines offline numbers on all of Spec-Bench with online
+engine runs on a stratified subset.
 
 ---
 
-## 10. Phase 4: Release (a few days)
+## 12. Milestone 6: Write-up and release
 
-- **HF Hub.** Upload the best draft (plus the pruned variant, if any) with a model card covering:
-  - intended use: as an assistant model for Qwen3-4B in non-thinking mode;
-  - a usage snippet, `model.generate(..., assistant_model=draft)`;
-  - the training data and recipe;
-  - the evaluation table;
-  - limitations: it is not a standalone chat model, and the timings are specific to the T4;
-  - license: Apache-2.0.
-- **README.** Lead with the headline table, the predicted-vs-measured plot and the Pareto plot, followed by a
-  short method section and the commands to reproduce the results.
-- **Write-up** (blog post or report) with the analyses from §9.
-- **GGUF / llama.cpp.**
-  - Convert the untrimmed draft with `convert_hf_to_gguf.py`. A pruned draft is still the Qwen3 architecture, so
-    it converts fine.
-  - Run it as a draft model (`llama-speculative`, or `llama-server` with `--model-draft`) on the laptop and report
-    tokens per second.
-- **Tag a release** and archive the result JSONs.
+*Estimated time: about a week.*
 
-**Resume bullet (template):** "Implemented speculative decoding and KL/TVD distillation in PyTorch; trained a
-distilled (and layer-pruned) Qwen3 draft that raised tokens per target step from X to Y and sped up Qwen3-4B
-generation Z× on a T4 (Spec-Bench), with an offline simulator that predicts acceptance without decoding."
+- **Headline numbers:** open the README with tokens per second, percentage of the bandwidth ceiling, and speedup.
+- **Plots and tables**
+  - the v(k) curve, at several context lengths;
+  - predicted versus measured speedup across γ;
+  - acceptance by Spec-Bench category, off-the-shelf versus distilled;
+  - the comparison of core and thread configurations, per phase;
+  - c against context length, for 4-bit and 8-bit drafts;
+  - the per-operation time breakdown against the bandwidth ceiling;
+  - the draft-variant table from §11.8.
+- **What didn't work:** include it. It makes the write-up more credible.
+- **Release**
+  - distilled drafts on the Hugging Face Hub (safetensors, the engine format and GGUF) with model cards;
+  - a tagged GitHub release of the engine with build instructions;
+  - *optional:* a GitHub Actions CI badge (a Windows build plus the scalar-path tests).
 
----
-
-## 11. Timeline and milestones
-
-These assume part-time work. GPU jobs such as data generation run on Kaggle while coding continues locally.
-
-| Week | Work | Milestone |
-|---|---|---|
-| 0 | Setup; Phase 0 | **M0:** `results/phase0.md` with c, v, o, baseline α and a go/no-go decision |
-| 1–2 | Phase 1 decoder, tests, simulator; start target data generation | **M1:** tests green; online τ = offline τ; at least as fast as HF assisted generation |
-| 3 | Data pipeline (prompts, decontamination, dev set); training loop; pilot | **M2:** pilot improves dev α with no NaNs |
-| 4–5 | Phase 2 stages B–D | **M3:** best recipe chosen; acceptance-vs-tokens curve |
-| 6 | Phase 2b (optional) | **M4:** Pareto plot |
-| 7–8 | Phase 3 | **M5:** headline table and all plots |
-| 9 | Phase 4 | **M6:** Hub release, README, write-up |
-
-**MVP cut line (about 6 weeks):**
-
-- Phases 0 and 1;
-- target-generated data with the `sft`, `fkl` and `tvd` losses;
-- online evaluation of the best draft against the off-the-shelf draft, HF assisted generation and the target;
-- a README with the headline table and the predicted-vs-measured plot.
-
-Everything else is an extension.
+**Resume bullet (template):** "Built a C++ CPU inference engine for Qwen3 (AVX-VNNI 4/8-bit kernels, hybrid-core
+thread pool) reaching X% of the memory-bandwidth ceiling; implemented speculative decoding with bit-exact greedy
+verification and distilled a quantization-matched 0.6B draft, speeding up Qwen3-4B Z× on a laptop CPU
+(Spec-Bench)."
 
 ---
 
-## 12. Risks and mitigations
+## 13. Benchmarking rules
+
+- **Before timing:** plug in, fix the Windows power mode (Best performance), close other programs, pause
+  OneDrive, Windows Update and search indexing, and warm up.
+- **Throttling:** laptops slow down as they heat up. Report sustained speed after a minute of load, not the first
+  few seconds. Log CPU clocks and temperatures (e.g., with HWiNFO).
+- **Runs:** run each configuration several times and report the median and interquartile range. Use identical
+  prompts and random seeds across methods.
+- **Order:** interleave methods (A, B, A, B, …) so thermal drift doesn't favour whichever ran first.
+- **What to report:** generation speed separately from prompt processing. Fixed-length generations (ignoring
+  end-of-sequence) for microbenchmarks; real stopping for Spec-Bench runs.
+- **Record:** thread count, core pinning, model formats, commit and weights-file hash with every result, as a JSON
+  record in `results/`.
+
+---
+
+## 14. Timeline
+
+| Weeks | Engine track (laptop) | Distillation track (Kaggle) | Milestone |
+|---|---|---|---|
+| 0 | Toolchain, bandwidth, llama.cpp baseline | — | **M0:** go/no-go |
+| 1–2 | Reference, quantization, twin, export | 4B references and perplexity | **M1** |
+| 3–5 | Correct engine | Data pipeline, target data generation, pilot | **M2** |
+| 6–8 | Fast engine | Loss and teacher comparisons (stages B–C) | **M3: stopping point A** |
+| 9–10 | Speculative decoding in the engine | Data comparison, scale-up (stages D–E) | **M4: stopping point B** |
+| 11–12 | In-engine evaluation of the distilled drafts; stretch goals | Stretch goals (quantization-aware training, pruning) | **M5** |
+| 13–14 | Write-up and release | — | **M6** |
+
+If you'd rather do one thing at a time, run Milestone 5 after Milestone 4 and add about 2 weeks.
+
+---
+
+## 15. Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| fp16 overflow in either model | Check on day one (§5). Keep the offending modules in fp32, or fall back to a bfloat16-capable GPU. |
-| c stays high even when compiled | Layer pruning, vocab trimming and early stopping (§8); smaller γ. |
-| `torch.compile` / CUDA graphs break with HF caches | Pin versions; capture graphs manually; worst case, work in eager mode and focus on pruning. |
-| Kaggle quota or session timeouts | Budget (§4.3), small grid runs, Hub checkpoints every 30–45 minutes, automatic resume. |
-| Distillation gains are small (same family, already well aligned) | Report per category, since gains concentrate where baseline α is low. The pruning track still pays off because distillation is what makes pruned drafts usable. |
-| Noisy timing on shared hardware | Medians and IQR, interleaved runs, repeats, logged clocks and temperature. |
-| HF API churn | Pin versions; keep a thin wrapper around cache operations. |
-| Test-set contamination | 13-gram decontamination; Spec-Bench used only for final numbers. |
-| Scope creep | Respect the MVP line; stretch items go last. |
+| Windows toolchain friction (pybind11 builds, intrinsics under MSVC) | scikit-build-core; try clang-cl; prove a hello-world module in Milestone 0. |
+| No speculative speedup even in llama.cpp | Decide at the Milestone 0 gate: continue, split, or pick one. |
+| v(k) climbs fast, so the best γ is small and the speedup modest | That is a finding in itself. Invest in the k-token kernel, make the draft cheaper (4-bit, trimmed vocabulary), and use prompt lookup where it wins. |
+| The engine is well behind llama.cpp | Expected at first. Report the percentage of the ceiling, explain the gap from the per-operation breakdown, and fix the biggest item first. |
+| A 4-bit 0.6B loses too much acceptance | Use an 8-bit draft or an 8-bit output layer; distill against the 4-bit teacher; try quantization-aware training (stretch). |
+| Bit-exactness breaks | Keep one code path for every k; no fast-math; the same row-to-thread order; the same attention accumulation order. |
+| Laptop thermals and background noise | The rules in §13; interleaved runs; medians with interquartile ranges. |
+| 16 GB of RAM | Develop on the 0.6B; run the 4B reference in bfloat16 or on Kaggle. |
+| fp16 NaNs during training on T4s | Check on day one; skip non-finite steps; watch the scaler. |
+| Kaggle quota and timeouts | Budget (§11.7), small grid runs, Hub checkpoints, automatic resume. |
+| Scope: this is really two projects | Stopping points A and B are complete projects. The distillation track can slip without sinking the engine. |
 
 ---
 
-## 13. Positioning and related work
+## 16. Related work and references
 
-Feature-level draft heads such as **EAGLE-2/3**, **Medusa** and **HASS** are the current state of the art. A
-one-layer head that reads the target's hidden states gets both a lower c and a higher acceptance than a separate
-small model. This project still studies a **standalone draft**, for three reasons:
-
-1. It is a clean, controlled setting for studying distillation data and losses.
-2. The result drops into any runtime that accepts a separate draft model, such as HF assisted generation or
-   llama.cpp, with no custom code.
-3. On a T4, the cost side of the trade-off is interesting in its own right.
-
-Acknowledge EAGLE-style heads in the write-up. As a stretch goal, compare against a public EAGLE-3 head for
-Qwen3-4B if one runs on your hardware.
-
-**References**
-
+- **llama.cpp / ggml** (github.com/ggml-org/llama.cpp): the Q4_0/Q8_0 block formats, CPU kernels and the
+  speculative decoding example this project measures against.
+- **Karpathy, *llama2.c***: a minimal from-scratch inference reference.
 - Leviathan, Kalman, Matias. *Fast Inference from Transformers via Speculative Decoding.* ICML 2023. arXiv:2211.17192
 - Chen et al. *Accelerating Large Language Model Decoding with Speculative Sampling.* 2023. arXiv:2302.01318
 - Zhou et al. *DistillSpec: Improving Speculative Decoding via Knowledge Distillation.* ICLR 2024. arXiv:2310.08461
 - Agarwal et al. *On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes* (GKD). ICLR 2024. arXiv:2306.13649
 - Kim, Rush. *Sequence-Level Knowledge Distillation.* EMNLP 2016. arXiv:1606.07947
 - Xia et al. *Unlocking Efficiency in Large Language Model Inference: A Comprehensive Survey of Speculative Decoding* (Spec-Bench). ACL Findings 2024. arXiv:2401.07851
-- Li et al. *EAGLE* (arXiv:2401.15077), *EAGLE-2* (arXiv:2406.16858), *EAGLE-3* (arXiv:2503.01840)
-- Cai et al. *Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads.* 2024. arXiv:2401.10774
-- Men et al. *ShortGPT: Layers in Large Language Models are More Redundant Than You Expect.* 2024. arXiv:2403.03853
-- Gromov et al. *The Unreasonable Ineffectiveness of the Deeper Layers.* 2024. arXiv:2403.17887
 - Zhao et al. *FR-Spec: Accelerating Large-Vocabulary Language Models via Frequency-Ranked Speculative Sampling.* 2025. arXiv:2502.14856
 - Huang et al. *SpecDec++: Boosting Speculative Decoding via Adaptive Candidate Lengths.* 2024. arXiv:2405.19715
+- Bengio, Léonard, Courville. *Estimating or Propagating Gradients Through Stochastic Neurons for Conditional Computation* (straight-through estimator). 2013. arXiv:1308.3432
+- Jacob et al. *Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference.* CVPR 2018. arXiv:1712.05877
+- Williams, Waterman, Patterson. *Roofline: An Insightful Visual Performance Model for Multicore Architectures.* CACM 2009.
+- McCalpin. *STREAM: Sustainable Memory Bandwidth in High Performance Computers.*
 - Qwen Team. *Qwen3 Technical Report.* 2025. arXiv:2505.09388
-- Saxena. *Prompt Lookup Decoding.* 2023. github.com/apoorvumang/prompt-lookup-decoding
+- Intel Intrinsics Guide (for `_mm256_dpbusd_avx_epi32`, `_mm256_sign_epi8` and the F16C conversions).
 
 ---
 
-## 14. Decisions and open questions
+## 17. Decisions and open questions
 
-**Decided (2026-09-21)**
+**Decided (2026-09-21, revised)**
 
-- Pair: Qwen3-0.6B → Qwen3-4B, in non-thinking mode, using fp16.
-- Primary hardware: Kaggle 2×T4. Timing runs on a single T4.
-- The offline simulator is the main evaluation tool. Online runs confirm results and measure wall-clock speed.
-- Every speedup is measured against the compiled target.
+- The headline platform is the laptop CPU (i7-13620H, 16 GB DDR4-3200) running a custom C++ engine. This replaces
+  the T4-GPU plan, which is still in the git history.
+- Develop on Qwen3-0.6B, and bring in the 4B once quantization works.
+- Engine formats: 8-bit and 4-bit blocks of 32 with one fp16 scale per block (the Q8_0/Q4_0 layouts), 8-bit
+  activation blocks, and an fp16 KV cache.
+- Tokenization happens in Python (Hugging Face). The generation loop runs in C++, bridged by pybind11.
+- Kaggle handles training, full-size PyTorch runs of the 4B, and offline evaluation.
+- Build natively on Windows, not in WSL.
 
 **Open**
 
-1. **Target variant:** `Qwen3-4B` (default) or `Qwen3-4B-Instruct-2507`. Decide after measuring baseline α for
-   both in Phase 0.
-2. **Hardware:** Kaggle only (default), or is a local NVIDIA GPU or cloud credit available?
-3. **Is Phase 2b in scope?** The default is yes after the MVP, and earlier if compiled c > 0.3.
-4. **Domain-targeted training prompts** (summarization and translation from train splits): the default is to run
-   them only as a labeled ablation.
-5. **Weekly time budget.** The timeline assumes part-time work; adjust the milestones once Phase 0 shows the real
-   pace.
+1. **Target:** `Qwen3-4B` (default) or `Qwen3-4B-Instruct-2507`? Decide from baseline acceptance in Milestone 4, or
+   earlier offline.
+2. **Draft precision:** 4-bit or 8-bit, and should the output layer stay 8-bit? Decide from the Milestone 1
+   perplexity table and the Milestone 4 measurements of c and α.
+3. **Primary compiler:** MSVC or clang-cl? Try both in Milestone 3 and keep the faster.
+4. **Distillation track:** in parallel with the engine (default), or after Milestone 4?
+5. **Stretch goals in scope:** vocabulary trimming, quantization-aware training, layer pruning, 8-bit draft KV
+   cache, prompt lookup?
+6. **Weekly time budget:** adjust the milestones once Milestone 0 shows the real pace.

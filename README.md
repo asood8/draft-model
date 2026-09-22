@@ -1,13 +1,14 @@
 # draft-model
 
-Distilling a small draft model to speed up **Qwen3-4B** with speculative decoding on a single T4 GPU.
+Speculative decoding for **Qwen3-4B** on a laptop CPU, built from scratch.
 
-The project covers:
+The project has four parts:
 
-- a from-scratch speculative decoder;
-- a comparison of distillation data sources and losses (SFT, forward/reverse KL, TVD) under greedy decoding and
-  sampling;
-- cheaper drafts through layer pruning and vocabulary trimming;
-- predicted-versus-measured speedup analysis on Spec-Bench.
+- a C++ inference engine with 4-bit and 8-bit AVX-VNNI kernels, a thread pool that uses both core types, and an
+  fp16 KV cache;
+- speculative decoding inside that engine, with bit-exact greedy verification;
+- a Qwen3-0.6B draft distilled to match the engine's quantized target;
+- predicted-versus-measured speedup analysis on Spec-Bench, including how much each extra guess costs to verify on
+  a CPU.
 
 **Status:** planning. See [PLAN.md](PLAN.md) for the full plan.
