@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Build output
+build/
+dist/
+_skbuild/
+CMakeUserPresets.json
+
+# Model weights and other large artifacts
+models/
+weights/
+*.gguf
+*.safetensors
+*.bin
+*.npz
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db

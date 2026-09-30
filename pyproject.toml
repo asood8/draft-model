@@ -1,0 +1,26 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "specdraft"
+version = "0.0.1"
+description = "Speculative decoding for Qwen3 on a laptop CPU: a C++ engine plus a distilled draft model"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+# The PyTorch side (reference model, quantization twin, distillation) is optional so that
+# the engine and its tests can be built and run without a multi-gigabyte download.
+torch = ["torch>=2.4", "transformers>=4.51", "safetensors>=0.4", "tokenizers>=0.20"]
+dev = ["pytest>=8", "scipy>=1.11"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.build-type = "Release"
+wheel.packages = ["python/specdraft"]
+build-dir = "build/{wheel_tag}"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
