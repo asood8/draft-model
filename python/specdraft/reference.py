@@ -204,6 +204,33 @@ class Qwen3Reference:
         }
         return cls(config, state_dict)
 
+    def state_dict(self) -> dict[str, Tensor]:
+        """Hugging Face weight names again, for export and for making modified copies."""
+        state = {
+            "model.embed_tokens.weight": self.embed_tokens,
+            "model.norm.weight": self.final_norm,
+        }
+        if not self.config.tie_word_embeddings:
+            state["lm_head.weight"] = self.lm_head
+        for i, layer in enumerate(self.layers):
+            p = f"model.layers.{i}."
+            state.update(
+                {
+                    p + "input_layernorm.weight": layer.input_norm,
+                    p + "post_attention_layernorm.weight": layer.post_attn_norm,
+                    p + "self_attn.q_proj.weight": layer.q_proj,
+                    p + "self_attn.k_proj.weight": layer.k_proj,
+                    p + "self_attn.v_proj.weight": layer.v_proj,
+                    p + "self_attn.o_proj.weight": layer.o_proj,
+                    p + "self_attn.q_norm.weight": layer.q_norm,
+                    p + "self_attn.k_norm.weight": layer.k_norm,
+                    p + "mlp.gate_proj.weight": layer.gate_proj,
+                    p + "mlp.up_proj.weight": layer.up_proj,
+                    p + "mlp.down_proj.weight": layer.down_proj,
+                }
+            )
+        return state
+
     @property
     def dtype(self) -> torch.dtype:
         return self.embed_tokens.dtype
@@ -297,11 +324,14 @@ class Qwen3Reference:
         cache: KVCache | None = None,
         capture: list[Tensor] | None = None,
         only_last_logits: bool = False,
+        hidden_only: bool = False,
     ) -> Tensor:
         """Run k tokens and return logits of shape [k, vocab_size] (or [1, vocab_size]).
 
         ``capture`` collects the hidden state after every layer, which is how the C++
-        engine gets compared layer by layer.
+        engine gets compared layer by layer. ``hidden_only`` returns the final hidden
+        states instead of logits, so callers can apply the output layer in chunks rather
+        than materializing a [k, 151936] tensor.
         """
         if tokens.ndim != 1:
             raise ValueError("tokens must be a 1-D sequence; this reference has no batch dim")
@@ -330,8 +360,11 @@ class Qwen3Reference:
         x = rms_norm(x, self.final_norm, cfg.rms_norm_eps)
         if only_last_logits:
             x = x[-1:]
-        x = self.quantize_activation(x, "lm_head_input")
-        return self.matmul(x, self.lm_head, "lm_head")
+        return x if hidden_only else self.logits_from_hidden(x)
+
+    def logits_from_hidden(self, hidden: Tensor) -> Tensor:
+        """The output layer on its own, so logits can be computed in chunks."""
+        return self.matmul(self.quantize_activation(hidden, "lm_head_input"), self.lm_head, "lm_head")
 
     __call__ = forward
 
@@ -437,6 +470,20 @@ def random_reference(
 
 # Every dimension is a multiple of 32 so the quantization twin can use it too, and
 # head_dim deliberately differs from hidden_size // num_attention_heads, as in real Qwen3.
+def perturbed_copy(model: Qwen3Reference, sigma: float = 0.01, seed: int = 0) -> Qwen3Reference:
+    """A copy of a model with Gaussian noise added to every weight.
+
+    Used as a stand-in draft in tests: it agrees with the original often but not always, so
+    both the accept and the reject paths of the speculative decoder get exercised.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    state = {
+        name: tensor + torch.randn(tensor.shape, generator=generator, dtype=tensor.dtype) * sigma
+        for name, tensor in model.state_dict().items()
+    }
+    return Qwen3Reference(model.config, state)
+
+
 TINY_CONFIG = Qwen3Config(
     vocab_size=64,
     hidden_size=32,
