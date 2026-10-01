@@ -26,6 +26,8 @@ add_library(engine_core STATIC
   engine/src/model_file.cpp
   engine/src/model.cpp
   engine/src/threadpool.cpp
+  engine/src/sampling.cpp
+  engine/src/speculative.cpp
 )
 target_include_directories(engine_core PUBLIC engine/include)
 specdraft_baseline_flags(engine_core)

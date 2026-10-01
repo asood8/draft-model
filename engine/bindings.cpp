@@ -16,6 +16,8 @@
 #include "specdraft/model.hpp"
 #include "specdraft/model_file.hpp"
 #include "specdraft/quant.hpp"
+#include "specdraft/sampling.hpp"
+#include "specdraft/speculative.hpp"
 #include "specdraft/threadpool.hpp"
 
 namespace py = pybind11;
@@ -102,6 +104,51 @@ float dot_py(const py::bytes& weights, const py::bytes& activations, const char*
     return Dot(w.data(), x.data(), static_cast<int>(w.size()));
 }
 
+// One weight row against k activation vectors, which must be k whole copies of the row's
+// block count, laid out one after another.
+template <typename WBlock, void (*Dot)(const WBlock*, const BlockA8*, int, int, float*)>
+py::array_t<float> dot_multi_py(const py::bytes& weights, const py::bytes& activations,
+                                const char* what) {
+    const std::vector<WBlock> w = blocks_from_bytes<WBlock>(weights, what);
+    const std::vector<BlockA8> x = blocks_from_bytes<BlockA8>(activations, "A8");
+    if (w.empty() || x.size() % w.size() != 0) {
+        throw std::invalid_argument("activations must be a whole number of vectors");
+    }
+    const int tokens = static_cast<int>(x.size() / w.size());
+    py::array_t<float> out(tokens);
+    Dot(w.data(), x.data(), static_cast<int>(w.size()), tokens, out.mutable_data());
+    return out;
+}
+
+py::dict stats_as_dict(const DecodeStats& stats) {
+    py::dict out;
+    out["emitted"] = stats.emitted;
+    out["rounds"] = stats.rounds;
+    out["accepted"] = stats.accepted;
+    out["rejections"] = stats.rejections;
+    out["target_forwards"] = stats.target_forwards;
+    out["draft_forwards"] = stats.draft_forwards;
+    out["seconds"] = stats.seconds;
+    out["accepted_lengths"] = stats.accepted_lengths;
+    out["tokens_per_target_forward"] = stats.tokens_per_target_forward();
+    out["alpha"] = stats.alpha();
+    out["tokens_per_second"] = stats.tokens_per_second();
+    return out;
+}
+
+GenerateOptions make_options(int max_new_tokens, int gamma, float temperature, int top_k,
+                             float top_p, const std::vector<int32_t>& stop, uint64_t seed) {
+    GenerateOptions options;
+    options.max_new_tokens = max_new_tokens;
+    options.gamma = gamma;
+    options.sampling.temperature = temperature;
+    options.sampling.top_k = top_k;
+    options.sampling.top_p = top_p;
+    options.stop = stop;
+    options.seed = seed;
+    return options;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_engine, m) {
@@ -109,11 +156,12 @@ PYBIND11_MODULE(_engine, m) {
 
     py::class_<Model>(m, "Model", "Qwen3 inference over a memory-mapped weights file")
         .def(py::init([](const std::string& path, int max_positions, int threads,
-                         const std::string& cores, bool dynamic_schedule) {
+                         const std::string& cores, bool dynamic_schedule, int max_batch) {
                  EngineOptions options;
                  options.max_positions = max_positions;
                  options.threads = threads;
                  options.dynamic_schedule = dynamic_schedule;
+                 options.max_batch = max_batch;
                  if (!parse_core_selection(cores.c_str(), &options.cores)) {
                      throw std::invalid_argument(
                          "cores must be any, performance, physical or logical");
@@ -121,7 +169,9 @@ PYBIND11_MODULE(_engine, m) {
                  return std::make_unique<Model>(ModelFile::open(path), options);
              }),
              py::arg("path"), py::arg("max_positions") = 2048, py::arg("threads") = 0,
-             py::arg("cores") = "performance", py::arg("dynamic_schedule") = false)
+             py::arg("cores") = "performance", py::arg("dynamic_schedule") = false,
+             py::arg("max_batch") = 16)
+        .def_property_readonly("max_batch", &Model::max_batch)
         .def_property_readonly("threads", &Model::threads)
         .def_property_readonly("core_selection", &Model::core_selection)
         .def_property_readonly("dynamic_schedule", &Model::dynamic_schedule)
@@ -184,6 +234,100 @@ PYBIND11_MODULE(_engine, m) {
             },
             py::arg("tokens"),
             "Run k tokens and return the hidden state after every layer [layers, k, hidden].");
+
+    m.def(
+        "dot_q4_a8_multi",
+        [](const py::bytes& w, const py::bytes& x) {
+            return dot_multi_py<BlockQ4, dot_q4_a8_multi>(w, x, "Q4");
+        },
+        py::arg("weights"), py::arg("activations"),
+        "One weight row against several activation vectors, sharing one pass over the weights.");
+    m.def(
+        "dot_q8_a8_multi",
+        [](const py::bytes& w, const py::bytes& x) {
+            return dot_multi_py<BlockQ8, dot_q8_a8_multi>(w, x, "Q8");
+        },
+        py::arg("weights"), py::arg("activations"));
+
+    m.def(
+        "generate_plain",
+        [](Model& model, const std::vector<int32_t>& prompt, int max_new_tokens, float temperature,
+           int top_k, float top_p, const std::vector<int32_t>& stop, uint64_t seed) {
+            const GenerateOptions options =
+                make_options(max_new_tokens, 1, temperature, top_k, top_p, stop, seed);
+            DecodeStats stats;
+            std::vector<int32_t> tokens;
+            {
+                py::gil_scoped_release unlocked;
+                tokens = generate_plain(model, prompt, options, &stats);
+            }
+            return py::make_tuple(tokens, stats_as_dict(stats));
+        },
+        py::arg("model"), py::arg("prompt"), py::arg("max_new_tokens") = 64,
+        py::arg("temperature") = 0.0f, py::arg("top_k") = 0, py::arg("top_p") = 1.0f,
+        py::arg("stop") = std::vector<int32_t>{}, py::arg("seed") = uint64_t{0},
+        "Token-at-a-time decoding entirely inside the engine. Returns (tokens, stats).");
+
+    m.def(
+        "generate_speculative",
+        [](Model& target, Model& draft, const std::vector<int32_t>& prompt, int max_new_tokens,
+           int gamma, float temperature, int top_k, float top_p, const std::vector<int32_t>& stop,
+           uint64_t seed) {
+            const GenerateOptions options =
+                make_options(max_new_tokens, gamma, temperature, top_k, top_p, stop, seed);
+            DecodeStats stats;
+            std::vector<int32_t> tokens;
+            {
+                py::gil_scoped_release unlocked;
+                tokens = generate_speculative(target, draft, prompt, options, &stats);
+            }
+            return py::make_tuple(tokens, stats_as_dict(stats));
+        },
+        py::arg("target"), py::arg("draft"), py::arg("prompt"), py::arg("max_new_tokens") = 64,
+        py::arg("gamma") = 4, py::arg("temperature") = 0.0f, py::arg("top_k") = 0,
+        py::arg("top_p") = 1.0f, py::arg("stop") = std::vector<int32_t>{},
+        py::arg("seed") = uint64_t{0},
+        "Speculative decoding entirely inside the engine. Returns (tokens, stats).");
+
+    m.def(
+        "warp_to_probs",
+        [](py::array_t<float, py::array::c_style | py::array::forcecast> logits, float temperature,
+           int top_k, float top_p) {
+            SamplingConfig config;
+            config.temperature = temperature;
+            config.top_k = top_k;
+            config.top_p = top_p;
+            py::array_t<float> out(logits.size());
+            std::memcpy(out.mutable_data(), logits.data(),
+                        static_cast<size_t>(logits.size()) * sizeof(float));
+            std::vector<int> scratch;
+            warp_to_probs(out.mutable_data(), static_cast<int>(out.size()), config, scratch);
+            return out;
+        },
+        py::arg("logits"), py::arg("temperature") = 1.0f, py::arg("top_k") = 0,
+        py::arg("top_p") = 1.0f, "The engine's sampling warps, for testing against Python's.");
+
+    m.def(
+        "accept_or_resample",
+        [](py::array_t<float, py::array::c_style | py::array::forcecast> p,
+           py::array_t<float, py::array::c_style | py::array::forcecast> q,
+           const std::vector<int32_t>& guesses, bool greedy, uint64_t seed) {
+            const int gamma = static_cast<int>(guesses.size());
+            if (p.ndim() != 2 || q.ndim() != 2 || p.shape(0) != gamma + 1 || q.shape(0) != gamma ||
+                p.shape(1) != q.shape(1)) {
+                throw std::invalid_argument("expected p [gamma+1, V] and q [gamma, V]");
+            }
+            const int vocab = static_cast<int>(p.shape(1));
+            Rng rng(seed);
+            std::vector<float> scratch;
+            const Verdict verdict = accept_or_resample(p.data(), vocab, q.data(), vocab,
+                                                       guesses.data(), gamma, vocab, greedy, rng,
+                                                       scratch);
+            return py::make_tuple(verdict.accepted, verdict.next_token);
+        },
+        py::arg("p"), py::arg("q"), py::arg("guesses"), py::arg("greedy") = false,
+        py::arg("seed") = uint64_t{0},
+        "The engine's acceptance rule, for testing against the Python oracle.");
 
     m.def(
         "core_topology",

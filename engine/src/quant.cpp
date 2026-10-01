@@ -2,6 +2,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 
 #include "specdraft/cpu.hpp"
@@ -68,7 +69,112 @@ SD_TARGET_VNNI float dot_q8_a8_vnni(const BlockQ8* w, const BlockA8* x, int nblo
     return hsum256(_mm256_add_ps(sum0, sum1));
 }
 
+// Up to four tokens share one pass over the weights. Four keeps the eight accumulators (two
+// per token, for the parity trick above) in registers; more would spill. A matrix row slice
+// that a thread owns is small enough to sit in its L2 cache, so the second and later tiles
+// read the weights from cache rather than memory.
+constexpr int kTile = 4;
+
+SD_TARGET_VNNI void dot_q4_tile(const BlockQ4* w, const BlockA8* x, int nblocks, int tokens,
+                                float* out) {
+    const __m256i low_nibble = _mm256_set1_epi8(0x0F);
+    const __m256i eight = _mm256_set1_epi8(8);
+    __m256 sum0[kTile], sum1[kTile];
+    for (int t = 0; t < tokens; ++t) {
+        sum0[t] = _mm256_setzero_ps();
+        sum1[t] = _mm256_setzero_ps();
+    }
+
+    for (int b = 0; b < nblocks; ++b) {
+        // Unpacked once, then used by every token in the tile.
+        const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w[b].q));
+        const __m256i both = _mm256_set_m128i(_mm_srli_epi16(packed, 4), packed);
+        const __m256i wq = _mm256_sub_epi8(_mm256_and_si256(both, low_nibble), eight);
+        const __m256i magnitude = _mm256_sign_epi8(wq, wq);
+        const float weight_scale = fp16_to_fp32(w[b].scale);
+
+        for (int t = 0; t < tokens; ++t) {
+            const BlockA8& block = x[static_cast<size_t>(t) * nblocks + b];
+            const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block.q));
+            const __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), magnitude,
+                                                       _mm256_sign_epi8(xq, wq));
+            const __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(weight_scale * block.scale),
+                                                _mm256_cvtepi32_ps(acc));
+            if ((b & 1) == 0) {
+                sum0[t] = _mm256_add_ps(sum0[t], scaled);
+            } else {
+                sum1[t] = _mm256_add_ps(sum1[t], scaled);
+            }
+        }
+    }
+
+    for (int t = 0; t < tokens; ++t) {
+        out[t] = hsum256(_mm256_add_ps(sum0[t], sum1[t]));
+    }
+}
+
+SD_TARGET_VNNI void dot_q8_tile(const BlockQ8* w, const BlockA8* x, int nblocks, int tokens,
+                                float* out) {
+    __m256 sum0[kTile], sum1[kTile];
+    for (int t = 0; t < tokens; ++t) {
+        sum0[t] = _mm256_setzero_ps();
+        sum1[t] = _mm256_setzero_ps();
+    }
+
+    for (int b = 0; b < nblocks; ++b) {
+        const __m256i wq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[b].q));
+        const __m256i magnitude = _mm256_sign_epi8(wq, wq);
+        const float weight_scale = fp16_to_fp32(w[b].scale);
+
+        for (int t = 0; t < tokens; ++t) {
+            const BlockA8& block = x[static_cast<size_t>(t) * nblocks + b];
+            const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block.q));
+            const __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), magnitude,
+                                                       _mm256_sign_epi8(xq, wq));
+            const __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(weight_scale * block.scale),
+                                                _mm256_cvtepi32_ps(acc));
+            if ((b & 1) == 0) {
+                sum0[t] = _mm256_add_ps(sum0[t], scaled);
+            } else {
+                sum1[t] = _mm256_add_ps(sum1[t], scaled);
+            }
+        }
+    }
+
+    for (int t = 0; t < tokens; ++t) {
+        out[t] = hsum256(_mm256_add_ps(sum0[t], sum1[t]));
+    }
+}
+
 }  // namespace
+
+void dot_q4_a8_multi(const BlockQ4* w, const BlockA8* x, int nblocks, int k, float* out) {
+    const CpuFeatures& f = cpu_features();
+    if (!(f.avx2 && f.avx_vnni)) {
+        for (int t = 0; t < k; ++t) {
+            out[t] = dot_q4_a8_scalar(w, x + static_cast<size_t>(t) * nblocks, nblocks);
+        }
+        return;
+    }
+    for (int t = 0; t < k; t += kTile) {
+        const int tokens = std::min(kTile, k - t);
+        dot_q4_tile(w, x + static_cast<size_t>(t) * nblocks, nblocks, tokens, out + t);
+    }
+}
+
+void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, float* out) {
+    const CpuFeatures& f = cpu_features();
+    if (!(f.avx2 && f.avx_vnni)) {
+        for (int t = 0; t < k; ++t) {
+            out[t] = dot_q8_a8_scalar(w, x + static_cast<size_t>(t) * nblocks, nblocks);
+        }
+        return;
+    }
+    for (int t = 0; t < k; t += kTile) {
+        const int tokens = std::min(kTile, k - t);
+        dot_q8_tile(w, x + static_cast<size_t>(t) * nblocks, nblocks, tokens, out + t);
+    }
+}
 
 void quantize_q4(const float* x, int n, BlockQ4* out) {
     const int nblocks = n / QK;

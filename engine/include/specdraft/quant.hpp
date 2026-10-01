@@ -82,4 +82,16 @@ float dot_q8_a8_scalar(const BlockQ8* w, const BlockA8* x, int nblocks);
 float dot_q4_a8(const BlockQ4* w, const BlockA8* x, int nblocks);
 float dot_q8_a8(const BlockQ8* w, const BlockA8* x, int nblocks);
 
+// One weight row against k activation vectors, unpacking each weight block once and reusing
+// it for every token. This is the kernel that decides v(k): the cost of verifying γ+1
+// guesses relative to producing one token. Reading the weights is what a single token's step
+// is made of, so k tokens that share those reads cost far less than k separate steps.
+//
+// Activations are laid out as k consecutive vectors of `nblocks` blocks each; `out` receives
+// one float per token. Each token accumulates in exactly the order the single-token kernel
+// uses, so results are bit-identical to calling that kernel k times — the property greedy
+// speculative decoding depends on.
+void dot_q4_a8_multi(const BlockQ4* w, const BlockA8* x, int nblocks, int k, float* out);
+void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, float* out);
+
 }  // namespace specdraft

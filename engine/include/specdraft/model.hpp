@@ -26,6 +26,9 @@ struct EngineOptions {
     // Hand out row chunks from a shared counter instead of a fixed split. On a hybrid CPU a
     // fixed split makes the performance cores wait for the efficiency cores.
     bool dynamic_schedule = false;
+    // How many tokens may share one pass over the weights. Verification needs γ+1 and prompt
+    // processing wants as many as fit; longer sequences are split into chunks of this size.
+    int max_batch = 16;
 };
 
 class Model {
@@ -38,6 +41,7 @@ public:
     int threads() const;
     const char* core_selection() const { return core_selection_name(options_.cores); }
     bool dynamic_schedule() const { return options_.dynamic_schedule; }
+    int max_batch() const { return options_.max_batch; }
     int pos() const { return pos_; }
 
     // Rolling back rejected draft tokens: attention only reads up to the counter, and stale
@@ -75,12 +79,18 @@ private:
         Tensor qkv, attn_out, gate_up, ffn_down;
     };
 
-    void forward_one(int32_t token, int position, float* logits_out, float* capture_out, int k,
-                     int token_index);
-    void attention(int layer_index, int position);
-    void matvec(const Tensor& weight, const float* x, uint32_t n_in, float* out, uint32_t n_out);
+    // One pass over the weights for `batch` tokens starting at position `base`.
+    void forward_batch(const int32_t* tokens, int batch, int base, float* logits_out,
+                       bool all_logits, int single_token, float* capture_out, int capture_offset,
+                       int capture_total);
+    void attention(int layer_index, int base, int batch);
+    // `batch` activation vectors against one weight matrix. Strides are in floats, so a caller
+    // can feed vectors that sit inside a wider buffer.
+    void matmul(const Tensor& weight, const float* in, uint32_t in_stride, uint32_t n_in,
+                float* out, uint32_t out_stride, uint32_t n_out, int batch);
     void embed(int32_t token, float* out) const;
     size_t cache_index(int layer, uint32_t kv_head, int position) const;
+    size_t score_index(int token, uint32_t head) const;
 
     ModelFile file_;
     EngineOptions options_;
@@ -92,7 +102,9 @@ private:
     Tensor output_;
     const float* output_norm_ = nullptr;
 
-    std::vector<float> x_, xb_, xb2_, qkv_, att_, scores_, mlp_, kv_scratch_;
+    // All sized for max_batch tokens; strides are the per-token widths below.
+    std::vector<float> x_, xb_, xb2_, qkv_, att_, scores_, mlp_, kv_scratch_, row_scratch_;
+    uint32_t qkv_stride_ = 0, mlp_stride_ = 0, blocks_stride_ = 0;
     std::vector<BlockA8> activations_;
     std::vector<uint16_t> key_cache_, value_cache_;  // [layer][kv_head][position][head_dim], fp16
 

@@ -149,3 +149,31 @@ def test_fake_quantize_keeps_shape():
     assert out.shape == x.shape and out.dtype == np.float32
     # Blocks run along the last axis, so each row is quantized independently.
     assert np.array_equal(out[1], pyq.fake_quantize(x[1], "q4"))
+
+
+# ------------------------------------------------- the k-token kernel (plan §10.1)
+
+
+@pytest.mark.parametrize("weight_fmt", ["q4", "q8"])
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4, 5, 8, 13])
+@pytest.mark.parametrize("n", [32, 1024])
+def test_multi_token_kernel_is_bit_exact_against_one_token_at_a_time(weight_fmt, tokens, n):
+    """This is what lets verification share one pass over the weights without changing a
+    single output bit, which is what bit-exact greedy speculative decoding needs."""
+    w_blob = _PY_QUANTIZE[weight_fmt](sample("normal", n, 1.0, seed=20))
+    vectors = [sample("normal", n, 0.5, seed=30 + i) for i in range(tokens)]
+    blobs = [pyq.quantize_a8(v) for v in vectors]
+
+    together = getattr(cpp, f"dot_{weight_fmt}_a8_multi")(w_blob, b"".join(blobs))
+    separately = [getattr(cpp, f"dot_{weight_fmt}_a8")(w_blob, blob) for blob in blobs]
+
+    assert together.shape == (tokens,)
+    assert np.array_equal(together, np.array(separately, dtype=np.float32))
+
+
+@pytest.mark.parametrize("weight_fmt", ["q4", "q8"])
+def test_multi_token_kernel_rejects_ragged_input(weight_fmt):
+    w_blob = _PY_QUANTIZE[weight_fmt](sample("normal", 64, 1.0, seed=21))
+    short = pyq.quantize_a8(sample("normal", 32, 1.0, seed=22))
+    with pytest.raises(Exception):
+        getattr(cpp, f"dot_{weight_fmt}_a8_multi")(w_blob, short)
