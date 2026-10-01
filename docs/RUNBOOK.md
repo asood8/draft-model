@@ -98,8 +98,15 @@ python scripts/run_specbench.py \
     --out results/specbench_baseline.json
 ```
 
-The question file is not bundled: take `data/spec_bench/question.jsonl` from
-github.com/hemingkx/Spec-Bench, or any JSON-lines file with `category` and `turns`.
+The question file is fetched separately, since it is someone else's dataset:
+
+```bash
+python scripts/fetch_specbench.py     # 480 questions, six categories of 80
+```
+
+It is already downloaded here. Any JSON-lines file with `category` and `turns` works instead. The
+two-turn questions are MT-Bench's and get grouped into the multi-turn category, which is how the
+benchmark's six categories are recovered from the finer labels in the file.
 
 Runs target-alone, the draft, prompt lookup and early stopping, interleaved per question. Compare
 the measured speedup against step 4's prediction — the gap between them is the interesting part, and

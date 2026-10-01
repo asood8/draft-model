@@ -22,3 +22,6 @@ weights/
 .vscode/
 .idea/
 Thumbs.db
+
+# Someone else's dataset, fetched by scripts/fetch_specbench.py
+data/spec_bench/

@@ -208,3 +208,37 @@ def test_the_runner_drives_the_engine(tmp_path):
         summary["speculative"]["all"]["tokens_per_target_forward"]
         >= summary["target"]["all"]["tokens_per_target_forward"]
     )
+
+def test_mt_bench_questions_are_grouped_by_their_turn_count(tmp_path):
+    """Spec-Bench labels its MT-Bench portion with MT-Bench's own eight sub-categories, and its
+    "math" label covers both MT-Bench's maths questions and GSM8K's. Two turns means MT-Bench,
+    which is the only reliable way to recover the six categories the benchmark reports."""
+    rows = [
+        {"question_id": 1, "category": "coding", "turns": ["write code", "now improve it"]},
+        {"question_id": 2, "category": "math", "turns": ["2+2?", "and 3+3?"]},  # MT-Bench maths
+        {"question_id": 3, "category": "math", "turns": ["a word problem"]},  # GSM8K
+        {"question_id": 4, "category": "translation", "turns": ["translate"]},
+    ]
+    path = write_questions(tmp_path / "q.jsonl", rows)
+
+    grouped = {q.question_id: q.category for q in load_questions(path)}
+    assert grouped == {1: "multi_turn", 2: "multi_turn", 3: "math", 4: "translation"}
+
+    ungrouped = {q.question_id: q.category for q in load_questions(path, group_multi_turn=False)}
+    assert ungrouped[1] == "coding" and ungrouped[2] == "math"
+
+
+@pytest.mark.skipif(
+    not Path("data/spec_bench/question.jsonl").is_file(),
+    reason="run scripts/fetch_specbench.py first",
+)
+def test_the_real_question_file_has_the_six_categories():
+    """The benchmark is 480 questions in six categories of 80; if that is not what came out, either
+    the file changed or the grouping is wrong."""
+    from collections import Counter
+
+    questions = load_questions("data/spec_bench/question.jsonl")
+    counts = Counter(question.category for question in questions)
+    assert len(questions) == 480
+    assert set(counts) == set(CATEGORIES)
+    assert set(counts.values()) == {80}

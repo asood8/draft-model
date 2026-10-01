@@ -27,6 +27,14 @@ from typing import Callable, Iterable, Sequence
 # What the method is handed (prompt token ids) and what it returns (tokens, statistics).
 MethodFn = Callable[[list[int]], tuple[list[int], dict]]
 
+# Spec-Bench's own file labels its MT-Bench portion with MT-Bench's eight sub-categories rather
+# than one name, and its "math" label covers both MT-Bench's maths questions and GSM8K's. The
+# distinguishing feature is the turn count: the 80 MT-Bench questions are the only two-turn ones,
+# which is what `load_questions` groups on.
+MT_BENCH_SUBCATEGORIES = (
+    "writing", "roleplay", "reasoning", "coding", "extraction", "stem", "humanities",
+)
+
 CATEGORY_ALIASES = {
     "mt_bench": "multi_turn",
     "mt-bench": "multi_turn",
@@ -68,6 +76,7 @@ def load_questions(
     categories: Sequence[str] | None = None,
     limit_per_category: int | None = None,
     seed: int = 0,
+    group_multi_turn: bool = True,
 ) -> list[Question]:
     """Read the benchmark file, optionally taking a stratified subset.
 
@@ -85,10 +94,15 @@ def load_questions(
             turns = [single] if single else []
         if not turns:
             continue
+        # A two-turn question is from MT-Bench, whatever its own label says, and belongs in the
+        # multi-turn category the benchmark reports.
+        category = normalize_category(str(row.get("category", "unknown")))
+        if group_multi_turn and len(turns) > 1:
+            category = "multi_turn"
         questions.append(
             Question(
                 question_id=row.get("question_id", len(questions)),
-                category=normalize_category(str(row.get("category", "unknown"))),
+                category=category,
                 turns=list(turns),
             )
         )
