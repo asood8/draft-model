@@ -326,3 +326,55 @@ def teacher_from_model(model, device: str | None = None) -> TeacherFn:
         return logits if device is None else logits.to(device)
 
     return teacher
+
+
+def save_draft(
+    path: str | Path,
+    student: TrainableDraft,
+    source_model_dir: str | Path | None = None,
+    extra: dict | None = None,
+) -> Path:
+    """Write the trained draft where both the Hub and the export script can read it.
+
+    The architecture is unchanged, so the source model's config and tokenizer are copied across
+    and only the fields that training can alter are overridden. That keeps the result loadable by
+    ``AutoModelForCausalLM`` and by ``scripts/export_model.py`` without special cases.
+    """
+    import shutil
+
+    from safetensors.torch import save_file
+
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    weights = {
+        name: tensor.detach().to(torch.float32).contiguous()
+        for name, tensor in student.reference_state_dict().items()
+    }
+    save_file(weights, str(path / "model.safetensors"))
+
+    config = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        **{k: v for k, v in student.config.__dict__.items()},
+    }
+    if source_model_dir is not None:
+        source = Path(source_model_dir)
+        original = json.loads((source / "config.json").read_text(encoding="utf-8"))
+        original.update(
+            {
+                "num_hidden_layers": student.config.num_hidden_layers,
+                "tie_word_embeddings": student.config.tie_word_embeddings,
+                "torch_dtype": "float32",
+            }
+        )
+        config = original
+        for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
+                     "chat_template.jinja", "generation_config.json"):
+            candidate = source / name
+            if candidate.is_file():
+                shutil.copy2(candidate, path / name)
+
+    (path / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    if extra:
+        (path / "training.json").write_text(json.dumps(extra, indent=2), encoding="utf-8")
+    return path
