@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "specdraft/cpu.hpp"
+#include "specdraft/model.hpp"
+#include "specdraft/model_file.hpp"
 #include "specdraft/quant.hpp"
 
 namespace py = pybind11;
@@ -21,6 +23,30 @@ using namespace specdraft;
 namespace {
 
 using FloatArray = py::array_t<float, py::array::c_style | py::array::forcecast>;
+using TokenArray = py::array_t<int32_t, py::array::c_style | py::array::forcecast>;
+
+int checked_token_count(const TokenArray& tokens) {
+    if (tokens.ndim() != 1 || tokens.size() == 0) {
+        throw std::invalid_argument("tokens must be a non-empty 1-D int32 array");
+    }
+    return static_cast<int>(tokens.size());
+}
+
+py::dict config_as_dict(const ModelConfig& c) {
+    py::dict out;
+    out["vocab_size"] = c.vocab_size;
+    out["hidden_size"] = c.hidden_size;
+    out["intermediate_size"] = c.intermediate_size;
+    out["num_hidden_layers"] = c.num_hidden_layers;
+    out["num_attention_heads"] = c.num_attention_heads;
+    out["num_key_value_heads"] = c.num_key_value_heads;
+    out["head_dim"] = c.head_dim;
+    out["vocab_limit"] = c.vocab_limit;
+    out["tie_word_embeddings"] = c.tie_word_embeddings != 0;
+    out["rms_norm_eps"] = c.rms_norm_eps;
+    out["rope_theta"] = c.rope_theta;
+    return out;
+}
 
 int checked_length(const FloatArray& x) {
     if (x.size() % QK != 0 || x.size() == 0) {
@@ -79,6 +105,69 @@ float dot_py(const py::bytes& weights, const py::bytes& activations, const char*
 
 PYBIND11_MODULE(_engine, m) {
     m.doc() = "specdraft CPU engine";
+
+    py::class_<Model>(m, "Model", "Qwen3 inference over a memory-mapped weights file")
+        .def(py::init([](const std::string& path, int max_positions) {
+                 return std::make_unique<Model>(ModelFile::open(path), max_positions);
+             }),
+             py::arg("path"), py::arg("max_positions") = 2048)
+        .def_property_readonly("config", [](const Model& model) { return config_as_dict(model.config()); })
+        .def_property_readonly("max_positions", &Model::max_positions)
+        .def_property_readonly("pos", &Model::pos, "how many positions the KV cache holds")
+        .def("set_pos", &Model::set_pos, py::arg("position"),
+             "Roll the cache back; attention then ignores everything past this point.")
+        .def("reset", &Model::reset)
+        .def(
+            "forward",
+            [](Model& model, const TokenArray& tokens, bool all_logits) {
+                const int k = checked_token_count(tokens);
+                const auto rows = all_logits ? k : 1;
+                py::array_t<float> out({rows, static_cast<int>(model.config().vocab_limit)});
+                const int32_t* ids = tokens.data();
+                float* destination = out.mutable_data();
+                {
+                    py::gil_scoped_release unlocked;
+                    model.forward(ids, k, destination, all_logits);
+                }
+                return out;
+            },
+            py::arg("tokens"), py::arg("all_logits") = false,
+            "Run k tokens at the current position and return logits [k or 1, vocab_limit].")
+        .def(
+            "forward_capture",
+            [](Model& model, const TokenArray& tokens) {
+                const int k = checked_token_count(tokens);
+                const ModelConfig& c = model.config();
+                py::array_t<float> out({static_cast<int>(c.num_hidden_layers), k,
+                                        static_cast<int>(c.hidden_size)});
+                const int32_t* ids = tokens.data();
+                float* destination = out.mutable_data();
+                {
+                    py::gil_scoped_release unlocked;
+                    model.forward(ids, k, nullptr, false, destination);
+                }
+                return out;
+            },
+            py::arg("tokens"),
+            "Run k tokens and return the hidden state after every layer [layers, k, hidden].");
+
+    m.def(
+        "model_file_info",
+        [](const std::string& path) {
+            ModelFile file = ModelFile::open(path);
+            py::dict tensors;
+            for (const std::string& name : file.names()) {
+                const Tensor& tensor = file.tensor(name);
+                tensors[py::str(name)] =
+                    py::make_tuple(format_name(tensor.format), tensor.rows, tensor.cols, tensor.nbytes);
+            }
+            py::dict out;
+            out["config"] = config_as_dict(file.config());
+            out["size_bytes"] = file.size_bytes();
+            out["tensors"] = tensors;
+            return out;
+        },
+        py::arg("path"), "Read a weights file's header and directory without loading a model.");
 
     m.attr("QK") = QK;
     m.attr("BLOCK_SIZES") = std::map<std::string, size_t>{

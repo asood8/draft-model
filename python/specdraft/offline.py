@@ -65,6 +65,29 @@ class PositionMetrics:
         return self.greedy_match.astype(np.float64) if greedy else self.coupled_accept
 
 
+def _row_logits(model, tokens: Tensor, rows: np.ndarray, chunk: int):
+    """Yield (begin, end, logits) for the requested rows, in chunks.
+
+    Models that can hand back hidden states (the reference and the twin) get their output
+    layer applied chunk by chunk, so a full [T, 151936] float32 tensor never exists. The C++
+    engine cannot separate its output layer from its forward pass, so it is asked for all
+    logits at once instead.
+    """
+    try:
+        hidden = model.forward(tokens, hidden_only=True)
+    except NotImplementedError:
+        logits = model.forward(tokens, cache=model.new_cache(len(tokens)), only_last_logits=False)
+        for begin in range(0, len(rows), chunk):
+            end = min(begin + chunk, len(rows))
+            yield begin, end, logits[torch.as_tensor(rows[begin:end])]
+        return
+
+    for begin in range(0, len(rows), chunk):
+        end = min(begin + chunk, len(rows))
+        index = torch.as_tensor(rows[begin:end], device=hidden.device)
+        yield begin, end, model.logits_from_hidden(hidden[index])
+
+
 @torch.no_grad()
 def score_sequence(
     target,
@@ -85,9 +108,6 @@ def score_sequence(
     if not 1 <= response_start < len(tokens):
         raise ValueError("response_start must be inside the sequence")
 
-    target_hidden = target.forward(tokens, hidden_only=True)
-    draft_hidden = draft.forward(tokens, hidden_only=True)
-
     rows = np.arange(response_start - 1, len(tokens) - 1)  # logits rows to score
     predicted = np.asarray(tokens[response_start:].tolist(), dtype=np.int64)
 
@@ -97,11 +117,9 @@ def score_sequence(
     confidence = np.zeros(len(rows), dtype=np.float64)
     target_match = np.zeros(len(rows), dtype=bool)
 
-    for begin in range(0, len(rows), chunk):
-        end = min(begin + chunk, len(rows))
-        index = torch.as_tensor(rows[begin:end], device=target_hidden.device)
-        p_logits = target.logits_from_hidden(target_hidden[index])
-        q_logits = draft.logits_from_hidden(draft_hidden[index])
+    for (begin, end, p_logits), (_, _, q_logits) in zip(
+        _row_logits(target, tokens, rows, chunk), _row_logits(draft, tokens, rows, chunk)
+    ):
         if vocab_limit is not None:
             p_logits = p_logits[..., :vocab_limit]
             q_logits = q_logits[..., :vocab_limit]

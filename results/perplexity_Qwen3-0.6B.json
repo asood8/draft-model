@@ -1,22 +1,37 @@
 {
   "model": "models\\Qwen3-0.6B",
   "window": 1024,
-  "windows": 2,
-  "tokens": 2048,
+  "windows": 8,
+  "tokens": 8192,
   "vocab_limit": 151669,
   "rows": [
     {
       "config": "fp32",
-      "perplexity": 19.95432472229004,
-      "tokens_per_second": 42.1027062800581
+      "perplexity": 28.53030776977539,
+      "tokens_per_second": 141.8578551980839
+    },
+    {
+      "config": "q8",
+      "perplexity": 28.457014083862305,
+      "tokens_per_second": 96.90191391014528
     },
     {
       "config": "q4",
-      "perplexity": 21.878204345703125,
-      "tokens_per_second": 47.474849751664166
+      "perplexity": 32.175498962402344,
+      "tokens_per_second": 96.07273872717727
+    },
+    {
+      "config": "q4 + q8 output",
+      "perplexity": 31.52581787109375,
+      "tokens_per_second": 110.04309577530638
+    },
+    {
+      "config": "engine twin (q4 + a8 + fp16 kv)",
+      "perplexity": 32.118167877197266,
+      "tokens_per_second": 84.00889502686633
     }
   ],
   "torch": "2.14.0+cpu",
   "cpu": "Intel64 Family 6 Model 186 Stepping 2, GenuineIntel",
-  "when": "2026-09-30T06:07:00+00:00"
+  "when": "2026-09-30T06:14:48+00:00"
 }

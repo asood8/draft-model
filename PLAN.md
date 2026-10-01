@@ -8,6 +8,12 @@ This version replaces the earlier plan, which targeted a T4 GPU; it is still in 
 **10–14 weeks of part-time work**. **Milestones 3 and 4 are natural stopping points** that are resume-worthy on
 their own. Section 17 tracks decisions and open questions.
 
+## Status
+
+| Date | Where things stand |
+|---|---|
+| 2026-09-30 | **Milestone 1 done.** Qwen3 written from scratch matches Hugging Face layer by layer and token for token. The quantization formats exist in C++, NumPy and torch, byte-identical. The 0.6B exports to 4 bits at 4.50 bits/weight (335 MB). Perplexity table measured (§7.2). **Milestone 2 done.** The C++ engine loads that file, its fp32 path matches the reference to 1e-5, and its greedy output matches the twin token for token; the Python speculative decoder drives it. Toolchain installed (VS Build Tools 2026, MSVC 19.51, clang-cl 22.1, CMake 4.3, Ninja 1.13). 434 tests pass. Next: Milestone 3, making it fast. |
+
 ---
 
 ## Contents
@@ -438,16 +444,33 @@ byte.
 - **Done when:** greedy generation matches PyTorch token for token. The fp32 engine is compared with the fp32
   reference, and the quantized engine with the twin; any mismatches must be documented near-ties.
 
+> **Measured, 2026-09-30: how closely the engine and the twin can agree.** The fp32 path agrees to 1e-5, so the
+> arithmetic is right. The quantized path cannot agree elementwise, and tightening the threshold would only
+> produce a test that fails for the wrong reason. 8-bit activation quantization is a *step function*: on the real
+> 0.6B, nudging one layer's input by 7e-8 relative — far below float32 noise — flips **229 of 1024** activation
+> levels and moves that layer's output by 5e-3, and the effect *saturates* rather than shrinking as the nudge gets
+> smaller. Two implementations differing by one ulp anywhere therefore diverge by about that much per layer, which
+> compounds to a few percent in the logits over 28 layers.
+>
+> Three consequences, all of them now enforced by tests:
+> 1. **What to assert about engine versus twin:** identical decoded tokens, top-1 agreement (measured 98.9%), and
+>    a bounded total variation distance (measured 0.023) — never elementwise closeness.
+> 2. **Bit-exactness still holds strictly inside the engine.** A k-token pass equals k single-token passes exactly,
+>    which is all that greedy speculative decoding needs, and it is unaffected by this.
+> 3. **Scoring the engine's own text is worth it (see §11.6).** The engine exposes all logits, so final acceptance
+>    numbers need not inherit the twin's 1–2% offset.
+
 **Scalar reference kernel.** This becomes the oracle for the SIMD version.
 
 ```cpp
 #include <cstdint>
 
 struct BlockQ4 { uint16_t scale; uint8_t q[16]; };  // 32 weights at 4 bits + fp16 scale
-struct BlockQ8 { float scale; int8_t q[32]; };      // 32 activations at 8 bits
+struct BlockQ8 { uint16_t scale; int8_t q[32]; };   // 32 weights at 8 bits + fp16 scale
+struct BlockA8 { float scale; int8_t q[32]; };      // 32 activations at 8 bits + fp32 scale
 
 // Scalar reference for testing the SIMD kernel. fp16_to_fp32 can use F16C's _cvtsh_ss.
-float dot_q4_q8(const BlockQ4* w, const BlockQ8* x, int nblocks) {
+float dot_q4_a8(const BlockQ4* w, const BlockA8* x, int nblocks) {
     float sum = 0.0f;
     for (int b = 0; b < nblocks; ++b) {
         int32_t acc = 0;
@@ -799,6 +822,17 @@ def simulate_tokens_per_step(accept_prob, gamma, draws=20, seed=0):
     return draws * T / steps
 ```
 
+**Which models the scores come from.** The simulation is exact *for the pair of models being scored*. Scoring the
+twins on a GPU is what makes the grid affordable, and the twin tracks the engine closely but not perfectly
+(measured 2026-09-30: 98.9% top-1 agreement, 0.023 mean TVD — see the note in §8 for why it cannot be perfect).
+That is good enough for **ranking** recipes, since the offset applies to all of them equally, but not for the
+numbers that get published. So:
+
+- **rank** losses and data sources with the twins on Kaggle, then
+- **re-score the chosen draft with the engine itself** before quoting acceptance. The engine returns all logits and
+  `offline.score_sequence` accepts either kind of model, so it is the same code either way.
+- `scripts/engine_twin_agreement.py` reports the gap; re-run it whenever the engine's arithmetic changes.
+
 ### 11.7 Grid (budget-aware)
 
 | Stage | Runs | Purpose |
@@ -945,8 +979,12 @@ If you'd rather do one thing at a time, run Milestone 5 after Milestone 4 and ad
 
 1. **Target:** `Qwen3-4B` (default) or `Qwen3-4B-Instruct-2507`? Decide from baseline acceptance in Milestone 4, or
    earlier offline.
-2. **Draft precision:** 4-bit or 8-bit, and should the output layer stay 8-bit? Decide from the Milestone 1
-   perplexity table and the Milestone 4 measurements of c and α.
+2. **Draft precision:** 4-bit or 8-bit, and should the output layer stay 8-bit? **Measured 2026-09-30** on
+   WikiText-2 (8,192 tokens, Qwen3-0.6B): fp32 28.53, 8-bit 28.46 (free), 4-bit 32.18 (**+12.8%**), 4-bit with an
+   8-bit output layer 31.53 (+10.5%), full engine twin 32.12. So activations and the fp16 cache cost almost
+   nothing, 4-bit weights cost real quality on a 0.6B, and the 8-bit output layer buys back a fifth of that for
+   about 13% more draft bytes. What remains is whether that quality loss shows up as lost *acceptance*, which
+   needs the Milestone 4 measurements of c and α to settle.
 3. **Primary compiler:** MSVC or clang-cl? Try both in Milestone 3 and keep the faster.
 4. **Distillation track:** in parallel with the engine (default), or after Milestone 4?
 5. **Stretch goals in scope:** vocabulary trimming, quantization-aware training, layer pruning, 8-bit draft KV

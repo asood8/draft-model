@@ -1,0 +1,11 @@
+{
+  "engine_file": "models\\Qwen3-0.6B-q4.sdm",
+  "weight_format": "q4",
+  "tokens": 87,
+  "top1_agreement": 0.9885057210922241,
+  "top5_overlap": 0.9793103448275863,
+  "mean_tvd": 0.02284356951713562,
+  "logit_relative_error": 0.03189815953373909,
+  "temperature": 1.0,
+  "when": "2026-10-01T03:48:16+00:00"
+}
