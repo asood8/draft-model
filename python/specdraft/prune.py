@@ -153,3 +153,49 @@ def save_pruned(
 
     student = TrainableDraft(model.config, model.state_dict())
     return save_draft(path, student, source_model_dir=source_model_dir, extra=extra)
+
+
+# ------------------------------------------------------------------- vocabulary trimming
+#
+# The companion to layer pruning (plan §8.2). A 0.6B draft's output layer spans 151,936 rows and
+# is about a quarter of the bytes a decode step reads, and pruning layers cannot touch it. Keeping
+# only the tokens that actually get generated cuts most of that.
+#
+# It stays exact: the draft simply never proposes a dropped token, and the acceptance rule reads q
+# only where the draft proposed, so the residual max(0, p − q) still covers everything else.
+
+
+def token_frequencies(sequences: list, vocab_size: int, response_only: bool = True) -> Tensor:
+    """How often each token appears, counted over the text a draft would have to produce.
+
+    ``sequences`` are ``TrainedSequence`` objects; by default only response positions count, since
+    prompts are read rather than generated.
+    """
+    counts = torch.zeros(vocab_size, dtype=torch.long)
+    for sequence in sequences:
+        tokens = sequence.tokens[sequence.response_start :] if response_only else sequence.tokens
+        if tokens:
+            counts.index_add_(
+                0, torch.tensor(tokens, dtype=torch.long), torch.ones(len(tokens), dtype=torch.long)
+            )
+    return counts
+
+
+def choose_vocabulary(
+    counts: Tensor, keep: int, always_keep: list[int] | None = None
+) -> tuple[Tensor, float]:
+    """The `keep` most frequent tokens, plus any that must survive regardless.
+
+    Returns the sorted token ids and the share of occurrences they cover, which is the acceptance
+    the trimming can cost at most: whatever mass the target puts on a dropped token is a guess the
+    draft can no longer make.
+    """
+    if keep <= 0 or keep > counts.numel():
+        raise ValueError(f"keep must be between 1 and {counts.numel()}")
+
+    ranked = torch.argsort(counts, descending=True)[:keep].tolist()
+    kept = set(ranked) | set(always_keep or [])
+    ids = torch.tensor(sorted(kept), dtype=torch.int32)
+    total = int(counts.sum())
+    covered = int(counts[ids.long()].sum())
+    return ids, (covered / total if total else 0.0)

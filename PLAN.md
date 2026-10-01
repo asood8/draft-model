@@ -857,6 +857,16 @@ numbers that get published. So:
 > The saving is also smaller than the layer count suggests: removing those 8 layers cuts bytes per token only to
 > **0.79** of the original, because the output layer over a 151,936-row vocabulary is a fixed cost pruning cannot
 > touch. That is what makes vocabulary trimming the companion to pruning rather than an alternative to it.
+>
+> **Vocabulary trimming, measured the same day.** Keeping the 32,768 most frequent tokens cuts the draft's output
+> layer from 87.5 MB to 18.9 MB, taking bytes per decode step from 335 MB to **267 MB (0.80×)** — about the same
+> saving as dropping eight layers, and the two multiply to roughly 0.63×. On WikiText the kept set covers
+> **100.000%** of occurrences (that text uses only 19,714 distinct tokens), so the acceptance cost there is nil;
+> a mix with code and other languages will use more, so coverage has to be recomputed on the real generation data.
+> Unlike pruning, this needs no healing: the draft simply cannot propose what it dropped, and tests confirm greedy
+> output is unchanged and sampling still passes a chi-square against the target's distribution. The file grows on
+> disk, since it now carries both the full embedding for lookups and the trimmed output layer, while the bytes a
+> step *reads* fall — which is what c is made of.
 
 **Kaggle GPU budget (rough)**
 

@@ -44,6 +44,15 @@ public:
     int max_batch() const { return options_.max_batch; }
     int pos() const { return pos_; }
 
+    // How many logits one scored token produces: the whole vocabulary, or just the tokens a
+    // trimmed output layer kept.
+    uint32_t logit_count() const { return output_map_ == nullptr ? config().vocab_limit : config().output_vocab; }
+    // Which token a logit refers to. The identity unless the output layer was trimmed.
+    int32_t token_for_logit(uint32_t index) const {
+        return output_map_ == nullptr ? static_cast<int32_t>(index) : output_map_[index];
+    }
+    bool trimmed_vocabulary() const { return output_map_ != nullptr; }
+
     // Rolling back rejected draft tokens: attention only reads up to the counter, and stale
     // entries beyond it get overwritten by the next round.
     void set_pos(int position);
@@ -100,6 +109,7 @@ private:
     std::vector<Layer> layers_;
     Tensor embedding_;  // token_embd, also the output layer when weights are tied
     Tensor output_;
+    const int32_t* output_map_ = nullptr;  // null unless the output layer was trimmed
     const float* output_norm_ = nullptr;
 
     // All sized for max_batch tokens; strides are the per-token widths below.

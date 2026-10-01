@@ -12,7 +12,8 @@
 
 namespace specdraft {
 
-enum class Format : uint32_t { fp32 = 0, q4 = 1, q8 = 2 };
+// i32 is not a weight format: it carries the vocabulary map of a trimmed output layer.
+enum class Format : uint32_t { fp32 = 0, q4 = 1, q8 = 2, i32 = 3 };
 
 const char* format_name(Format format);
 
@@ -28,6 +29,11 @@ struct ModelConfig {
     uint32_t num_key_value_heads = 0;
     uint32_t head_dim = 0;  // from the file, not hidden_size / heads
     uint32_t vocab_limit = 0;  // the tokenizer's size; rows past it are padding
+    // Rows in a trimmed output layer, or 0 when it spans the whole vocabulary. A trimmed draft
+    // can only propose the tokens it kept, which costs acceptance but saves a quarter of its
+    // bytes per step; the acceptance rule needs no change, since it only reads q where the draft
+    // actually proposed.
+    uint32_t output_vocab = 0;
     uint32_t tie_word_embeddings = 0;
     double rms_norm_eps = 0.0;
     double rope_theta = 0.0;

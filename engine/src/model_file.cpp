@@ -21,7 +21,7 @@ namespace {
 
 // Must match python/specdraft/export.py.
 constexpr char MAGIC[4] = {'S', 'D', 'M', '2'};
-constexpr uint32_t VERSION = 2;
+constexpr uint32_t VERSION = 3;
 constexpr size_t HEADER_BYTES = 128;
 constexpr size_t ENTRY_BYTES = 72;
 constexpr size_t NAME_BYTES = 40;
@@ -43,6 +43,8 @@ const char* format_name(Format format) {
             return "q4";
         case Format::q8:
             return "q8";
+        case Format::i32:
+            return "i32";
     }
     return "?";
 }
@@ -55,6 +57,8 @@ size_t row_bytes(Format format, uint32_t cols) {
             return static_cast<size_t>(cols) / QK * sizeof(BlockQ4);
         case Format::q8:
             return static_cast<size_t>(cols) / QK * sizeof(BlockQ8);
+        case Format::i32:
+            return static_cast<size_t>(cols) * sizeof(int32_t);
     }
     return 0;
 }
@@ -177,9 +181,10 @@ ModelFile ModelFile::open(const std::string& path) {
     config.num_key_value_heads = read_at<uint32_t>(base, 36);
     config.head_dim = read_at<uint32_t>(base, 40);
     config.vocab_limit = read_at<uint32_t>(base, 44);
-    config.tie_word_embeddings = read_at<uint32_t>(base, 48);
-    config.rms_norm_eps = read_at<double>(base, 52);
-    config.rope_theta = read_at<double>(base, 60);
+    config.output_vocab = read_at<uint32_t>(base, 48);
+    config.tie_word_embeddings = read_at<uint32_t>(base, 52);
+    config.rms_norm_eps = read_at<double>(base, 56);
+    config.rope_theta = read_at<double>(base, 64);
 
     if (HEADER_BYTES + static_cast<size_t>(count) * ENTRY_BYTES > file.size_ ||
         data_start > file.size_) {

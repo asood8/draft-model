@@ -53,7 +53,12 @@ ModelDrafter::ModelDrafter(Model& model, const SamplingConfig& sampling, float c
     : model_(model),
       sampling_(sampling),
       confidence_threshold_(confidence_threshold),
-      vocab_(static_cast<int>(model.config().vocab_limit)) {}
+      vocab_(static_cast<int>(model.config().vocab_limit)),
+      width_(static_cast<int>(model.logit_count())) {
+    if (model.trimmed_vocabulary()) {
+        trimmed_.assign(static_cast<size_t>(width_), 0.0f);
+    }
+}
 
 void ModelDrafter::reset() {
     model_.reset();
@@ -71,45 +76,59 @@ void ModelDrafter::rewind(int kept) {
 
 int ModelDrafter::propose(const std::vector<int32_t>& seq, int gamma, int32_t* guesses, float* q,
                           int q_stride, DecodeStats& stats, Rng& rng) {
-    // Feed whatever the draft's cache is missing, then walk forward one token at a time.
-    const std::vector<int32_t> pending = pending_for(model_, seq);
-    model_.forward(pending.data(), static_cast<int>(pending.size()), q, false);
-    ++stats.draft_forwards;
-
     const bool greedy = sampling_.greedy();
     const bool check_confidence = confidence_threshold_ > 0.0f;
     const SamplingConfig plain_softmax;  // temperature 1, no filtering
+    const bool trimmed = !trimmed_.empty();
+
+    // A trimmed draft writes one logit per kept token, so its output goes to a scratch buffer and
+    // is scattered into the target's vocabulary afterwards. An untrimmed draft writes straight
+    // into the row, which is the common case and copies nothing.
+    const auto destination = [&](int j) {
+        return trimmed ? trimmed_.data() : q + static_cast<size_t>(j) * q_stride;
+    };
+
+    // Feed whatever the draft's cache is missing, then walk forward one token at a time.
+    const std::vector<int32_t> pending = pending_for(model_, seq);
+    model_.forward(pending.data(), static_cast<int>(pending.size()), destination(0), false);
+    ++stats.draft_forwards;
 
     int produced = 0;
     for (int j = 0; j < gamma; ++j) {
         float* row = q + static_cast<size_t>(j) * q_stride;
-        if (vocab_ < q_stride) {  // a trimmed draft cannot propose the tokens it dropped
+        float* values = trimmed ? trimmed_.data() : row;
+        if (!trimmed && vocab_ < q_stride) {
             std::fill(row + vocab_, row + q_stride, 0.0f);
         }
 
-        if (greedy) {
-            if (check_confidence) {
-                // The threshold is about how sure the draft is, which needs probabilities even
-                // when the guess itself only needs an argmax. Costs one softmax per step, and
-                // only when the feature is switched on.
-                warp_to_probs(row, vocab_, plain_softmax, scratch_);
-                if (max_probability(row, vocab_) < confidence_threshold_) {
-                    break;
+        if (greedy && check_confidence) {
+            // The threshold is about how sure the draft is, which needs probabilities even when
+            // the guess itself only needs an argmax. Costs one softmax per step, and only when
+            // the feature is switched on.
+            warp_to_probs(values, width_, plain_softmax, scratch_);
+        } else if (!greedy) {
+            warp_to_probs(values, width_, sampling_, scratch_);
+        }
+        if (check_confidence && max_probability(values, width_) < confidence_threshold_) {
+            break;
+        }
+
+        const int chosen = greedy ? argmax(values, width_) : sample_from_probs(values, width_, rng);
+        guesses[j] = model_.token_for_logit(static_cast<uint32_t>(chosen));
+        if (trimmed) {
+            // The acceptance rule reads q over the target's vocabulary, so place each kept
+            // token's probability at its own id and leave the dropped tokens at zero.
+            std::fill(row, row + q_stride, 0.0f);
+            if (!greedy) {
+                for (int i = 0; i < width_; ++i) {
+                    row[model_.token_for_logit(static_cast<uint32_t>(i))] = trimmed_[static_cast<size_t>(i)];
                 }
             }
-            guesses[j] = argmax(row, vocab_);
-        } else {
-            warp_to_probs(row, vocab_, sampling_, scratch_);
-            if (check_confidence && max_probability(row, vocab_) < confidence_threshold_) {
-                break;
-            }
-            guesses[j] = sample_from_probs(row, vocab_, rng);
         }
         ++produced;
 
         if (j + 1 < gamma) {
-            float* next = q + static_cast<size_t>(j + 1) * q_stride;
-            model_.forward(&guesses[j], 1, next, false);
+            model_.forward(&guesses[j], 1, destination(j + 1), false);
             ++stats.draft_forwards;
         }
     }
@@ -303,6 +322,9 @@ std::vector<int32_t> generate_speculative(Model& target, Model& draft,
                                           const GenerateOptions& options, DecodeStats* stats) {
     if (draft.config().vocab_limit > target.config().vocab_limit) {
         throw std::invalid_argument("the draft's vocabulary is larger than the target's");
+    }
+    if (draft.logit_count() > target.config().vocab_limit) {
+        throw std::invalid_argument("the draft scores more tokens than the target has");
     }
     ModelDrafter drafter(draft, options.sampling, options.confidence_threshold);
     return generate_with_drafter(target, drafter, prompt, options, stats);

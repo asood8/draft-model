@@ -90,6 +90,27 @@ Model::Model(ModelFile file, EngineOptions options) : file_(std::move(file)), op
 
     embedding_ = file_.tensor("token_embd");
     output_ = file_.has("output") ? file_.tensor("output") : embedding_;
+    if (file_.has("output_map")) {
+        const Tensor& map = file_.tensor("output_map");
+        if (map.format != Format::i32) {
+            throw std::runtime_error("output_map must be i32");
+        }
+        if (map.rows != c.output_vocab || c.output_vocab == 0) {
+            throw std::runtime_error("output_map does not match output_vocab");
+        }
+        if (output_.rows < c.output_vocab) {
+            throw std::runtime_error("the output layer has fewer rows than output_vocab");
+        }
+        output_map_ = static_cast<const int32_t*>(map.data);
+        for (uint32_t i = 0; i < c.output_vocab; ++i) {
+            const int32_t token = output_map_[i];
+            if (token < 0 || static_cast<uint32_t>(token) >= c.vocab_limit) {
+                throw std::runtime_error("output_map refers to a token outside the vocabulary");
+            }
+        }
+    } else if (c.output_vocab != 0) {
+        throw std::runtime_error("output_vocab is set but no output_map was written");
+    }
     output_norm_ = as_floats(file_.tensor("output_norm"), "output_norm");
     require_quantizable(embedding_, "token_embd");
 
@@ -178,8 +199,8 @@ size_t Model::weight_bytes_per_token() const {
                  layer.ffn_down.nbytes;
     }
     // The embedding is only read a row at a time, but the output layer reads every row it
-    // scores, which is vocab_limit of them.
-    total += row_bytes(output_.format, output_.cols) * c.vocab_limit;
+    // scores -- which is where trimming the vocabulary saves its bytes.
+    total += row_bytes(output_.format, output_.cols) * logit_count();
     return total;
 }
 
@@ -460,8 +481,10 @@ void Model::forward_batch(const int32_t* tokens, int batch, int base, float* log
             rms_norm(x_.data() + static_cast<size_t>(first + j) * hidden, output_norm_, hidden, eps,
                      xb_.data() + static_cast<size_t>(j) * hidden);
         }
-        matmul(output_, xb_.data(), hidden, hidden, logits_out, c.vocab_limit, c.vocab_limit,
-               count);
+        // A trimmed output layer scores only the tokens it kept, so a pass writes that many
+        // logits per token rather than one per vocabulary entry.
+        const uint32_t width = logit_count();
+        matmul(output_, xb_.data(), hidden, hidden, logits_out, width, width, count);
         tick(kOutput);
     }
     if (timing_) {
@@ -479,6 +502,7 @@ void Model::forward(const int32_t* tokens, int k, float* logits_out, bool all_lo
     }
 
     // Longer sequences are split into chunks that share one pass over the weights each.
+    const uint32_t width = logit_count();  // fewer than the vocabulary when the output is trimmed
     int done = 0;
     while (done < k) {
         const int batch = std::min(k - done, options_.max_batch);
@@ -487,7 +511,7 @@ void Model::forward(const int32_t* tokens, int k, float* logits_out, bool all_lo
         int single_token = -1;
         if (logits_out != nullptr) {
             if (all_logits) {
-                chunk_logits = logits_out + static_cast<size_t>(done) * config().vocab_limit;
+                chunk_logits = logits_out + static_cast<size_t>(done) * width;
             } else if (last_chunk) {
                 chunk_logits = logits_out;
                 single_token = batch - 1;

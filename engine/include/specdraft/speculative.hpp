@@ -88,7 +88,9 @@ private:
     Model& model_;
     SamplingConfig sampling_;
     float confidence_threshold_;
-    int vocab_;
+    int vocab_;   // the target's vocabulary, which q is expressed over
+    int width_;   // logits the draft produces: fewer when its output layer was trimmed
+    std::vector<float> trimmed_;  // scratch for a trimmed draft's own logits
     std::vector<int> scratch_;
 };
 

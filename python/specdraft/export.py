@@ -32,14 +32,15 @@ from . import quant
 from .reference import Qwen3Config
 
 MAGIC = b"SDM2"
-VERSION = 2
+VERSION = 3
 HEADER_BYTES = 128
 DIRECTORY_ENTRY_BYTES = 72
 NAME_BYTES = 40
 ALIGNMENT = 64
 
 WEIGHT_FORMATS = ("q4", "q8", "fp32")
-FORMAT_CODES = {"fp32": 0, "q4": 1, "q8": 2}
+# i32 is not a weight format: it carries the vocabulary map of a trimmed output layer.
+FORMAT_CODES = {"fp32": 0, "q4": 1, "q8": 2, "i32": 3}
 FORMAT_NAMES = {code: name for name, code in FORMAT_CODES.items()}
 
 # The engine reads these in this order; keep both sides in step.
@@ -52,6 +53,9 @@ CONFIG_FIELDS = (
     "num_key_value_heads",
     "head_dim",
     "vocab_limit",
+    # Rows in a trimmed output layer, or 0 when it covers the whole vocabulary. A trimmed draft
+    # simply never proposes the tokens it dropped, which the acceptance rule already handles.
+    "output_vocab",
     "tie_word_embeddings",
 )
 
@@ -66,6 +70,8 @@ class TensorEntry:
 
 
 def _encode(array: np.ndarray, fmt: str) -> bytes:
+    if fmt == "i32":
+        return np.ascontiguousarray(array, dtype=np.int32).tobytes()
     array = np.ascontiguousarray(array, dtype=np.float32)
     if fmt == "fp32":
         return array.tobytes()
@@ -78,6 +84,8 @@ def _encode(array: np.ndarray, fmt: str) -> bytes:
 
 def decode(blob: bytes, fmt: str, shape: tuple[int, ...]) -> np.ndarray:
     """Inverse of ``_encode``, for tests and tooling."""
+    if fmt == "i32":
+        return np.frombuffer(blob, dtype=np.int32).reshape(shape)
     if fmt == "fp32":
         values = np.frombuffer(blob, dtype=np.float32)
     elif fmt == "q4":
@@ -100,13 +108,30 @@ def plan_tensors(
     config: Qwen3Config,
     weight_format: str = "q4",
     output_format: str | None = None,
+    output_map: np.ndarray | None = None,
 ) -> list[tuple[str, np.ndarray, str]]:
-    """The tensors to write, in file order: (name, values, format)."""
+    """The tensors to write, in file order: (name, values, format).
+
+    With ``output_map`` the output layer keeps only those token ids, which cuts a quarter of a
+    0.6B draft's bytes per step. The embedding stays whole, because the draft is still fed tokens
+    the target chose, from the full vocabulary; only what it can *propose* shrinks.
+    """
     output_format = weight_format if output_format is None else output_format
-    items: list[tuple[str, np.ndarray, str]] = [
-        ("token_embd", _to_numpy(state_dict["model.embed_tokens.weight"]), output_format),
-    ]
-    if not config.tie_word_embeddings:
+    embedding = _to_numpy(state_dict["model.embed_tokens.weight"])
+    items: list[tuple[str, np.ndarray, str]] = [("token_embd", embedding, output_format)]
+
+    if output_map is not None:
+        ids = np.ascontiguousarray(output_map, dtype=np.int32)
+        if ids.ndim != 1 or ids.size == 0:
+            raise ValueError("output_map must be a non-empty one-dimensional array of token ids")
+        if ids.min() < 0 or ids.max() >= config.vocab_size:
+            raise ValueError("output_map refers to a token outside the vocabulary")
+        if ids.size != len(set(ids.tolist())):
+            raise ValueError("output_map must not repeat a token")
+        full = embedding if config.tie_word_embeddings else _to_numpy(state_dict["lm_head.weight"])
+        items.append(("output", full[ids], output_format))
+        items.append(("output_map", ids, "i32"))
+    elif not config.tie_word_embeddings:
         items.append(("output", _to_numpy(state_dict["lm_head.weight"]), output_format))
 
     for i in range(config.num_hidden_layers):
@@ -155,12 +180,13 @@ def write_model(
     weight_format: str = "q4",
     output_format: str | None = None,
     vocab_limit: int | None = None,
+    output_map: np.ndarray | None = None,
 ) -> list[TensorEntry]:
     """Quantize, fuse and write the file. Returns the tensor directory."""
     if weight_format not in WEIGHT_FORMATS:
         raise ValueError(f"unknown format {weight_format!r}; expected one of {WEIGHT_FORMATS}")
 
-    items = plan_tensors(state_dict, config, weight_format, output_format)
+    items = plan_tensors(state_dict, config, weight_format, output_format, output_map)
     payloads = [(name, _encode(values, fmt), fmt, tuple(values.shape)) for name, values, fmt in items]
 
     data_start = _align(HEADER_BYTES + DIRECTORY_ENTRY_BYTES * len(payloads))
@@ -178,13 +204,14 @@ def write_model(
     values = {
         **{field: getattr(config, field, None) for field in CONFIG_FIELDS},
         "vocab_limit": vocab_limit if vocab_limit is not None else config.vocab_size,
+        "output_vocab": 0 if output_map is None else int(len(output_map)),
         "tie_word_embeddings": int(config.tie_word_embeddings),
     }
     header = bytearray(HEADER_BYTES)
     header[0:4] = MAGIC
     struct.pack_into("<III", header, 4, VERSION, len(entries), data_start)
     struct.pack_into(
-        "<9I2d",
+        "<10I2d",
         header,
         16,
         *[int(values[field]) for field in CONFIG_FIELDS],
@@ -251,13 +278,14 @@ def read_model(path: str | Path) -> ModelFile:
         version, count, data_start = struct.unpack_from("<III", header, 4)
         if version != VERSION:
             raise ValueError(f"unsupported model file version {version}")
-        fields = struct.unpack_from("<9I2d", header, 16)
+        fields = struct.unpack_from("<10I2d", header, 16)
         directory = f.read(DIRECTORY_ENTRY_BYTES * count)
 
-    config = dict(zip(CONFIG_FIELDS, fields[:9]))
-    config["rms_norm_eps"], config["rope_theta"] = fields[9], fields[10]
+    config = dict(zip(CONFIG_FIELDS, fields[:10]))
+    config["rms_norm_eps"], config["rope_theta"] = fields[10], fields[11]
     config["tie_word_embeddings"] = bool(config["tie_word_embeddings"])
     vocab_limit = config.pop("vocab_limit")
+    output_vocab = config.pop("output_vocab")
 
     entries: dict[str, TensorEntry] = {}
     for i in range(count):
@@ -272,6 +300,7 @@ def read_model(path: str | Path) -> ModelFile:
         "version": version,
         "config": config,
         "vocab_limit": vocab_limit,
+        "output_vocab": output_vocab,
         "data_start": data_start,
         # Not stored separately: the formats are visible in the directory itself.
         "weight_format": entries["blk.0.qkv"].format if "blk.0.qkv" in entries else None,

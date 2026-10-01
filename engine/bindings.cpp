@@ -45,6 +45,7 @@ py::dict config_as_dict(const ModelConfig& c) {
     out["num_key_value_heads"] = c.num_key_value_heads;
     out["head_dim"] = c.head_dim;
     out["vocab_limit"] = c.vocab_limit;
+    out["output_vocab"] = c.output_vocab;
     out["tie_word_embeddings"] = c.tie_word_embeddings != 0;
     out["rms_norm_eps"] = c.rms_norm_eps;
     out["rope_theta"] = c.rope_theta;
@@ -175,6 +176,18 @@ PYBIND11_MODULE(_engine, m) {
              py::arg("cores") = "performance", py::arg("dynamic_schedule") = false,
              py::arg("max_batch") = 16)
         .def_property_readonly("max_batch", &Model::max_batch)
+        .def_property_readonly("logit_count", &Model::logit_count,
+                               "Logits per scored token: fewer when the output layer was trimmed.")
+        .def_property_readonly("trimmed_vocabulary", &Model::trimmed_vocabulary)
+        .def(
+            "token_for_logit",
+            [](const Model& model, uint32_t index) {
+                if (index >= model.logit_count()) {
+                    throw std::out_of_range("logit index out of range");
+                }
+                return model.token_for_logit(index);
+            },
+            py::arg("index"), "Which token a logit refers to; the identity unless trimmed.")
         .def_property_readonly("threads", &Model::threads)
         .def_property_readonly("core_selection", &Model::core_selection)
         .def_property_readonly("dynamic_schedule", &Model::dynamic_schedule)
@@ -209,7 +222,7 @@ PYBIND11_MODULE(_engine, m) {
             [](Model& model, const TokenArray& tokens, bool all_logits) {
                 const int k = checked_token_count(tokens);
                 const auto rows = all_logits ? k : 1;
-                py::array_t<float> out({rows, static_cast<int>(model.config().vocab_limit)});
+                py::array_t<float> out({rows, static_cast<int>(model.logit_count())});
                 const int32_t* ids = tokens.data();
                 float* destination = out.mutable_data();
                 {
