@@ -1,5 +1,7 @@
 #include "specdraft/model.hpp"
 
+#include "specdraft/simd.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -14,14 +16,9 @@ using Clock = std::chrono::steady_clock;
 
 // RMSNorm with the reduction in float32, as Qwen3 does it. Safe with out == x.
 void rms_norm(const float* x, const float* weight, uint32_t n, float eps, float* out) {
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < n; ++i) {
-        sum += x[i] * x[i];
-    }
+    const float sum = sum_of_squares(x, n);
     const float scale = 1.0f / std::sqrt(sum / static_cast<float>(n) + eps);
-    for (uint32_t i = 0; i < n; ++i) {
-        out[i] = x[i] * scale * weight[i];
-    }
+    scale_and_weight(x, weight, scale, n, out);
 }
 
 // Rotate the two halves of one head, matching Hugging Face's layout: element i pairs with
@@ -287,17 +284,12 @@ void Model::attention(int layer_index, int position) {
 
             for (int t = 0; t < length; ++t) {
                 const uint16_t* cached = key_cache_.data() + cache_index(layer_index, kv, t);
-                for (uint32_t d = 0; d < head_dim; ++d) {
-                    keys_buffer[d] = fp16_to_fp32(cached[d]);
-                }
+                fp16_to_fp32_many(cached, keys_buffer, head_dim);
                 for (uint32_t g = 0; g < group; ++g) {
                     const uint32_t h = first_head + g;
                     const float* q = qkv_.data() + static_cast<size_t>(h) * head_dim;
-                    float dot = 0.0f;
-                    for (uint32_t d = 0; d < head_dim; ++d) {
-                        dot += q[d] * keys_buffer[d];
-                    }
-                    scores_[static_cast<size_t>(h) * stride + t] = dot * scale;
+                    scores_[static_cast<size_t>(h) * stride + t] =
+                        dot_f32(q, keys_buffer, head_dim) * scale;
                 }
             }
 
@@ -310,16 +302,11 @@ void Model::attention(int layer_index, int position) {
 
             for (int t = 0; t < length; ++t) {
                 const uint16_t* cached = value_cache_.data() + cache_index(layer_index, kv, t);
-                for (uint32_t d = 0; d < head_dim; ++d) {
-                    values_buffer[d] = fp16_to_fp32(cached[d]);
-                }
+                fp16_to_fp32_many(cached, values_buffer, head_dim);
                 for (uint32_t g = 0; g < group; ++g) {
                     const uint32_t h = first_head + g;
-                    const float weight = scores_[static_cast<size_t>(h) * stride + t];
-                    float* out = att_.data() + static_cast<size_t>(h) * head_dim;
-                    for (uint32_t d = 0; d < head_dim; ++d) {
-                        out[d] += weight * values_buffer[d];
-                    }
+                    accumulate_scaled(att_.data() + static_cast<size_t>(h) * head_dim, values_buffer,
+                                      scores_[static_cast<size_t>(h) * stride + t], head_dim);
                 }
             }
         }
@@ -374,10 +361,8 @@ void Model::forward_one(int32_t token, int position, float* logits_out, float* c
             uint16_t* key_slot = key_cache_.data() + cache_index(static_cast<int>(l), h, position);
             uint16_t* value_slot =
                 value_cache_.data() + cache_index(static_cast<int>(l), h, position);
-            for (uint32_t d = 0; d < head_dim; ++d) {
-                key_slot[d] = fp32_to_fp16(keys[static_cast<size_t>(h) * head_dim + d]);
-                value_slot[d] = fp32_to_fp16(values[static_cast<size_t>(h) * head_dim + d]);
-            }
+            fp32_to_fp16_many(keys + static_cast<size_t>(h) * head_dim, key_slot, head_dim);
+            fp32_to_fp16_many(values + static_cast<size_t>(h) * head_dim, value_slot, head_dim);
         }
         tick(kQkv);
 
@@ -385,9 +370,7 @@ void Model::forward_one(int32_t token, int position, float* logits_out, float* c
         tick(kAttention);
 
         matvec(layer.attn_out, att_.data(), q_dim, xb2_.data(), c.hidden_size);
-        for (uint32_t i = 0; i < c.hidden_size; ++i) {
-            x_[i] += xb2_[i];
-        }
+        add_in_place(x_.data(), xb2_.data(), c.hidden_size);
         tick(kAttnOut);
 
         rms_norm(x_.data(), layer.ffn_norm, c.hidden_size, eps, xb_.data());
@@ -399,9 +382,7 @@ void Model::forward_one(int32_t token, int position, float* logits_out, float* c
         tick(kGateUp);
 
         matvec(layer.ffn_down, mlp_.data(), c.intermediate_size, xb2_.data(), c.hidden_size);
-        for (uint32_t i = 0; i < c.hidden_size; ++i) {
-            x_[i] += xb2_[i];
-        }
+        add_in_place(x_.data(), xb2_.data(), c.hidden_size);
         tick(kFfnDown);
 
         if (capture_out != nullptr) {

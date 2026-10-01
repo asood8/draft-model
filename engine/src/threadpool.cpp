@@ -221,6 +221,26 @@ void ThreadPool::run_dynamic_raw(int total, int chunk, JobFn job, void* context)
     }
 }
 
+double measure_dispatch_overhead(int jobs, int threads, CoreSelection selection) {
+    ThreadPool pool(threads, selection);
+    const int slices = pool.size() * 8;
+    std::vector<int> touched(static_cast<size_t>(pool.size()), 0);
+    const auto nothing = [&](int begin, int end, int worker) {
+        touched[static_cast<size_t>(worker)] += end - begin;
+    };
+
+    for (int i = 0; i < 64; ++i) {  // warm up: get every worker spinning, not sleeping
+        pool.run(slices, nothing);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    for (int i = 0; i < std::max(1, jobs); ++i) {
+        pool.run(slices, nothing);
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    return seconds / std::max(1, jobs);
+}
+
 double measure_read_bandwidth(size_t bytes, int threads, CoreSelection selection, int repeats) {
     bytes = std::max<size_t>(bytes, 1 << 20);
     const size_t count = bytes / sizeof(float);

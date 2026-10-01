@@ -90,4 +90,8 @@ private:
 // against, since decoding is dominated by streaming weights once per token.
 double measure_read_bandwidth(size_t bytes, int threads, CoreSelection selection, int repeats = 3);
 
+// Seconds to dispatch one empty job and collect every worker again. A token involves well
+// over a hundred of these, so this number multiplied by that count is pure overhead.
+double measure_dispatch_overhead(int jobs, int threads, CoreSelection selection);
+
 }  // namespace specdraft

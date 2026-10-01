@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "specdraft/cpu.hpp"
+#include "specdraft/simd.hpp"
 
 // Clang needs per-function target features for AVX-VNNI, since the baseline flags only
 // enable AVX2/FMA/F16C. MSVC lets any intrinsic be used anywhere.
@@ -21,19 +22,13 @@ inline int clamp_int(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-inline float hsum256(__m256 v) {
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 s = _mm_add_ps(lo, hi);
-    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-    return _mm_cvtss_f32(s);
-}
-
+// Two accumulators, because one would serialize the loop: each block's FMA would wait on the
+// previous block's, and an FMA takes several cycles while a block is only 18 bytes.
 SD_TARGET_VNNI float dot_q4_a8_vnni(const BlockQ4* w, const BlockA8* x, int nblocks) {
     const __m256i low_nibble = _mm256_set1_epi8(0x0F);
     const __m256i eight = _mm256_set1_epi8(8);
-    __m256 sum = _mm256_setzero_ps();
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
     for (int b = 0; b < nblocks; ++b) {
         // 16 bytes hold 32 nibbles: low nibbles are weights 0..15, high nibbles 16..31.
         __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w[b].q));
@@ -44,38 +39,36 @@ SD_TARGET_VNNI float dot_q4_a8_vnni(const BlockQ4* w, const BlockA8* x, int nblo
         __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(wq, wq),
                                               _mm256_sign_epi8(xq, wq));
         const float d = fp16_to_fp32(w[b].scale) * x[b].scale;
-        sum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc), sum);
+        __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc));
+        if ((b & 1) == 0) {
+            sum0 = _mm256_add_ps(sum0, scaled);
+        } else {
+            sum1 = _mm256_add_ps(sum1, scaled);
+        }
     }
-    return hsum256(sum);
+    return hsum256(_mm256_add_ps(sum0, sum1));
 }
 
 SD_TARGET_VNNI float dot_q8_a8_vnni(const BlockQ8* w, const BlockA8* x, int nblocks) {
-    __m256 sum = _mm256_setzero_ps();
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
     for (int b = 0; b < nblocks; ++b) {
         __m256i wq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[b].q));
         __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[b].q));
         __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(wq, wq),
                                               _mm256_sign_epi8(xq, wq));
         const float d = fp16_to_fp32(w[b].scale) * x[b].scale;
-        sum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc), sum);
+        __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc));
+        if ((b & 1) == 0) {
+            sum0 = _mm256_add_ps(sum0, scaled);
+        } else {
+            sum1 = _mm256_add_ps(sum1, scaled);
+        }
     }
-    return hsum256(sum);
+    return hsum256(_mm256_add_ps(sum0, sum1));
 }
 
 }  // namespace
-
-// The scalar _cvtsh_ss / _cvtss_sh intrinsics are a GCC/Clang extension that MSVC does
-// not have, so use the F16C vector forms, which every supported compiler provides.
-float fp16_to_fp32(uint16_t h) {
-    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h))));
-}
-
-uint16_t fp32_to_fp16(float f) {
-    // Rounding comes from the immediate (round to nearest, ties to even), not MXCSR, so
-    // it matches NumPy's float32 -> float16 conversion.
-    const __m128i h = _mm_cvtps_ph(_mm_set_ss(f), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    return static_cast<uint16_t>(_mm_extract_epi16(h, 0));
-}
 
 void quantize_q4(const float* x, int n, BlockQ4* out) {
     const int nblocks = n / QK;

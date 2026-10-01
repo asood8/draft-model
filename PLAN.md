@@ -12,6 +12,7 @@ their own. Section 17 tracks decisions and open questions.
 
 | Date | Where things stand |
 |---|---|
+| 2026-10-01 | **Milestone 3 under way.** Persistent thread pool with spin barriers, row-split work, core pinning and CPU topology detection; attention, the norms and the KV cache writes vectorized. Decode went from 4.4 tok/s (scalar, single thread) to a median of about 30–50 tok/s on six performance cores at context 128, against a measured ceiling of 100–117 tok/s. Measured read bandwidth 37–39 GB/s (about 75% of the DDR4-3200 theoretical 51.2). Dispatch overhead is 0.9 µs per parallel job, so barriers are not the constraint. See §13 for why the range on the decode figure is so wide. 454 tests pass. Next: the k-token kernel, which sets v(k). |
 | 2026-09-30 | **Milestone 1 done.** Qwen3 written from scratch matches Hugging Face layer by layer and token for token. The quantization formats exist in C++, NumPy and torch, byte-identical. The 0.6B exports to 4 bits at 4.50 bits/weight (335 MB). Perplexity table measured (§7.2). **Milestone 2 done.** The C++ engine loads that file, its fp32 path matches the reference to 1e-5, and its greedy output matches the twin token for token; the Python speculative decoder drives it. Toolchain installed (VS Build Tools 2026, MSVC 19.51, clang-cl 22.1, CMake 4.3, Ninja 1.13). 434 tests pass. Next: Milestone 3, making it fast. |
 
 ---
@@ -894,6 +895,18 @@ verification and distilled a quantization-matched 0.6B draft, speeding up Qwen3-
 
 - **Before timing:** plug in, fix the Windows power mode (Best performance), close other programs, pause
   OneDrive, Windows Update and search indexing, and warm up.
+
+> **Measured, 2026-10-01: this laptop is a noisy instrument.** On AC with the Balanced power scheme, repeated
+> samples of the *same build* ranged from 40 to 70 tok/s (a 51% spread), and medians taken minutes apart differed
+> by 75%. Single-threaded runs are steady (10% spread) while multi-threaded runs are not, and saturating all six
+> performance cores produces 30 stalls above 1.5× the median per 200 tokens, against 3 when one core is left free —
+> the OS needs a core, and a spinning worker that gets preempted holds up the whole barrier.
+>
+> So the protocol is: nine interleaved samples of a couple of seconds each, a sustained warm-up first, a **fixed
+> context length** (attention cost grows with it, so letting it drift measures nothing), medians with the
+> interquartile range beside them, and **overlapping ranges read as no difference**. Per-token latency percentiles
+> are more informative than averages here, because the averages are dragged around by the tail. An optimization
+> worth less than about 20% cannot be confirmed on this machine without a quieter setup.
 - **Throttling:** laptops slow down as they heat up. Report sustained speed after a minute of load, not the first
   few seconds. Log CPU clocks and temperatures (e.g., with HWiNFO).
 - **Runs:** run each configuration several times and report the median and interquartile range. Use identical

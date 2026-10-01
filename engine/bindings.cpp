@@ -227,6 +227,19 @@ PYBIND11_MODULE(_engine, m) {
         "Read bandwidth in GB/s: the ceiling tokens-per-second is measured against.");
 
     m.def(
+        "measure_dispatch_overhead",
+        [](int jobs, int threads, const std::string& selection) {
+            CoreSelection parsed;
+            if (!parse_core_selection(selection.c_str(), &parsed)) {
+                throw std::invalid_argument("unknown core selection");
+            }
+            py::gil_scoped_release unlocked;
+            return measure_dispatch_overhead(jobs, threads, parsed);
+        },
+        py::arg("jobs") = 2000, py::arg("threads") = 0, py::arg("selection") = "performance",
+        "Seconds per empty parallel job: the cost of a synchronization point.");
+
+    m.def(
         "model_file_info",
         [](const std::string& path) {
             ModelFile file = ModelFile::open(path);

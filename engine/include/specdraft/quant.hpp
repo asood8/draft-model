@@ -1,5 +1,7 @@
 #pragma once
 
+#include <immintrin.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -41,8 +43,20 @@ static_assert(sizeof(BlockQ4) == 18, "BlockQ4 must be 18 bytes");
 static_assert(sizeof(BlockQ8) == 34, "BlockQ8 must be 34 bytes");
 static_assert(sizeof(BlockA8) == 36, "BlockA8 must be 36 bytes");
 
-float fp16_to_fp32(uint16_t h);
-uint16_t fp32_to_fp16(float f);  // round to nearest, ties to even
+// Defined here rather than in the .cpp so the dot kernels inline them: they run once per
+// 32-weight block, and a real call per block costs more than the arithmetic it performs.
+// The scalar _cvtsh_ss / _cvtss_sh intrinsics are a GCC/Clang extension MSVC lacks, so these
+// use the F16C vector forms, which every supported compiler provides.
+inline float fp16_to_fp32(uint16_t h) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h))));
+}
+
+// Rounding comes from the immediate (nearest, ties to even), not MXCSR, so it matches
+// NumPy's and torch's float32 -> float16 conversion.
+inline uint16_t fp32_to_fp16(float f) {
+    const __m128i h = _mm_cvtps_ph(_mm_set_ss(f), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    return static_cast<uint16_t>(_mm_extract_epi16(h, 0));
+}
 
 // Quantization. n must be a multiple of QK; the output holds n / QK blocks.
 //
