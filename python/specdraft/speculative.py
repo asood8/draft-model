@@ -69,6 +69,7 @@ def _trim(logits: Tensor, vocab_limit: int | None) -> Tensor:
     return logits if vocab_limit is None else logits[..., :vocab_limit]
 
 
+@torch.no_grad()
 def plain_generate(
     model: ModelLike,
     prompt: Sequence[int],
@@ -101,6 +102,7 @@ def plain_generate(
     return generated, stats
 
 
+@torch.no_grad()
 def speculative_generate(
     target: ModelLike,
     draft: ModelLike,

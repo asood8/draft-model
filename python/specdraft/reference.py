@@ -317,7 +317,6 @@ class Qwen3Reference:
         up = self.matmul(h, layer.up_proj, "up_proj")
         return self.matmul(torch.nn.functional.silu(gate) * up, layer.down_proj, "down_proj")
 
-    @torch.no_grad()
     def forward(
         self,
         tokens: Tensor,
