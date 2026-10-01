@@ -194,3 +194,31 @@ def test_exported_draft_feeds_the_engine(tiny_model_dir, data_file, tmp_path):
     engine = cpp.Model(str(weights_file), max_positions=32, max_batch=4)
     logits = engine.forward([3, 5, 7], all_logits=True)
     assert logits.shape == (3, 151_669)
+
+
+def test_quantization_aware_run_saves_a_loadable_draft(tiny_model_dir, data_file, tmp_path):
+    """The --quantization-aware path trains through the rounding the engine will apply."""
+    out = tmp_path / "run_qat"
+    run_train_script(
+        [
+            "--student", str(tiny_model_dir),
+            "--teacher", str(tiny_model_dir),
+            "--data", str(data_file),
+            "--out", str(out),
+            "--loss", "tvd",
+            "--max-tokens", "300",
+            "--tokens-per-step", "150",
+            "--learning-rate", "1e-3",
+            "--validation", "2",
+            "--quantization-aware",
+            "--student-format", "q4",
+        ]
+    )
+    training = json.loads((out / "draft" / "training.json").read_text(encoding="utf-8"))
+    assert training["quantization_aware"] is True
+    assert training["student_format"] == "q4"
+
+    # Saved at full precision, so exporting lands it on the same grid it was trained against.
+    reloaded = Qwen3Reference.from_pretrained(out / "draft")
+    logits = reloaded.forward(torch.tensor([2, 4, 6]))
+    assert torch.isfinite(logits).all()

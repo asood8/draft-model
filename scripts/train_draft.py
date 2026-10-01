@@ -39,7 +39,7 @@ from specdraft.train import (
     train,
     validate,
 )
-from specdraft.trainable import TrainableDraft
+from specdraft.trainable import QuantizationAwareDraft, TrainableDraft
 from specdraft.twin import QuantizedTwin
 
 
@@ -75,6 +75,11 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true", help="fp16 autocast with a gradient scaler")
     parser.add_argument("--eight-bit-adam", action="store_true")
     parser.add_argument("--freeze-embeddings", action="store_true")
+    parser.add_argument("--quantization-aware", action="store_true",
+                        help="train through the draft's own rounding, since the engine runs it "
+                             "quantized (plan section 11.1)")
+    parser.add_argument("--student-format", default="q4", choices=["q4", "q8"],
+                        help="the format the draft will be run in, for --quantization-aware")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -92,11 +97,22 @@ def main() -> None:
     print(f"{len(training)} training sequences ({response_tokens / 1e6:.2f}M response tokens), "
           f"{len(held_out)} held out")
 
-    student = TrainableDraft.from_pretrained(
-        args.student, freeze_embeddings=args.freeze_embeddings
-    ).to(args.student_device)
+    if args.quantization_aware:
+        from specdraft.reference import Qwen3Config, load_safetensors
+
+        student = QuantizationAwareDraft(
+            Qwen3Config.from_pretrained(args.student),
+            load_safetensors(args.student),
+            weight_format=args.student_format,
+            freeze_embeddings=args.freeze_embeddings,
+        ).to(args.student_device)
+    else:
+        student = TrainableDraft.from_pretrained(
+            args.student, freeze_embeddings=args.freeze_embeddings
+        ).to(args.student_device)
     trainable, total = student.parameter_count()
-    print(f"student: {trainable / 1e6:.0f}M trainable of {total / 1e6:.0f}M")
+    print(f"student: {trainable / 1e6:.0f}M trainable of {total / 1e6:.0f}M"
+          + (f", trained through {args.student_format} rounding" if args.quantization_aware else ""))
 
     if args.teacher_format is None:
         teacher_model = Qwen3Reference.from_pretrained(args.teacher, device=args.teacher_device)
@@ -161,6 +177,8 @@ def main() -> None:
         source_model_dir=args.student,
         extra={
             "loss": args.loss,
+            "quantization_aware": args.quantization_aware,
+            "student_format": args.student_format if args.quantization_aware else None,
             "teacher": str(args.teacher),
             "teacher_format": args.teacher_format or "fp32",
             "response_tokens": state.response_tokens,

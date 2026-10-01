@@ -22,7 +22,7 @@ class TrainableDraft(nn.Module):
 
     ``freeze_embeddings`` leaves the tied embedding and output matrix alone, which is about a
     quarter of the 0.6B's parameters and the easiest thing to give up when memory is tight
-    (plan §11.5).
+    (plan Â§11.5).
     """
 
     def __init__(
@@ -96,3 +96,85 @@ class TrainableDraft(nn.Module):
 
 def _is_embedding(name: str) -> bool:
     return name in ("model.embed_tokens.weight", "lm_head.weight")
+
+
+class QuantizationAwareDraft(TrainableDraft):
+    """A draft trained with the rounding it will be run under (plan section 11.1, stretch).
+
+    The engine runs the draft quantized, and 4-bit costs real quality on a model this small:
+    WikiText-2 perplexity went from 28.5 to 32.2 on the 0.6B. Training against full-precision
+    weights and quantizing afterwards asks the optimizer to find a point that happens to survive
+    rounding; training *through* the rounding asks for one that is good after rounding, which is a
+    different and easier request.
+
+    The rounding is a step function with no useful derivative, so the backward pass uses a
+    straight-through estimator: the forward value is quantized and the gradient reaches the
+    underlying weight as though it had not been. The optimizer's own copy stays full precision;
+    only what the forward pass multiplies is rounded, and it is re-rounded every step, since the
+    weights move between them.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+        state_dict: dict[str, Tensor],
+        weight_format: str = "q4",
+        output_format: str | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(config, state_dict, **kwargs)
+        self.weight_format = weight_format
+        self.output_format = weight_format if output_format is None else output_format
+        # The reference calls this for every matrix multiply, which is exactly where the engine
+        # reads a quantized weight, so the rounding goes here rather than into a stale copy.
+        self.model.matmul = self._quantized_matmul  # type: ignore[method-assign]
+        self.model.embed = self._quantized_embed  # type: ignore[method-assign]
+
+    def _format_for(self, name: str) -> str | None:
+        if name == "lm_head":
+            return self.output_format
+        # Norm weights are not quantized, in training or in the engine.
+        return self.weight_format if name.endswith("_proj") else None
+
+    def _quantized_matmul(self, x: Tensor, weight: Tensor, name: str) -> Tensor:
+        fmt = self._format_for(name)
+        if fmt is not None:
+            weight = _StraightThroughQuantize.apply(weight, fmt)
+        return x @ weight.transpose(0, 1)
+
+    def _quantized_embed(self, tokens: Tensor) -> Tensor:
+        # Rounding the gathered rows is the same thing as gathering from the rounded matrix,
+        # because the blocks run along the hidden dimension, and it costs a great deal less.
+        rows = self.weights[self._names["model.embed_tokens.weight"]][tokens]
+        return _StraightThroughQuantize.apply(rows, self.output_format)
+
+    def quantized_reference(self) -> Qwen3Reference:
+        """What the engine will actually run: the weights on their quantization grid."""
+        from .quant_torch import fake_quantize
+
+        state = {}
+        for name, key in self._names.items():
+            tensor = self.weights[key].detach()
+            if name in ("model.embed_tokens.weight", "lm_head.weight"):
+                state[name] = fake_quantize(tensor, self.output_format)
+            elif name.endswith("_proj.weight"):
+                state[name] = fake_quantize(tensor, self.weight_format)
+            else:
+                state[name] = tensor
+        return Qwen3Reference(self.config, state)
+
+
+class _StraightThroughQuantize(torch.autograd.Function):
+    """Quantize going forward, pass the gradient straight through coming back."""
+
+    @staticmethod
+    def forward(ctx, weight: Tensor, fmt: str) -> Tensor:
+        from .quant_torch import fake_quantize
+
+        return fake_quantize(weight, fmt)
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor):
+        # The derivative of rounding is zero almost everywhere and undefined at the steps, so the
+        # estimator pretends it was the identity. Without that, nothing would learn at all.
+        return gradient, None

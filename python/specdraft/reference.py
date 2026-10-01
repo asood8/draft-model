@@ -258,6 +258,11 @@ class Qwen3Reference:
         """One linear layer, x @ weight.T. The twin quantizes both sides first."""
         return x @ weight.transpose(0, 1)
 
+    def embed(self, tokens: Tensor) -> Tensor:
+        """Look up the token rows. Quantization-aware training rounds them, as the engine does:
+        it dequantizes those rows out of a quantized matrix."""
+        return self.embed_tokens[tokens]
+
     # -- forward ------------------------------------------------------------------
 
     def _rope(self, positions: Tensor) -> tuple[Tensor, Tensor]:
@@ -338,7 +343,7 @@ class Qwen3Reference:
         k = tokens.shape[0]
         start = cache.pos if cache is not None else 0
 
-        x = self.embed_tokens[tokens.to(self.device)]
+        x = self.embed(tokens.to(self.device))
         positions = torch.arange(start, start + k, device=self.device)
         cos, sin = self._rope(positions)
         mask = self._causal_mask(k, start)
