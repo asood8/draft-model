@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "specdraft/model.hpp"
@@ -14,13 +16,17 @@
 // newest token", which is one token for the target and one or two for the draft, since after a
 // round where every guess was accepted the draft never saw its own last guess or the bonus
 // token.
+//
+// Where the guesses come from is a separate question from how they are checked, so the loop
+// takes a Drafter. A small model is one; copying from earlier in the prompt is another.
 
 namespace specdraft {
 
 struct DecodeStats {
     int emitted = 0;
     int rounds = 0;
-    int accepted = 0;    // accepted draft tokens
+    int proposed = 0;    // guesses offered, which varies when the drafter stops early
+    int accepted = 0;    // guesses that survived
     int rejections = 0;  // rounds that ended in a rejection
     int target_forwards = 0;  // verification passes, prefill excluded
     int draft_forwards = 0;
@@ -37,9 +43,7 @@ struct DecodeStats {
         const int trials = accepted + rejections;
         return trials > 0 ? static_cast<double>(accepted) / trials : 0.0;
     }
-    double tokens_per_second() const {
-        return seconds > 0.0 ? emitted / seconds : 0.0;
-    }
+    double tokens_per_second() const { return seconds > 0.0 ? emitted / seconds : 0.0; }
 };
 
 struct GenerateOptions {
@@ -48,6 +52,63 @@ struct GenerateOptions {
     SamplingConfig sampling;
     std::vector<int32_t> stop;
     uint64_t seed = 0;
+    // Stop drafting once the draft's own top probability falls below this. Every extra guess
+    // costs a draft step and makes the verification pass wider, so giving up on a position the
+    // draft is unsure about can pay (plan §8.3). 0 disables it.
+    float confidence_threshold = 0.0f;
+};
+
+// Where guesses come from. A drafter fills `guesses` and the matching rows of `q`, which hold
+// the distribution each guess was actually drawn from, over the target's vocabulary.
+class Drafter {
+public:
+    virtual ~Drafter() = default;
+    virtual const char* name() const = 0;
+    // Returns how many guesses were produced, which may be fewer than gamma, or zero.
+    virtual int propose(const std::vector<int32_t>& seq, int gamma, int32_t* guesses, float* q,
+                        int q_stride, DecodeStats& stats, Rng& rng) = 0;
+    // Called after each round so a drafter holding a cache can roll it back.
+    virtual void rewind(int kept) = 0;
+    virtual void reset() = 0;
+    virtual void prefill(const std::vector<int32_t>& prompt) = 0;
+};
+
+// Guesses from a small model: the usual arrangement.
+class ModelDrafter : public Drafter {
+public:
+    ModelDrafter(Model& model, const SamplingConfig& sampling, float confidence_threshold);
+    const char* name() const override { return "model"; }
+    int propose(const std::vector<int32_t>& seq, int gamma, int32_t* guesses, float* q,
+                int q_stride, DecodeStats& stats, Rng& rng) override;
+    void rewind(int kept) override;
+    void reset() override;
+    void prefill(const std::vector<int32_t>& prompt) override;
+
+private:
+    Model& model_;
+    SamplingConfig sampling_;
+    float confidence_threshold_;
+    int vocab_;
+    std::vector<int> scratch_;
+};
+
+// Guesses copied from earlier in the text: find the most recent place the last few tokens
+// appeared and copy what followed. Costs no model work at all, so c is effectively zero, which
+// makes it hard to beat where text repeats, such as summarization (plan §10.4).
+class PromptLookupDrafter : public Drafter {
+public:
+    PromptLookupDrafter(int vocab, int max_ngram = 3, int min_ngram = 1);
+    const char* name() const override { return "prompt_lookup"; }
+    int propose(const std::vector<int32_t>& seq, int gamma, int32_t* guesses, float* q,
+                int q_stride, DecodeStats& stats, Rng& rng) override;
+    void rewind(int) override {}
+    void reset() override {}
+    void prefill(const std::vector<int32_t>&) override {}
+
+private:
+    int vocab_;
+    int max_ngram_;
+    int min_ngram_;
 };
 
 // Ordinary token-at-a-time decoding: the baseline, and what greedy speculative decoding has to
@@ -55,8 +116,13 @@ struct GenerateOptions {
 std::vector<int32_t> generate_plain(Model& model, const std::vector<int32_t>& prompt,
                                     const GenerateOptions& options, DecodeStats* stats);
 
-// Draft gamma tokens, verify them in one target pass, repeat. The output has exactly the
-// distribution plain decoding from `target` would have.
+// Draft, verify in one target pass, repeat. The output has exactly the distribution plain
+// decoding from `target` would have, whatever the drafter does.
+std::vector<int32_t> generate_with_drafter(Model& target, Drafter& drafter,
+                                           const std::vector<int32_t>& prompt,
+                                           const GenerateOptions& options, DecodeStats* stats);
+
+// Convenience wrapper for the usual case: a draft model.
 //
 // A draft with a smaller vocabulary than the target is allowed: its missing tokens get
 // probability zero, which the acceptance rule handles without any change, since it only ever
@@ -64,5 +130,9 @@ std::vector<int32_t> generate_plain(Model& model, const std::vector<int32_t>& pr
 std::vector<int32_t> generate_speculative(Model& target, Model& draft,
                                           const std::vector<int32_t>& prompt,
                                           const GenerateOptions& options, DecodeStats* stats);
+
+std::vector<int32_t> generate_prompt_lookup(Model& target, const std::vector<int32_t>& prompt,
+                                            const GenerateOptions& options, int max_ngram,
+                                            DecodeStats* stats);
 
 }  // namespace specdraft

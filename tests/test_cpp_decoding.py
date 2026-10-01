@@ -250,3 +250,101 @@ def test_sampling_reproduces_the_targets_distribution(tmp_path):
 
     pvalue = chi_square_pvalue(counts.flatten(), (exact * trials).flatten())
     assert pvalue > 1e-3, f"the engine's sampling does not match the target (p={pvalue:.2e})"
+
+
+# --------------------------------------------- prompt lookup and early stopping
+
+
+def test_prompt_lookup_matches_plain_decoding(paths):
+    """Copied guesses carry no distribution, so they are treated as a point mass. The output
+    must still be exactly what plain decoding produces."""
+    target = cpp.Model(str(paths["target"]), max_positions=MAX_POSITIONS, max_batch=5)
+    # A prompt with repeated text, which is where copying pays.
+    phrase = prompt_tokens(6, TINY_CONFIG.vocab_size, seed=20)
+    prompt = phrase + phrase + phrase[:3]
+
+    expected, plain_stats = cpp.generate_plain(target, prompt, max_new_tokens=30)
+    got, lookup_stats = cpp.generate_prompt_lookup(
+        target, prompt, max_new_tokens=30, gamma=4, max_ngram=3
+    )
+
+    assert got == expected
+    assert lookup_stats["draft_forwards"] == 0, "copying must cost no model work at all"
+    assert lookup_stats["proposed"] > 0, "a repeating prompt should give it something to copy"
+    assert lookup_stats["target_forwards"] <= plain_stats["target_forwards"]
+
+
+def test_prompt_lookup_falls_back_when_there_is_nothing_to_copy(paths):
+    """With no repeated n-gram the drafter proposes nothing, and each round must then behave
+    exactly like an ordinary decoding step."""
+    target = cpp.Model(str(paths["target"]), max_positions=MAX_POSITIONS, max_batch=5)
+    prompt = [3]
+
+    got, stats = cpp.generate_prompt_lookup(
+        target, prompt, max_new_tokens=6, gamma=4, max_ngram=8
+    )
+    assert got == cpp.generate_plain(target, prompt, max_new_tokens=6)[0]
+    assert stats["emitted"] == 6
+    assert stats["tokens_per_target_forward"] <= 2.0
+
+
+@pytest.mark.slow
+def test_prompt_lookup_sampling_is_still_exact(tmp_path):
+    """The point-mass treatment has to leave the distribution alone, not just the greedy path."""
+    reference = random_reference(SMALL_CONFIG, seed=21)
+    vocab = SMALL_CONFIG.vocab_size
+    path = tmp_path / "target.sdm"
+    write_model(path, reference.state_dict(), reference.config, weight_format="q8")
+    target = cpp.Model(str(path), max_positions=64, max_batch=5)
+
+    phrase = prompt_tokens(4, vocab, seed=22)
+    prompt = phrase + phrase
+    config = SamplingConfig(temperature=1.0)
+    first = warp_probs(torch.from_numpy(target.forward(np.array(prompt, dtype=np.int32))[0]), config).numpy()
+    exact = np.empty((vocab, vocab))
+    for a in range(vocab):
+        target.reset()
+        row = target.forward(np.array(prompt + [a], dtype=np.int32))[0]
+        exact[a] = first[a] * warp_probs(torch.from_numpy(row), config).numpy()
+
+    trials = 3000
+    counts = np.zeros((vocab, vocab))
+    for trial in range(trials):
+        got, _ = cpp.generate_prompt_lookup(
+            target, prompt, max_new_tokens=2, gamma=3, temperature=1.0, seed=trial
+        )
+        counts[got[0], got[1]] += 1
+
+    pvalue = chi_square_pvalue(counts.flatten(), (exact * trials).flatten())
+    assert pvalue > 1e-3, f"prompt lookup changed the distribution (p={pvalue:.2e})"
+
+
+@pytest.mark.parametrize("threshold", [0.0, 0.3, 0.95])
+def test_confidence_threshold_keeps_output_exact(paths, threshold):
+    """Giving up early changes how many guesses are offered, never what comes out."""
+    target, draft = open_pair(paths)
+    prompt = prompt_tokens(5, TINY_CONFIG.vocab_size, seed=23)
+    expected, _ = cpp.generate_plain(target, prompt, max_new_tokens=24)
+
+    got, stats = cpp.generate_speculative(
+        target, draft, prompt, max_new_tokens=24, gamma=6, confidence_threshold=threshold
+    )
+    assert got == expected
+    assert stats["proposed"] <= 6 * stats["rounds"]
+
+
+def test_a_high_threshold_stops_drafting_altogether(paths):
+    target, draft = open_pair(paths)
+    prompt = prompt_tokens(4, TINY_CONFIG.vocab_size, seed=24)
+    # Nothing can clear a threshold above one, so no guesses should be offered.
+    _, stats = cpp.generate_speculative(
+        target, draft, prompt, max_new_tokens=8, gamma=4, confidence_threshold=1.0
+    )
+    assert stats["proposed"] == 0
+    assert stats["tokens_per_target_forward"] == pytest.approx(1.0)
+
+
+def test_invalid_threshold_is_rejected(paths):
+    target, draft = open_pair(paths)
+    with pytest.raises(Exception):
+        cpp.generate_speculative(target, draft, [1, 2], max_new_tokens=4, confidence_threshold=1.5)

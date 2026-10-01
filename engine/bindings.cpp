@@ -124,6 +124,7 @@ py::dict stats_as_dict(const DecodeStats& stats) {
     py::dict out;
     out["emitted"] = stats.emitted;
     out["rounds"] = stats.rounds;
+    out["proposed"] = stats.proposed;
     out["accepted"] = stats.accepted;
     out["rejections"] = stats.rejections;
     out["target_forwards"] = stats.target_forwards;
@@ -137,7 +138,8 @@ py::dict stats_as_dict(const DecodeStats& stats) {
 }
 
 GenerateOptions make_options(int max_new_tokens, int gamma, float temperature, int top_k,
-                             float top_p, const std::vector<int32_t>& stop, uint64_t seed) {
+                             float top_p, const std::vector<int32_t>& stop, uint64_t seed,
+                             float confidence_threshold = 0.0f) {
     GenerateOptions options;
     options.max_new_tokens = max_new_tokens;
     options.gamma = gamma;
@@ -146,6 +148,7 @@ GenerateOptions make_options(int max_new_tokens, int gamma, float temperature, i
     options.sampling.top_p = top_p;
     options.stop = stop;
     options.seed = seed;
+    options.confidence_threshold = confidence_threshold;
     return options;
 }
 
@@ -272,9 +275,9 @@ PYBIND11_MODULE(_engine, m) {
         "generate_speculative",
         [](Model& target, Model& draft, const std::vector<int32_t>& prompt, int max_new_tokens,
            int gamma, float temperature, int top_k, float top_p, const std::vector<int32_t>& stop,
-           uint64_t seed) {
-            const GenerateOptions options =
-                make_options(max_new_tokens, gamma, temperature, top_k, top_p, stop, seed);
+           uint64_t seed, float confidence_threshold) {
+            const GenerateOptions options = make_options(max_new_tokens, gamma, temperature, top_k,
+                                                         top_p, stop, seed, confidence_threshold);
             DecodeStats stats;
             std::vector<int32_t> tokens;
             {
@@ -286,8 +289,30 @@ PYBIND11_MODULE(_engine, m) {
         py::arg("target"), py::arg("draft"), py::arg("prompt"), py::arg("max_new_tokens") = 64,
         py::arg("gamma") = 4, py::arg("temperature") = 0.0f, py::arg("top_k") = 0,
         py::arg("top_p") = 1.0f, py::arg("stop") = std::vector<int32_t>{},
-        py::arg("seed") = uint64_t{0},
+        py::arg("seed") = uint64_t{0}, py::arg("confidence_threshold") = 0.0f,
         "Speculative decoding entirely inside the engine. Returns (tokens, stats).");
+
+    m.def(
+        "generate_prompt_lookup",
+        [](Model& target, const std::vector<int32_t>& prompt, int max_new_tokens, int gamma,
+           float temperature, int top_k, float top_p, const std::vector<int32_t>& stop,
+           uint64_t seed, int max_ngram) {
+            const GenerateOptions options =
+                make_options(max_new_tokens, gamma, temperature, top_k, top_p, stop, seed);
+            DecodeStats stats;
+            std::vector<int32_t> tokens;
+            {
+                py::gil_scoped_release unlocked;
+                tokens = generate_prompt_lookup(target, prompt, options, max_ngram, &stats);
+            }
+            return py::make_tuple(tokens, stats_as_dict(stats));
+        },
+        py::arg("target"), py::arg("prompt"), py::arg("max_new_tokens") = 64, py::arg("gamma") = 4,
+        py::arg("temperature") = 0.0f, py::arg("top_k") = 0, py::arg("top_p") = 1.0f,
+        py::arg("stop") = std::vector<int32_t>{}, py::arg("seed") = uint64_t{0},
+        py::arg("max_ngram") = 3,
+        "Guesses copied from earlier in the text instead of from a draft model: no model work, "
+        "so c is effectively zero. Returns (tokens, stats).");
 
     m.def(
         "warp_to_probs",
