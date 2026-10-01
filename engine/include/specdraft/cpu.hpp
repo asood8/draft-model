@@ -20,6 +20,12 @@ const CpuFeatures& cpu_features();
 // "vnni" or "scalar": which kernel path the dot products will actually take.
 const char* active_kernel_path();
 
+// Force the scalar kernels even on a CPU that has AVX-VNNI. The scalar path is the reference the
+// SIMD kernels were written against, and on a machine with VNNI it would otherwise never run, so
+// being able to select it is how it stays tested.
+void set_force_scalar(bool force);
+bool force_scalar();
+
 // One logical processor. On a hybrid CPU like the i7-13620H there are two kinds of core,
 // and which kind a thread lands on changes throughput a lot, so the engine needs to be
 // able to see and choose.

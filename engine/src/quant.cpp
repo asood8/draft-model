@@ -150,7 +150,7 @@ SD_TARGET_VNNI void dot_q8_tile(const BlockQ8* w, const BlockA8* x, int nblocks,
 
 void dot_q4_a8_multi(const BlockQ4* w, const BlockA8* x, int nblocks, int k, float* out) {
     const CpuFeatures& f = cpu_features();
-    if (!(f.avx2 && f.avx_vnni)) {
+    if (!(f.avx2 && f.avx_vnni) || force_scalar()) {
         for (int t = 0; t < k; ++t) {
             out[t] = dot_q4_a8_scalar(w, x + static_cast<size_t>(t) * nblocks, nblocks);
         }
@@ -164,7 +164,7 @@ void dot_q4_a8_multi(const BlockQ4* w, const BlockA8* x, int nblocks, int k, flo
 
 void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, float* out) {
     const CpuFeatures& f = cpu_features();
-    if (!(f.avx2 && f.avx_vnni)) {
+    if (!(f.avx2 && f.avx_vnni) || force_scalar()) {
         for (int t = 0; t < k; ++t) {
             out[t] = dot_q8_a8_scalar(w, x + static_cast<size_t>(t) * nblocks, nblocks);
         }
@@ -296,7 +296,7 @@ float dot_q8_a8_scalar(const BlockQ8* w, const BlockA8* x, int nblocks) {
 
 float dot_q4_a8(const BlockQ4* w, const BlockA8* x, int nblocks) {
     const CpuFeatures& f = cpu_features();
-    if (f.avx2 && f.avx_vnni) {
+    if (f.avx2 && f.avx_vnni && !force_scalar()) {
         return dot_q4_a8_vnni(w, x, nblocks);
     }
     return dot_q4_a8_scalar(w, x, nblocks);
@@ -304,7 +304,7 @@ float dot_q4_a8(const BlockQ4* w, const BlockA8* x, int nblocks) {
 
 float dot_q8_a8(const BlockQ8* w, const BlockA8* x, int nblocks) {
     const CpuFeatures& f = cpu_features();
-    if (f.avx2 && f.avx_vnni) {
+    if (f.avx2 && f.avx_vnni && !force_scalar()) {
         return dot_q8_a8_vnni(w, x, nblocks);
     }
     return dot_q8_a8_scalar(w, x, nblocks);

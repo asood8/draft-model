@@ -1,6 +1,7 @@
 #include "specdraft/cpu.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <thread>
 
 #if defined(_MSC_VER)
@@ -56,9 +57,21 @@ const CpuFeatures& cpu_features() {
     return features;
 }
 
+namespace {
+std::atomic<bool> g_force_scalar{false};
+}  // namespace
+
+void set_force_scalar(bool force) {
+    g_force_scalar.store(force, std::memory_order_relaxed);
+}
+
+bool force_scalar() {
+    return g_force_scalar.load(std::memory_order_relaxed);
+}
+
 const char* active_kernel_path() {
     const CpuFeatures& f = cpu_features();
-    return (f.avx2 && f.avx_vnni) ? "vnni" : "scalar";
+    return (f.avx2 && f.avx_vnni && !force_scalar()) ? "vnni" : "scalar";
 }
 
 namespace {

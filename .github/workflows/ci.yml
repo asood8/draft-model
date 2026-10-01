@@ -1,0 +1,48 @@
+name: tests
+
+# Two things this catches that local runs cannot. A clean checkout has to build from nothing, so a
+# file left out of the repo or a path that only works here shows up immediately. And the runners
+# almost certainly lack AVX-VNNI, so they execute the scalar kernels for real rather than the
+# AVX-VNNI ones this project is developed against.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # CPU-only PyTorch first: the default wheel on Linux carries CUDA and is gigabytes.
+      - name: Install PyTorch (CPU)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build the engine and install
+        run: python -m pip install -e ".[torch,dev]"
+
+      - name: What this runner can do
+        run: |
+          python -c "from specdraft import _engine as e; print('features', e.cpu_features()); print('kernel path', e.kernel_path()); print('cores', len(e.core_topology()))"
+
+      - name: Tests
+        run: python -m pytest -q -m "not slow"
+
+      # The statistical tests are slow but they are the ones that would catch a sampling rule that
+      # is subtly wrong, so run them once per push rather than never.
+      - name: Statistical tests
+        if: github.event_name == 'push'
+        run: python -m pytest -q -m slow

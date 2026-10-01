@@ -924,9 +924,11 @@ verification and distilled a quantization-matched 0.6B draft, speeding up Qwen3-
 - **Before timing:** plug in, fix the Windows power mode (Best performance), close other programs, pause
   OneDrive, Windows Update and search indexing, and warm up.
 
-> **Measured, 2026-10-01: this laptop is a noisy instrument.** On AC with the Balanced power scheme, repeated
-> samples of the *same build* ranged from 40 to 70 tok/s (a 51% spread), and medians taken minutes apart differed
-> by 75%. Single-threaded runs are steady (10% spread) while multi-threaded runs are not, and saturating all six
+> **Measured, 2026-10-01: this laptop is a noisy instrument, and not for want of a setting.** Repeated samples of
+> the *same build* ranged from 40 to 70 tok/s (a 51% spread), and medians taken minutes apart differed by 75%. The
+> power mode is not the cause: Windows 11 exposes only a "Balanced" scheme here, but the AC overlay is already Best
+> performance, and the hidden High performance scheme would change nothing. What remains is thermal headroom on a
+> 45 W chip and the OS preempting spin-waiting threads. Single-threaded runs are steady (10% spread) while multi-threaded runs are not, and saturating all six
 > performance cores produces 30 stalls above 1.5× the median per 200 tokens, against 3 when one core is left free —
 > the OS needs a core, and a spinning worker that gets preempted holds up the whole barrier.
 >

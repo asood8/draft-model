@@ -452,6 +452,9 @@ PYBIND11_MODULE(_engine, m) {
                                            {"avx512f", f.avx512f}};
     });
     m.def("kernel_path", [] { return std::string(active_kernel_path()); });
+    m.def("set_force_scalar", &set_force_scalar, py::arg("force"),
+          "Use the scalar kernels even where AVX-VNNI exists, so the reference path stays tested.");
+    m.def("force_scalar", &force_scalar);
 
     m.def("fp32_to_fp16", &fp32_to_fp16, py::arg("value"));
     m.def("fp16_to_fp32", &fp16_to_fp32, py::arg("bits"));

@@ -14,7 +14,7 @@ dependencies = ["numpy>=1.26"]
 # The PyTorch side (reference model, quantization twin, distillation) is optional so that
 # the engine and its tests can be built and run without a multi-gigabyte download.
 torch = ["torch>=2.4", "transformers>=4.51", "safetensors>=0.4", "tokenizers>=0.20"]
-dev = ["pytest>=8", "scipy>=1.11"]
+dev = ["pytest>=8", "scipy>=1.11", "matplotlib>=3.8"]
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
