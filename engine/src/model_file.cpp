@@ -7,6 +7,7 @@
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX  // keep windows.h from defining min/max macros
 #include <windows.h>
 #else
 #include <fcntl.h>

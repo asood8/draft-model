@@ -1,9 +1,18 @@
 #include "specdraft/cpu.hpp"
 
+#include <algorithm>
+#include <thread>
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <cpuid.h>
+#endif
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX  // keep windows.h from defining min/max macros
+#include <windows.h>
 #endif
 
 namespace specdraft {
@@ -50,6 +59,79 @@ const CpuFeatures& cpu_features() {
 const char* active_kernel_path() {
     const CpuFeatures& f = cpu_features();
     return (f.avx2 && f.avx_vnni) ? "vnni" : "scalar";
+}
+
+namespace {
+
+std::vector<CoreInfo> detect_cores() {
+    std::vector<CoreInfo> cores;
+
+#if defined(_WIN32)
+    // GetSystemCpuSetInformation is the only place Windows reports EfficiencyClass, which
+    // is what separates performance cores from efficiency cores.
+    ULONG bytes = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
+    if (bytes > 0) {
+        std::vector<uint8_t> buffer(bytes);
+        if (GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+                                       bytes, &bytes, GetCurrentProcess(), 0)) {
+            ULONG offset = 0;
+            while (offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= bytes) {
+                auto* entry = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data() + offset);
+                if (entry->Size == 0) {
+                    break;
+                }
+                if (entry->Type == CpuSetInformation) {
+                    CoreInfo core;
+                    core.logical_index = entry->CpuSet.LogicalProcessorIndex;
+                    core.core_index = entry->CpuSet.CoreIndex;
+                    core.efficiency_class = entry->CpuSet.EfficiencyClass;
+                    cores.push_back(core);
+                }
+                offset += entry->Size;
+            }
+        }
+    }
+#endif
+
+    if (cores.empty()) {  // no topology available: assume one thread per logical processor
+        const unsigned count = std::max(1u, std::thread::hardware_concurrency());
+        for (unsigned i = 0; i < count; ++i) {
+            CoreInfo core;
+            core.logical_index = i;
+            core.core_index = i;
+            cores.push_back(core);
+        }
+    }
+
+    std::sort(cores.begin(), cores.end(), [](const CoreInfo& a, const CoreInfo& b) {
+        return a.logical_index < b.logical_index;
+    });
+    // Mark the first logical processor of each physical core, so callers can ask for one
+    // thread per core instead of one per hyperthread.
+    std::vector<uint32_t> seen;
+    for (CoreInfo& core : cores) {
+        if (std::find(seen.begin(), seen.end(), core.core_index) == seen.end()) {
+            core.primary = true;
+            seen.push_back(core.core_index);
+        }
+    }
+    return cores;
+}
+
+}  // namespace
+
+const std::vector<CoreInfo>& core_topology() {
+    static const std::vector<CoreInfo> cores = detect_cores();
+    return cores;
+}
+
+uint32_t fastest_efficiency_class() {
+    uint32_t best = 0;
+    for (const CoreInfo& core : core_topology()) {
+        best = std::max(best, core.efficiency_class);
+    }
+    return best;
 }
 
 }  // namespace specdraft

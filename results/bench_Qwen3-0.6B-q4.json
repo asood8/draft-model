@@ -1,0 +1,89 @@
+{
+  "model_file": "models\\Qwen3-0.6B-q4.sdm",
+  "cpu": "Intel64 Family 6 Model 186 Stepping 2, GenuineIntel",
+  "logical_processors": 16,
+  "physical_cores": 10,
+  "kernel_path": "vnni",
+  "read_bandwidth_gb_s": {
+    "performance": 38.88692281226572,
+    "physical": 33.99186481027726,
+    "logical": 39.19438093395583
+  },
+  "weight_bytes_per_token": 335087424,
+  "kv_bytes_per_token": 114688,
+  "rows": [
+    {
+      "configuration": "1 thread",
+      "threads": 1,
+      "decode_tokens_per_second": 19.74760585006032,
+      "decode_samples": [
+        19.298484023195616,
+        19.74760585006032,
+        20.380424398560848
+      ],
+      "prefill_tokens_per_second": 26.08954846081482,
+      "share_of_ceiling": 0.16882966937567556
+    },
+    {
+      "configuration": "performance cores",
+      "threads": 6,
+      "decode_tokens_per_second": 66.1192725595379,
+      "decode_samples": [
+        69.20812354133132,
+        60.59287094209718,
+        66.1192725595379
+      ],
+      "prefill_tokens_per_second": 76.7412407731829,
+      "share_of_ceiling": 0.5652783942693925
+    },
+    {
+      "configuration": "all physical, fixed split",
+      "threads": 10,
+      "decode_tokens_per_second": 37.649001807665954,
+      "decode_samples": [
+        37.649001807665954,
+        29.38294709339968,
+        38.00449181469596
+      ],
+      "prefill_tokens_per_second": 47.425253356343674,
+      "share_of_ceiling": 0.32187539977121016
+    },
+    {
+      "configuration": "all physical, dynamic chunks",
+      "threads": 10,
+      "decode_tokens_per_second": 62.64983752615952,
+      "decode_samples": [
+        63.817668664566185,
+        61.968491086039414,
+        62.64983752615952
+      ],
+      "prefill_tokens_per_second": 68.27508544462687,
+      "share_of_ceiling": 0.5356168963615908
+    },
+    {
+      "configuration": "every hyperthread",
+      "threads": 16,
+      "decode_tokens_per_second": 51.617454441725016,
+      "decode_samples": [
+        51.617454441725016,
+        55.60362952202666,
+        43.12180292102245
+      ],
+      "prefill_tokens_per_second": 59.81693028447312,
+      "share_of_ceiling": 0.4412969265022985
+    }
+  ],
+  "timings": {
+    "embed": 3.3900000000000004e-05,
+    "qkv": 0.10614760000000018,
+    "attention": 0.022925400000000016,
+    "attn_out": 0.043666999999999984,
+    "gate_up": 0.1066797,
+    "ffn_down": 0.06111890000000002,
+    "output": 0.07903710000000003,
+    "total": 0.41960960000000025,
+    "tokens": 27.0
+  },
+  "timing_configuration": "performance cores",
+  "when": "2026-10-01T04:36:57+00:00"
+}

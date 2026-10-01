@@ -16,6 +16,7 @@
 #include "specdraft/model.hpp"
 #include "specdraft/model_file.hpp"
 #include "specdraft/quant.hpp"
+#include "specdraft/threadpool.hpp"
 
 namespace py = pybind11;
 using namespace specdraft;
@@ -107,10 +108,43 @@ PYBIND11_MODULE(_engine, m) {
     m.doc() = "specdraft CPU engine";
 
     py::class_<Model>(m, "Model", "Qwen3 inference over a memory-mapped weights file")
-        .def(py::init([](const std::string& path, int max_positions) {
-                 return std::make_unique<Model>(ModelFile::open(path), max_positions);
+        .def(py::init([](const std::string& path, int max_positions, int threads,
+                         const std::string& cores, bool dynamic_schedule) {
+                 EngineOptions options;
+                 options.max_positions = max_positions;
+                 options.threads = threads;
+                 options.dynamic_schedule = dynamic_schedule;
+                 if (!parse_core_selection(cores.c_str(), &options.cores)) {
+                     throw std::invalid_argument(
+                         "cores must be any, performance, physical or logical");
+                 }
+                 return std::make_unique<Model>(ModelFile::open(path), options);
              }),
-             py::arg("path"), py::arg("max_positions") = 2048)
+             py::arg("path"), py::arg("max_positions") = 2048, py::arg("threads") = 0,
+             py::arg("cores") = "performance", py::arg("dynamic_schedule") = false)
+        .def_property_readonly("threads", &Model::threads)
+        .def_property_readonly("core_selection", &Model::core_selection)
+        .def_property_readonly("dynamic_schedule", &Model::dynamic_schedule)
+        .def_property_readonly("weight_bytes_per_token", &Model::weight_bytes_per_token)
+        .def_property_readonly("kv_bytes_per_token", &Model::kv_bytes_per_token)
+        .def("set_timing", &Model::set_timing, py::arg("enabled"))
+        .def("reset_timings", &Model::reset_timings)
+        .def(
+            "timings",
+            [](const Model& model) {
+                py::dict out;
+                double total = 0.0;
+                for (int i = 0; i < Model::kStageCount; ++i) {
+                    const auto stage = static_cast<Model::Stage>(i);
+                    const double seconds = model.stage_seconds(stage);
+                    out[py::str(Model::stage_name(stage))] = seconds;
+                    total += seconds;
+                }
+                out["total"] = total;
+                out["tokens"] = model.timed_tokens();
+                return out;
+            },
+            "Seconds spent in each stage since the last reset, plus the token count.")
         .def_property_readonly("config", [](const Model& model) { return config_as_dict(model.config()); })
         .def_property_readonly("max_positions", &Model::max_positions)
         .def_property_readonly("pos", &Model::pos, "how many positions the KV cache holds")
@@ -150,6 +184,47 @@ PYBIND11_MODULE(_engine, m) {
             },
             py::arg("tokens"),
             "Run k tokens and return the hidden state after every layer [layers, k, hidden].");
+
+    m.def(
+        "core_topology",
+        [] {
+            py::list out;
+            for (const CoreInfo& core : core_topology()) {
+                py::dict entry;
+                entry["logical_index"] = core.logical_index;
+                entry["core_index"] = core.core_index;
+                entry["efficiency_class"] = core.efficiency_class;
+                entry["primary"] = core.primary;
+                out.append(entry);
+            }
+            return out;
+        },
+        "Every logical processor, with its physical core and how fast a core it is.");
+
+    m.def(
+        "cores_for",
+        [](const std::string& selection) {
+            CoreSelection parsed;
+            if (!parse_core_selection(selection.c_str(), &parsed)) {
+                throw std::invalid_argument("unknown core selection");
+            }
+            return cores_for(parsed);
+        },
+        py::arg("selection"), "Which logical processors a selection would pin threads to.");
+
+    m.def(
+        "measure_read_bandwidth",
+        [](size_t bytes, int threads, const std::string& selection, int repeats) {
+            CoreSelection parsed;
+            if (!parse_core_selection(selection.c_str(), &parsed)) {
+                throw std::invalid_argument("unknown core selection");
+            }
+            py::gil_scoped_release unlocked;
+            return measure_read_bandwidth(bytes, threads, parsed, repeats);
+        },
+        py::arg("bytes") = size_t{1} << 30, py::arg("threads") = 0,
+        py::arg("selection") = "performance", py::arg("repeats") = 3,
+        "Read bandwidth in GB/s: the ceiling tokens-per-second is measured against.");
 
     m.def(
         "model_file_info",

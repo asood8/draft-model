@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 namespace specdraft {
 
 // CPU features the kernels care about. AVX2 + FMA + F16C are the compile-time
@@ -16,5 +19,21 @@ const CpuFeatures& cpu_features();
 
 // "vnni" or "scalar": which kernel path the dot products will actually take.
 const char* active_kernel_path();
+
+// One logical processor. On a hybrid CPU like the i7-13620H there are two kinds of core,
+// and which kind a thread lands on changes throughput a lot, so the engine needs to be
+// able to see and choose.
+struct CoreInfo {
+    uint32_t logical_index = 0;
+    uint32_t core_index = 0;  // physical core; two logical processors share one with SMT
+    uint32_t efficiency_class = 0;  // higher is faster (Windows); 0 when unknown
+    bool primary = false;  // the first logical processor of its physical core
+};
+
+// Every logical processor, in order. Empty if the OS would not say.
+const std::vector<CoreInfo>& core_topology();
+
+// The highest efficiency class present, i.e. which cores are the performance cores.
+uint32_t fastest_efficiency_class();
 
 }  // namespace specdraft
