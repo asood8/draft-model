@@ -860,9 +860,14 @@ numbers that get published. So:
 >
 > **Vocabulary trimming, measured the same day.** Keeping the 32,768 most frequent tokens cuts the draft's output
 > layer from 87.5 MB to 18.9 MB, taking bytes per decode step from 335 MB to **267 MB (0.80×)** — about the same
-> saving as dropping eight layers, and the two multiply to roughly 0.63×. On WikiText the kept set covers
-> **100.000%** of occurrences (that text uses only 19,714 distinct tokens), so the acceptance cost there is nil;
-> a mix with code and other languages will use more, so coverage has to be recomputed on the real generation data.
+> saving as dropping eight layers, and the two multiply to roughly 0.63×.
+>
+> **Which corpus the tokens are counted on matters more than the size of the set.** A set chosen from WikiText
+> covered 100.000% of WikiText (that text uses only 19,714 distinct tokens) but missed **23%** of the same model's
+> own chat output — markdown markers like ` **`, capitalized names, newline runs — capping acceptance near 0.77
+> before any other effect. So the frequencies must be counted on the target's own generations in the decoding setup
+> being shipped, never on convenient prose, and the coverage figure printed at trim time is only as good as that
+> text.
 > Unlike pruning, this needs no healing: the draft simply cannot propose what it dropped, and tests confirm greedy
 > output is unchanged and sampling still passes a chi-square against the target's distribution. The file grows on
 > disk, since it now carries both the full embedding for lookups and the trimmed output layer, while the bytes a

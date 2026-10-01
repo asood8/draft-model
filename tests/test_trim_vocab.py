@@ -217,3 +217,52 @@ def test_sampling_with_a_trimmed_draft_is_still_exact(tmp_path):
     scaled = expected[keep] * (observed.sum() / expected[keep].sum())
     pvalue = float(stats_module.chisquare(observed, scaled).pvalue)
     assert pvalue > 1e-3, f"a trimmed draft changed the distribution (p={pvalue:.2e})"
+
+
+# ------------------------------------------- the Python side sees the target's vocabulary
+
+
+def test_the_wrapper_expands_a_trimmed_models_logits(trimmed_pair):
+    """Everything in Python -- the offline metrics, the decoder -- works over the target's
+    vocabulary, so a trimmed model's own index space must not leak out."""
+    from specdraft.engine import EngineModel
+
+    _, draft_path, kept = trimmed_pair
+    draft = EngineModel(draft_path, max_positions=32)
+    tokens = torch.tensor([1, 2, 3])
+
+    expanded = draft.forward(tokens, cache=draft.new_cache(32))
+    assert expanded.shape == (3, SMALL.vocab_size)
+    dropped = sorted(set(range(SMALL.vocab_size)) - set(kept.tolist()))
+    assert torch.isinf(expanded[:, dropped]).all() and (expanded[:, dropped] < 0).all()
+    assert torch.isfinite(expanded[:, kept.tolist()]).all()
+
+    raw = draft.forward(tokens, cache=draft.new_cache(32), raw_logits=True)
+    assert raw.shape == (3, len(kept))
+    torch.testing.assert_close(raw, expanded[:, kept.tolist()])
+
+
+def test_offline_scoring_sees_through_the_trimming(trimmed_pair):
+    """A trimmed copy of a model must score as nearly identical to it, not as unrelated.
+
+    This is the bug that made trimming look catastrophic: comparing a trimmed draft's argmax in
+    its own index space against the target's in the full space never matches.
+    """
+    from specdraft.engine import EngineModel
+    from specdraft.offline import score_sequence
+    from specdraft.sampling import GREEDY
+
+    target_path, draft_path, kept = trimmed_pair
+    target = EngineModel(target_path, max_positions=64)
+    draft = EngineModel(draft_path, max_positions=64)
+    allowed = set(kept.tolist())
+
+    sequence = torch.tensor([1, 3, 5, 7, 9, 11, 13, 15])
+    metrics = score_sequence(target, draft, sequence, response_start=3, config=GREEDY)
+
+    # The draft is the target with half its output rows removed, so it must agree everywhere the
+    # target's own choice is a token it kept, and nowhere else.
+    for index, matched in enumerate(metrics.greedy_match):
+        target_choice = int(metrics.tokens[index]) if metrics.target_match[index] else None
+        if target_choice is not None:
+            assert bool(matched) == (target_choice in allowed)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -45,6 +46,15 @@ class EngineModel:
         self.raw = _engine.Model(str(path), max_positions=max_positions)
         self.path = Path(path)
         self.device = torch.device("cpu")
+        # A model whose output layer was trimmed scores only the tokens it kept, in its own
+        # index space. Everything on the Python side -- the offline metrics, the decoder, the
+        # acceptance rule -- works over the target's vocabulary, so those logits get scattered
+        # back onto their own token ids with the dropped ones left at -inf.
+        self._token_map = None
+        if self.raw.trimmed_vocabulary:
+            self._token_map = np.array(
+                [self.raw.token_for_logit(i) for i in range(self.raw.logit_count)], dtype=np.int64
+            )
 
     # -- what the decoder calls ----------------------------------------------------
 
@@ -65,8 +75,12 @@ class EngineModel:
         capture: list[Tensor] | None = None,
         only_last_logits: bool = False,
         hidden_only: bool = False,
+        raw_logits: bool = False,
     ) -> Tensor:
         """Run k tokens and return logits [k or 1, vocab_limit].
+
+        For a model with a trimmed output layer the logits are expanded into the target's
+        vocabulary, with the dropped tokens at -inf, unless ``raw_logits`` is set.
 
         ``cache`` is accepted for interface compatibility; the engine always uses its own.
         ``hidden_only`` is not available, since the engine's output layer is not separable
@@ -92,6 +106,12 @@ class EngineModel:
             # forward_capture computes no logits, so run again for them; only tests do this.
             self.raw.set_pos(self.raw.pos - len(ids))
         logits = self.raw.forward(ids, all_logits=not only_last_logits)
+        if self._token_map is not None and not raw_logits:
+            expanded = np.full(
+                (logits.shape[0], self.vocab_limit), -np.inf, dtype=np.float32
+            )
+            expanded[:, self._token_map] = logits
+            logits = expanded
         return torch.from_numpy(logits)
 
     # -- information ---------------------------------------------------------------

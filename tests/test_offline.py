@@ -178,3 +178,109 @@ def test_scoring_rejects_bad_response_start(pair):
         score_sequence(target, draft, tokens(10, seed=5), response_start=0)
     with pytest.raises(ValueError):
         score_sequence(target, draft, tokens(10, seed=5), response_start=10)
+
+
+# ------------------------------------------------- pooling, token classes, gamma sweeps
+
+
+def test_concatenating_pools_every_column(pair):
+    from specdraft.offline import concatenate
+
+    target, draft = pair
+    parts = [
+        score_sequence(target, draft, tokens(20, seed=30), 5, config=SAMPLING),
+        score_sequence(target, draft, tokens(14, seed=31), 4, config=SAMPLING),
+    ]
+    pooled = concatenate(parts)
+    assert len(pooled) == len(parts[0]) + len(parts[1])
+    assert pooled.one_minus_tvd[0] == parts[0].one_minus_tvd[0]
+    assert pooled.tokens[-1] == parts[1].tokens[-1]
+    with pytest.raises(ValueError):
+        concatenate([])
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (" ", "whitespace"),
+        ("\n\n", "whitespace"),
+        (" 42", "digit"),
+        ("3.5", "digit"),
+        (".", "punctuation"),
+        (" ,", "punctuation"),
+        (" Paris", "word_start_capital"),
+        (" paris", "word_start"),
+        ("ing", "word_continuation"),
+        ("日本", "cjk"),
+        ("", "other"),
+    ],
+)
+def test_token_classes(text, expected):
+    from specdraft.offline import classify_token
+
+    assert classify_token(text) == expected
+
+
+def test_special_tokens_are_their_own_class():
+    from specdraft.offline import classify_token
+
+    assert classify_token("<|im_end|>", is_special=True) == "special"
+
+
+def test_acceptance_by_class_splits_the_blame():
+    """A class that is frequent *and* poorly accepted is where a draft needs work."""
+    import numpy as np
+
+    from specdraft.offline import PositionMetrics, acceptance_by_class
+
+    metrics = PositionMetrics(
+        greedy_match=np.array([True, True, False, False, True, False]),
+        one_minus_tvd=np.zeros(6),
+        coupled_accept=np.zeros(6),
+        draft_confidence=np.ones(6),
+        target_match=np.ones(6, dtype=bool),
+        tokens=np.arange(6),
+    )
+    classes = ["word_start", "word_start", "digit", "digit", "word_start", "digit"]
+    profile = acceptance_by_class(metrics, classes, greedy=True)
+
+    assert profile["word_start"]["acceptance"] == pytest.approx(1.0)
+    assert profile["digit"]["acceptance"] == pytest.approx(0.0)
+    assert profile["word_start"]["share"] == pytest.approx(0.5)
+    assert list(profile) == ["word_start", "digit"]  # most frequent first
+
+
+def test_gamma_sweep_answers_every_gamma_from_one_pass(pair):
+    from specdraft.offline import gamma_sweep
+
+    target, draft = pair
+    metrics = score_sequence(target, draft, tokens(60, seed=32), 10, config=GREEDY)
+    sweep = gamma_sweep(metrics, [1, 2, 4, 8], greedy=True)
+
+    assert set(sweep) == {1, 2, 4, 8}
+    assert all(1.0 <= value <= gamma + 1 for gamma, value in sweep.items())
+    # More guesses per round can never emit fewer tokens per pass.
+    assert sweep[1] <= sweep[2] <= sweep[4] <= sweep[8]
+
+
+def test_a_confidence_threshold_can_only_reduce_tokens_per_pass(pair):
+    from specdraft.offline import gamma_sweep
+
+    target, draft = pair
+    metrics = score_sequence(target, draft, tokens(60, seed=33), 10, config=GREEDY)
+    without = gamma_sweep(metrics, [4], greedy=True)[4]
+    with_threshold = gamma_sweep(metrics, [4], greedy=True, confidence_threshold=1.01)[4]
+    assert with_threshold == pytest.approx(1.0)  # nothing clears it, so no guesses are made
+    assert with_threshold <= without
+
+
+def test_best_gamma_uses_the_measured_curve():
+    from specdraft.offline import best_gamma
+
+    tokens_per_step = {1: 1.8, 2: 2.5, 4: 3.4, 8: 4.0}
+    # A flat verification cost favours many guesses; a steeply rising one favours few, which is
+    # the whole reason v(k) is measured rather than assumed.
+    flat = best_gamma(tokens_per_step, c=0.1, v=1.0)
+    steep = best_gamma(tokens_per_step, c=0.1, v={2: 1.1, 3: 1.4, 5: 2.4, 9: 5.0})
+    assert flat[0] >= steep[0]
+    assert flat[1] > steep[1]

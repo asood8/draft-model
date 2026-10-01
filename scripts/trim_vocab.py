@@ -94,8 +94,14 @@ def main() -> None:
                                       always_keep=always_keep)
     print(f"keeping {len(ids)} tokens ({len(ids) / vocab_limit:.1%} of the vocabulary), "
           f"covering {coverage:.3%} of occurrences")
-    print(f"so trimming costs at most about {1 - coverage:.3%} of acceptance, "
-          "before any distillation")
+    print(f"so trimming costs at most about {1 - coverage:.3%} of acceptance on *this* text")
+    if args.data is None:
+        print("
+WARNING: counted on plain prose, which is not what the draft will have to "
+              "predict. Measured on a 0.6B, a set chosen from WikiText covered 100% of WikiText "
+              "but missed 23% of the model's own chat output -- markdown markers, capitalized "
+              "names, newline runs -- so acceptance was capped near 0.77. Recount with --data "
+              "pointing at the target's own generations before trusting the coverage figure.")
 
     state_dict = {k: v.to(torch.float32) for k, v in load_safetensors(args.model).items()}
     entries = write_model(

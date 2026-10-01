@@ -21,6 +21,7 @@ training checkpoints and sweeps γ for free.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -86,6 +87,20 @@ def _row_logits(model, tokens: Tensor, rows: np.ndarray, chunk: int):
         end = min(begin + chunk, len(rows))
         index = torch.as_tensor(rows[begin:end], device=hidden.device)
         yield begin, end, model.logits_from_hidden(hidden[index])
+
+
+def concatenate(parts: Sequence[PositionMetrics]) -> PositionMetrics:
+    """Pool the scores from several sequences into one set of per-position numbers."""
+    if not parts:
+        raise ValueError("nothing to concatenate")
+    return PositionMetrics(
+        greedy_match=np.concatenate([part.greedy_match for part in parts]),
+        one_minus_tvd=np.concatenate([part.one_minus_tvd for part in parts]),
+        coupled_accept=np.concatenate([part.coupled_accept for part in parts]),
+        draft_confidence=np.concatenate([part.draft_confidence for part in parts]),
+        target_match=np.concatenate([part.target_match for part in parts]),
+        tokens=np.concatenate([part.tokens for part in parts]),
+    )
 
 
 @torch.no_grad()
@@ -255,3 +270,128 @@ def predicted_speedup(tau: float, gamma: int, c: float, v: float = 1.0, o: float
     same units, and o is per-round overhead such as sampling over a 152k vocabulary.
     """
     return tau / (gamma * c + v + o)
+
+
+# ----------------------------------------------------- what kinds of token get rejected
+#
+# Plan §9.3: acceptance is an average, and averages hide the interesting part. Grouping
+# positions by what kind of token the target wanted shows where a draft is actually failing,
+# which is what makes the write-up worth reading. Numbers, names and sentence openings are the
+# usual suspects, and the classes below are chosen to separate them.
+
+TOKEN_CLASSES = (
+    "whitespace",
+    "digit",
+    "punctuation",
+    "cjk",
+    "word_start_capital",
+    "word_start",
+    "word_continuation",
+    "special",
+    "other",
+)
+
+
+def classify_token(text: str, is_special: bool = False) -> str:
+    """Put one token's surface form into a class. The order below is the priority."""
+    if is_special:
+        return "special"
+    if not text:
+        return "other"
+    if text.strip() == "":
+        return "whitespace"
+    if any(character.isdigit() for character in text):
+        return "digit"
+    if any("\u4e00" <= character <= "\u9fff" or "\u3040" <= character <= "\u30ff" for character in text):
+        return "cjk"
+    stripped = text.strip()
+    if all(not character.isalnum() for character in stripped):
+        return "punctuation"
+
+    leading_space = text[0].isspace()
+    first_letter = next((character for character in stripped if character.isalpha()), "")
+    if leading_space:
+        return "word_start_capital" if first_letter.isupper() else "word_start"
+    return "word_continuation"
+
+
+def token_class_names(tokenizer, token_ids: np.ndarray) -> list[str]:
+    """One class per token id, using the tokenizer's own surface forms."""
+    special = set(getattr(tokenizer, "all_special_ids", None) or [])
+    classes = []
+    for token_id in token_ids.tolist():
+        text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+        classes.append(classify_token(text, is_special=int(token_id) in special))
+    return classes
+
+
+def acceptance_by_class(
+    metrics: PositionMetrics, classes: Sequence[str], greedy: bool = True
+) -> dict[str, dict[str, float]]:
+    """Acceptance per token class, with how much of the text each class accounts for.
+
+    A class that is both frequent and poorly accepted is where a distillation run should be
+    judged; a rare one with low acceptance is a curiosity.
+    """
+    accept = metrics.accept_prob(greedy=greedy)
+    totals: dict[str, list[float]] = {}
+    for name, value in zip(classes, accept):
+        totals.setdefault(name, []).append(float(value))
+
+    positions = len(accept)
+    return {
+        name: {
+            "positions": len(values),
+            "share": len(values) / positions if positions else 0.0,
+            "acceptance": sum(values) / len(values),
+        }
+        for name, values in sorted(totals.items(), key=lambda item: -len(item[1]))
+    }
+
+
+def gamma_sweep(
+    metrics: PositionMetrics,
+    gammas: Sequence[int],
+    greedy: bool = True,
+    draws: int = 32,
+    seed: int = 0,
+    confidence_threshold: float = 0.0,
+) -> dict[int, float]:
+    """Tokens per target pass for each γ, from the one pass over the text.
+
+    This is what makes a γ sweep nearly free: the same per-position numbers answer every γ, so
+    the expensive part happens once.
+    """
+    accept = metrics.accept_prob(greedy=greedy)
+    confidence = metrics.draft_confidence if confidence_threshold > 0 else None
+    return {
+        gamma: simulate_tokens_per_step(
+            accept,
+            gamma,
+            draws=draws,
+            seed=seed,
+            draft_confidence=confidence,
+            confidence_threshold=confidence_threshold,
+        )
+        for gamma in gammas
+    }
+
+
+def best_gamma(
+    tokens_per_step: dict[int, float],
+    c: float,
+    v: dict[int, float] | float = 1.0,
+    o: float = 0.0,
+) -> tuple[int, float]:
+    """The γ with the best predicted speedup, and that speedup.
+
+    ``v`` may be a single number or the measured v(k) curve, in which case v(γ+1) is used for
+    each γ — which is the whole reason the curve gets measured.
+    """
+    best = (0, 0.0)
+    for gamma, tau in tokens_per_step.items():
+        verification = v if isinstance(v, (int, float)) else v.get(gamma + 1, 1.0)
+        speedup = predicted_speedup(tau, gamma, c, float(verification), o)
+        if speedup > best[1]:
+            best = (gamma, speedup)
+    return best
