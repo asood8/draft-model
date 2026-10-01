@@ -1,4 +1,4 @@
-# draft-model
+# draft-model (in progress)
 
 Speculative decoding for **Qwen3-4B** on a laptop CPU, built from scratch.
 
