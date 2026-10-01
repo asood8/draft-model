@@ -1,4 +1,4 @@
-"""Build the training data for distillation (plan §11.2 and §11.3).
+"""Build the training data for distillation (plan section 11.2 and section 11.3).
 
 Two steps. First the prompt mix, decontaminated against the evaluation set::
 

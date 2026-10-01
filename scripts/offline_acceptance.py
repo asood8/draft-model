@@ -1,4 +1,4 @@
-"""Score a draft without decoding, and sweep γ for free (plan §11.6).
+"""Score a draft without decoding, and sweep gamma for free (plan section 11.6).
 
     python scripts/offline_acceptance.py \
         --target models/Qwen3-4B --draft runs/tvd-target/draft \
@@ -7,13 +7,13 @@
         --out results/offline_tvd.json
 
 Decoding on a laptop CPU runs at tens of tokens a second, so measuring acceptance by actually
-generating would take days across every draft, decoding mode, γ and task. Instead each model runs
+generating would take days across every draft, decoding mode, gamma and task. Instead each model runs
 *once* over text the target already produced, and the rounds are simulated from the per-position
 numbers. For greedy that is not an approximation but the same computation; for sampling it is exact
 in distribution.
 
-What comes out: acceptance, tokens per target pass at every γ, the predicted speedup when c and
-v(k) are supplied, and which kinds of token the draft gets wrong — the last being what makes the
+What comes out: acceptance, tokens per target pass at every gamma, the predicted speedup when c and
+v(k) are supplied, and which kinds of token the draft gets wrong -- the last being what makes the
 write-up more than a table.
 
 Either side can be a Hugging Face directory (scored through the quantization twin, which is how

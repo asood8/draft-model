@@ -1,4 +1,4 @@
-"""Distil a draft model toward a target (plan §11).
+"""Distil a draft model toward a target (plan section 11).
 
 One run of the grid, start to finish::
 

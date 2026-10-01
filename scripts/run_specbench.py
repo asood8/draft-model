@@ -1,4 +1,4 @@
-"""Run Spec-Bench through the engine and write the headline table (plan §9).
+"""Run Spec-Bench through the engine and write the headline table (plan section 9).
 
     python scripts/run_specbench.py \
         --target models/Qwen3-4B-q4.sdm --draft models/Qwen3-0.6B-q4.sdm \
@@ -7,14 +7,14 @@
 
 Methods, all running inside the engine so the comparison is like for like:
 
-* ``target`` — the model alone, which every speedup is measured against;
-* ``speculative`` — the draft model, at the given γ;
-* ``lookup`` — guesses copied from earlier text, which needs no draft at all and is hard to beat
+* ``target`` -- the model alone, which every speedup is measured against;
+* ``speculative`` -- the draft model, at the given gamma;
+* ``lookup`` -- guesses copied from earlier text, which needs no draft at all and is hard to beat
   where text repeats;
-* ``speculative+stop`` — the draft with confidence-based early stopping.
+* ``speculative+stop`` -- the draft with confidence-based early stopping.
 
 The question file is not bundled; see ``specdraft.specbench``. Methods are interleaved per
-question, and speeds are medians, because this machine drifts while a suite runs (plan §13).
+question, and speeds are medians, because this machine drifts while a suite runs (plan section 13).
 """
 
 from __future__ import annotations

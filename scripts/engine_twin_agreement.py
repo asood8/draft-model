@@ -1,4 +1,4 @@
-"""How well does the PyTorch twin predict the engine? (plan §11.6)
+"""How well does the PyTorch twin predict the engine? (plan section 11.6)
 
     python scripts/engine_twin_agreement.py models/Qwen3-0.6B-q4.sdm models/Qwen3-0.6B
 

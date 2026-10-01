@@ -1,4 +1,4 @@
-"""WikiText-2 perplexity for the reference model and its quantized twins (plan §7.2).
+"""WikiText-2 perplexity for the reference model and its quantized twins (plan section 7.2).
 
     python scripts/perplexity.py models/Qwen3-0.6B --windows 8
 

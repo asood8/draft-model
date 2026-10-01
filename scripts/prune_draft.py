@@ -1,4 +1,4 @@
-"""Score a draft's layers and remove the least useful ones (plan §8.1).
+"""Score a draft's layers and remove the least useful ones (plan section 8.1).
 
     python scripts/prune_draft.py --model models/Qwen3-0.6B --keep 14 \
         --out models/Qwen3-0.6B-keep14

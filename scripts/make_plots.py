@@ -1,20 +1,20 @@
-"""Turn the result JSONs into the figures the write-up is built around (plan §12).
+"""Turn the result JSONs into the figures the write-up is built around (plan section 12).
 
     python scripts/make_plots.py --results results --out results/figures
 
 Reads whatever is present and skips what is not, so it can be run at any point and will draw more
 as more measurements land:
 
-* **v(k)** — what each extra verified token costs. The figure the project exists to produce, since
+* **v(k)** -- what each extra verified token costs. The figure the project exists to produce, since
   the usual speedup formula assumes this line is flat at 1.
-* **Predicted against measured speedup** — the formula is only worth having if it predicts; the
+* **Predicted against measured speedup** -- the formula is only worth having if it predicts; the
   distance from the diagonal is the part worth explaining.
-* **Tokens per pass against γ** — where more guesses stop paying.
-* **Thread configurations** — performance cores against all cores, fixed split against dynamic
+* **Tokens per pass against gamma** -- where more guesses stop paying.
+* **Thread configurations** -- performance cores against all cores, fixed split against dynamic
   chunks, with the measured bandwidth ceiling drawn in.
-* **Acceptance by token class** — which kinds of token a draft gets wrong, which is what makes the
+* **Acceptance by token class** -- which kinds of token a draft gets wrong, which is what makes the
   write-up more than a table.
-* **Per-category speedup** — the headline Spec-Bench comparison.
+* **Per-category speedup** -- the headline Spec-Bench comparison.
 
 Plots are deliberately plain: one chart per figure, labelled axes, no styling that would make two
 figures hard to compare.

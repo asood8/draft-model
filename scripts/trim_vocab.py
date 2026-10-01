@@ -1,4 +1,4 @@
-"""Trim a draft's output vocabulary and export it for the engine (plan §8.2).
+"""Trim a draft's output vocabulary and export it for the engine (plan section 8.2).
 
     python scripts/trim_vocab.py --model models/Qwen3-0.6B --keep 32768 \
         --wikitext-tokens 200000 --format q4 --out models/Qwen3-0.6B-trim32k-q4.sdm
@@ -8,8 +8,8 @@ reads; layer pruning cannot touch it. Keeping only the tokens that actually get 
 most of that, and stays exact: the draft simply never proposes a dropped token, and the acceptance
 rule resamples from the residual, which still covers them.
 
-Count the frequencies over text the draft will have to produce — ideally the target's own
-generations (``--data``) — rather than over prompts, which are read and not written. The coverage
+Count the frequencies over text the draft will have to produce -- ideally the target's own
+generations (``--data``) -- rather than over prompts, which are read and not written. The coverage
 figure printed here is the ceiling on what trimming can cost in acceptance: whatever mass the
 target puts on a dropped token is a guess the draft can no longer make.
 

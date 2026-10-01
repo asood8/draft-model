@@ -5,11 +5,11 @@
 
 Every speed is a percentage of this machine's measured read bandwidth, because single-token
 decoding streams the weights once per token and little else. The thread configurations are
-the four from plan §9.4, plus one thread for reference.
+the four from plan section 9.4, plus one thread for reference.
 
 **Why each sample lasts seconds.** A laptop's clocks wander: short samples of the same build
 on this machine ranged from 40 to 70 tok/s, a 51% spread, which is wider than most
-optimizations are worth. So the harness follows plan §13: a sustained warm-up to reach a
+optimizations are worth. So the harness follows plan section 13: a sustained warm-up to reach a
 steady thermal state, samples measured over whole seconds, configurations interleaved so
 drift hits them equally, and the median reported with the spread beside it. A result whose
 interquartile range overlaps another's is not a difference.

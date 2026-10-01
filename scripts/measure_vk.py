@@ -1,15 +1,15 @@
-"""Measure v(k): what it costs to verify k tokens in one pass (plan §3).
+"""Measure v(k): what it costs to verify k tokens in one pass (plan section 3).
 
     python scripts/measure_vk.py models/Qwen3-0.6B-q4.sdm
     python scripts/measure_vk.py models/Qwen3-4B-q4.sdm --draft models/Qwen3-0.6B-q4.sdm
 
-The original speedup formula assumes checking γ+1 tokens costs the same as one ordinary step.
+The original speedup formula assumes checking gamma+1 tokens costs the same as one ordinary step.
 On a CPU it does not: the weights are read once however many tokens share the pass, but the
 integer arithmetic grows with every extra token, so v(k) starts near 1 and climbs. Where it
 starts climbing decides the best number of guesses per round, and that is the term this
 project adds to the formula:
 
-    speedup(γ) = τ(γ) / (γ·c + v(γ+1)),   τ(γ) = (1 − α^(γ+1)) / (1 − α)
+    speedup(gamma) = tau(gamma) / (gamma*c + v(gamma+1)),   tau(gamma) = (1 - alpha^(gamma+1)) / (1 - alpha)
 
 With a draft model given, c is measured too and the whole table is predicted.
 """
@@ -64,15 +64,22 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--alphas", type=float, nargs="*", default=[0.6, 0.7, 0.8])
     parser.add_argument("--cores", default="performance")
+    parser.add_argument("--measure-overhead", action="store_true", default=True,
+                        help="also measure o, the per-round overhead (needs --draft)")
+    parser.add_argument("--no-measure-overhead", dest="measure_overhead", action="store_false")
+    parser.add_argument("--overhead-gamma", type=int, default=4)
+    parser.add_argument("--overhead-tokens", type=int, default=32)
     parser.add_argument("--out", type=Path, default=Path("results"))
     args = parser.parse_args()
 
+    # Room for the longest thing either measurement does: the k-token sweep, or the overhead run
+    # which generates tokens on top of the context.
+    # The overhead measurement runs two budgets, the longer being twice the first.
+    capacity = args.context + max(args.max_k, 2 * args.overhead_tokens + args.overhead_gamma) + 8
+
     def open_model(path: Path):
         return cpp.Model(
-            str(path),
-            max_positions=args.context + args.max_k + 8,
-            cores=args.cores,
-            max_batch=args.max_k,
+            str(path), max_positions=capacity, cores=args.cores, max_batch=args.max_k
         )
 
     target = open_model(args.target)
@@ -102,6 +109,7 @@ def main() -> None:
     }
     del target
 
+    draft_step = 0.0
     if args.draft is not None:
         draft = open_model(args.draft)
         draft_step = time_forward(draft, 1, args.context, args.samples)
@@ -112,8 +120,8 @@ def main() -> None:
         record["c"] = c
         print(f"\none draft step: {draft_step * 1e3:.2f} ms   c = {c:.3f}")
 
-        print(f"\npredicted speedup, using measured v(γ+1) and c = {c:.3f}")
-        header = "  γ " + "".join(f"  α={a:<5.2f}" for a in args.alphas) + "  v(γ+1)"
+        print(f"\npredicted speedup, using measured v(gamma+1) and c = {c:.3f}")
+        header = "  gamma " + "".join(f"  alpha={a:<5.2f}" for a in args.alphas) + "  v(gamma+1)"
         print(header)
         best = {a: (0.0, 0) for a in args.alphas}
         rows = []
@@ -134,7 +142,53 @@ def main() -> None:
         print()
         for alpha in args.alphas:
             speedup, gamma = best[alpha]
-            print(f"best at α={alpha:.2f}: {speedup:.2f}x with γ={gamma}")
+            print(f"best at alpha={alpha:.2f}: {speedup:.2f}x with gamma={gamma}")
+
+    if args.draft is not None and args.measure_overhead:
+        # The third term in the formula. A round costs gamma draft steps plus one verification
+        # pass; whatever is left over -- sampling over a 152k vocabulary, the acceptance test,
+        # cache bookkeeping -- is o. Without it, any gap between predicted and measured speedup
+        # has nowhere to go.
+        #
+        # Taken from the engine's own per-stage timers rather than by subtracting one run from
+        # another: the models report how long they spent computing, and whatever the round loop
+        # took beyond that is overhead. Differencing two runs was tried first and failed, because
+        # this machine's run-to-run variance is larger than the quantity being measured.
+        gamma = min(args.overhead_gamma, args.max_k - 1)
+        target = open_model(args.target)
+        draft = open_model(args.draft)
+        for model in (target, draft):
+            model.set_timing(True)
+            model.reset_timings()
+
+        _, stats = cpp.generate_speculative(
+            target, draft, [7] * args.context, max_new_tokens=args.overhead_tokens, gamma=gamma
+        )
+        model_seconds = target.timings()["total"] + draft.timings()["total"]
+        rounds = max(1, stats["rounds"])
+        per_round = (stats["seconds"] - model_seconds) / rounds
+        o = per_round / single
+
+        record["overhead"] = {
+            "gamma": gamma,
+            "rounds": stats["rounds"],
+            "total_seconds": stats["seconds"],
+            "model_seconds": model_seconds,
+            "seconds_per_round": per_round,
+            "o_per_round": o,
+            "tokens_per_target_forward": stats["tokens_per_target_forward"],
+            "alpha": stats["alpha"],
+        }
+        print()
+        print(f"per-round overhead at gamma={gamma}: {per_round * 1e3:.2f} ms, "
+              f"o = {o:.3f} target steps")
+        print(f"  ({stats['seconds'] * 1e3:.0f} ms of generation, of which "
+              f"{model_seconds * 1e3:.0f} ms was the models computing, over {rounds} rounds)")
+        print(f"  that run: tau {stats['tokens_per_target_forward']:.2f}, "
+              f"alpha {stats['alpha']:.3f}")
+        print(f"  sampling over the vocabulary is most of this; it scales with gamma, "
+              f"not with model size")
+        del target, draft
 
     args.out.mkdir(parents=True, exist_ok=True)
     path = args.out / f"vk_{args.target.stem}.json"
