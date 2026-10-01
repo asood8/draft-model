@@ -12,6 +12,7 @@ their own. Section 17 tracks decisions and open questions.
 
 | Date | Where things stand |
 |---|---|
+| 2026-10-01 | **Milestone 5 built, and the evaluation harness with it.** Distillation exists end to end: five losses with a chunked form that keeps a 151,669-token vocabulary in memory, a trainable draft that reuses the verified reference forward pass, the training loop (teacher as a callable, so the full-precision target, the 4-bit twin or cached logits all fit), the data pipeline with 13-gram decontamination, and runnable scripts for both. An integration test trains a miniature Qwen3 carrying the real tokenizer, saves it, exports it and runs it in the engine. Spec-Bench harness runs target-alone, the draft, prompt lookup and early stopping, interleaved, into a per-category table. Layer pruning scores and cuts layers; see §11.7 for what that measured. 620 tests pass. Remaining before results: the 4B target, then the grid. |
 | 2026-10-01 | **Milestone 4 core done.** The k-token kernel shares one pass over the weights across the tokens being verified, and is bit-identical to calling the single-token kernel once per token (tested for 1–13 tokens, across tile boundaries). The forward pass is now batched to match. The decoding loops moved into C++ — sampling warps, a seeded xoshiro generator, the acceptance rule and the round loop — so Python overhead never lands in a timing. Greedy output from the C++ loop matches both plain decoding and the Python loop token for token; its sampling passes the same chi-square over every two-token continuation. First v(k) numbers for the 0.6B at context 128: v(2) ≈ 2.1 falling to v(5) ≈ 3.1, i.e. per-token cost inside a pass drops from 19.5 ms to about 11.5 ms. **Verification is not nearly free for a 0.6B**, because its weights are small next to its arithmetic; the 4B is where the term should flatten, and that needs the 4B downloaded. 507 tests pass. |
 | 2026-10-01 | **Milestone 3 under way.** Persistent thread pool with spin barriers, row-split work, core pinning and CPU topology detection; attention, the norms and the KV cache writes vectorized. Decode went from 4.4 tok/s (scalar, single thread) to a median of about 30–50 tok/s on six performance cores at context 128, against a measured ceiling of 100–117 tok/s. Measured read bandwidth 37–39 GB/s (about 75% of the DDR4-3200 theoretical 51.2). Dispatch overhead is 0.9 µs per parallel job, so barriers are not the constraint. See §13 for why the range on the decode figure is so wide. 454 tests pass. Next: the k-token kernel, which sets v(k). |
 | 2026-09-30 | **Milestone 1 done.** Qwen3 written from scratch matches Hugging Face layer by layer and token for token. The quantization formats exist in C++, NumPy and torch, byte-identical. The 0.6B exports to 4 bits at 4.50 bits/weight (335 MB). Perplexity table measured (§7.2). **Milestone 2 done.** The C++ engine loads that file, its fp32 path matches the reference to 1e-5, and its greedy output matches the twin token for token; the Python speculative decoder drives it. Toolchain installed (VS Build Tools 2026, MSVC 19.51, clang-cl 22.1, CMake 4.3, Ninja 1.13). 434 tests pass. Next: Milestone 3, making it fast. |
@@ -845,6 +846,17 @@ numbers that get published. So:
 | D. Data | Best loss on fixed text and on draft-generated data | Which data source |
 | E. Scale-up | Best recipe to ~50M tokens, with checkpoints evaluated along the way | Final draft, plus a curve of acceptance against training tokens |
 | *Stretch* | Quantization-aware training; on-policy distillation; **layer pruning** (fewer layers means fewer bytes *and* fewer thread barriers, which directly lowers c on a CPU) | |
+
+> **Measured, 2026-10-01: a pruning run is pruning *plus* training, never pruning alone.** Block influence on
+> Qwen3-0.6B ranks layers 23–26 as the least useful and layer 0 as far the most important (0.95 against about 0.10
+> for everything else), matching the published result that the removable layers are the deep ones other than the
+> last. But dropping 8 of 28 layers leaves a model that emits gibberish, and its acceptance as a draft for the
+> unpruned model collapses to **4%**. There is no α-versus-c trade-off to explore until distillation has healed it,
+> so each pruned variant has to be budgeted with a training run attached.
+>
+> The saving is also smaller than the layer count suggests: removing those 8 layers cuts bytes per token only to
+> **0.79** of the original, because the output layer over a 151,936-row vocabulary is a fixed cost pruning cannot
+> touch. That is what makes vocabulary trimming the companion to pruning rather than an alternative to it.
 
 **Kaggle GPU budget (rough)**
 
