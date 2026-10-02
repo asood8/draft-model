@@ -6,8 +6,10 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <cstring>
 #include <map>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -493,4 +495,98 @@ PYBIND11_MODULE(_engine, m) {
             return dot_py<BlockQ8, dot_q8_a8_scalar>(w, x, "Q8");
         },
         py::arg("weights"), py::arg("activations"));
+
+    // The k-token kernel on its own, with no model around it. Measuring v(k) through the engine
+    // mixes two different things: how efficiently the kernel issues its multiply-accumulates, and
+    // how often it stalls waiting for weights. Choosing `rows` so the weights fit L2 separates them
+    // -- a cache-resident run is a pure throughput figure, and the fall-off as `rows` grows past the
+    // cache is the memory cost. Single-threaded on purpose, so the thread pool is not in the way.
+    m.def(
+        "bench_dot",
+        [](int rows, int n_in, int tokens, int iters, const std::string& format) {
+            if (rows < 1 || n_in < 1 || tokens < 1 || iters < 1) {
+                throw std::invalid_argument("rows, n_in, tokens and iters must all be positive");
+            }
+            if (n_in % QK != 0) {
+                throw std::invalid_argument("n_in must be a multiple of " + std::to_string(QK));
+            }
+            const bool four_bit = format == "q4";
+            if (!four_bit && format != "q8") {
+                throw std::invalid_argument("format must be \"q4\" or \"q8\"");
+            }
+
+            const int nblocks = n_in / QK;
+            std::mt19937 rng(1234);
+            std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+            std::vector<float> scratch(static_cast<size_t>(n_in));
+            const auto fill = [&] {
+                for (float& value : scratch) {
+                    value = uniform(rng);
+                }
+            };
+
+            std::vector<BlockA8> activations(static_cast<size_t>(tokens) * nblocks);
+            for (int t = 0; t < tokens; ++t) {
+                fill();
+                quantize_a8(scratch.data(), n_in, activations.data() + static_cast<size_t>(t) * nblocks);
+            }
+
+            std::vector<BlockQ4> w4;
+            std::vector<BlockQ8> w8;
+            if (four_bit) {
+                w4.resize(static_cast<size_t>(rows) * nblocks);
+            } else {
+                w8.resize(static_cast<size_t>(rows) * nblocks);
+            }
+            for (int r = 0; r < rows; ++r) {
+                fill();
+                if (four_bit) {
+                    quantize_q4(scratch.data(), n_in, w4.data() + static_cast<size_t>(r) * nblocks);
+                } else {
+                    quantize_q8(scratch.data(), n_in, w8.data() + static_cast<size_t>(r) * nblocks);
+                }
+            }
+
+            std::vector<float> out(static_cast<size_t>(tokens));
+            double checksum = 0.0;
+            // The checksum is not a correctness check -- the tests do that -- it is only there so
+            // that nothing in the timed loop can be optimized away as dead.
+            const auto sweep = [&] {
+                for (int r = 0; r < rows; ++r) {
+                    if (four_bit) {
+                        dot_q4_a8_multi(w4.data() + static_cast<size_t>(r) * nblocks,
+                                        activations.data(), nblocks, tokens, out.data());
+                    } else {
+                        dot_q8_a8_multi(w8.data() + static_cast<size_t>(r) * nblocks,
+                                        activations.data(), nblocks, tokens, out.data());
+                    }
+                    checksum += out[0];
+                }
+            };
+
+            sweep();  // untimed, so the measurement is not paying for cold caches
+            double seconds = 0.0;
+            {
+                py::gil_scoped_release unlocked;
+                const auto started = std::chrono::steady_clock::now();
+                for (int i = 0; i < iters; ++i) {
+                    sweep();
+                }
+                seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+                              .count();
+            }
+
+            const double weight_bytes = static_cast<double>(rows) * nblocks
+                                        * (four_bit ? sizeof(BlockQ4) : sizeof(BlockQ8));
+            py::dict result;
+            result["seconds"] = seconds;
+            result["macs"] = static_cast<double>(rows) * n_in * tokens * iters;
+            result["weight_bytes"] = weight_bytes;
+            result["weight_bytes_read"] = weight_bytes * iters;
+            result["activation_bytes"] = static_cast<double>(activations.size()) * sizeof(BlockA8);
+            result["checksum"] = checksum;
+            return result;
+        },
+        py::arg("rows"), py::arg("n_in"), py::arg("tokens"), py::arg("iters") = 1,
+        py::arg("format") = "q4");
 }

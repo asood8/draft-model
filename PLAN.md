@@ -13,6 +13,7 @@ their own. Section 17 tracks decisions and open questions.
 | Date | Where things stand |
 |---|---|
 | 2026-10-01 | **Milestone 5 built, and the evaluation harness with it.** Distillation exists end to end: five losses with a chunked form that keeps a 151,669-token vocabulary in memory, a trainable draft that reuses the verified reference forward pass, the training loop (teacher as a callable, so the full-precision target, the 4-bit twin or cached logits all fit), the data pipeline with 13-gram decontamination, and runnable scripts for both. An integration test trains a miniature Qwen3 carrying the real tokenizer, saves it, exports it and runs it in the engine. Spec-Bench harness runs target-alone, the draft, prompt lookup and early stopping, interleaved, into a per-category table. Layer pruning scores and cuts layers; see §11.7 for what that measured. 620 tests pass. Remaining before results: the 4B target, then the grid. |
+| 2026-10-01 | **The real numbers for the real pair, and they say the kernel is the problem.** Acceptance of the off-the-shelf Qwen3-0.6B against Qwen3-4B, both 4-bit, greedy, scored offline over 1,318 response positions from 24 Spec-Bench prompts: **alpha = 0.711**, by category 0.80 math_reasoning, 0.73 multiturn, 0.72 rag, 0.72 translation, 0.69 summarization, 0.61 qa. That is a healthy baseline before any distillation. With the measured v(k), c = 0.220 and o = 0.080 it predicts **0.98x at gamma = 1** -- speculation loses by 2%. Break-even needs alpha >= 0.75, which distillation can reach; 1.2x would need alpha >= 0.93, which it cannot. At the bandwidth floor the *same* alpha gives 1.92x at gamma = 3, so the missing factor of two is entirely the k-token kernel, which a microbenchmark shows running at 8-11% of AVX-VNNI peak **with every weight in L1** -- instruction-bound, not memory-starved. See §3 and §10.1. Also fixed a bug in my own harness: the per-stage breakdown counted a 128-token prefill among its tokens, which made the output projection look like 2.9% of a step against 9.7% of the bytes, i.e. 104 GB/s on a machine that measures 39. It is 7.5% once the prefill is excluded. 656 tests pass. |
 | 2026-10-01 | **Milestone 4 core done.** The k-token kernel shares one pass over the weights across the tokens being verified, and is bit-identical to calling the single-token kernel once per token (tested for 1–13 tokens, across tile boundaries). The forward pass is now batched to match. The decoding loops moved into C++ — sampling warps, a seeded xoshiro generator, the acceptance rule and the round loop — so Python overhead never lands in a timing. Greedy output from the C++ loop matches both plain decoding and the Python loop token for token; its sampling passes the same chi-square over every two-token continuation. First v(k) numbers for the 0.6B at context 128: v(2) ≈ 2.1 falling to v(5) ≈ 3.1, i.e. per-token cost inside a pass drops from 19.5 ms to about 11.5 ms. **Verification is not nearly free for a 0.6B**, because its weights are small next to its arithmetic; the 4B is where the term should flatten, and that needs the 4B downloaded. 507 tests pass. |
 | 2026-10-01 | **Milestone 3 under way.** Persistent thread pool with spin barriers, row-split work, core pinning and CPU topology detection; attention, the norms and the KV cache writes vectorized. Decode went from 4.4 tok/s (scalar, single thread) to a median of about 30–50 tok/s on six performance cores at context 128, against a measured ceiling of 100–117 tok/s. Measured read bandwidth 37–39 GB/s (about 75% of the DDR4-3200 theoretical 51.2). Dispatch overhead is 0.9 µs per parallel job, so barriers are not the constraint. See §13 for why the range on the decode figure is so wide. 454 tests pass. Next: the k-token kernel, which sets v(k). |
 | 2026-09-30 | **Milestone 1 done.** Qwen3 written from scratch matches Hugging Face layer by layer and token for token. The quantization formats exist in C++, NumPy and torch, byte-identical. The 0.6B exports to 4 bits at 4.50 bits/weight (335 MB). Perplexity table measured (§7.2). **Milestone 2 done.** The C++ engine loads that file, its fp32 path matches the reference to 1e-5, and its greedy output matches the twin token for token; the Python speculative decoder drives it. Toolchain installed (VS Build Tools 2026, MSVC 19.51, clang-cl 22.1, CMake 4.3, Ninja 1.13). 434 tests pass. Next: Milestone 3, making it fast. |
@@ -643,27 +644,62 @@ where each result is:
 > every activation block once per row, and the `_mm256_sign_epi8(xq, wq)` operand depends on the *weight*
 > row, so nothing about the activation side can be hoisted out of the row loop either.
 >
-> Three changes, in the order their payoff justifies:
+> **Measured, 2026-10-01, with `scripts/bench_kernel.py`: the kernel is instruction-bound, not
+> memory-starved — the same sweep runs at the same speed out of L1 and out of DRAM.** One thread,
+> n_in 2560, q4, best of three, at four working-set sizes:
 >
-> 1. **Offset trick, to make the activation operand row-independent.** `dpbusd` wants unsigned × signed, which
+> | k | L1 (15 KB) | L2 (384 KB) | L3 (8 MB) | DRAM (192 MB) |
+> |---|---|---|---|---|
+> | 1 | 19.0 GMAC/s | 18.9 | 18.4 | 15.8 |
+> | 4 | 22.7 | 23.0 | 22.4 | 21.9 |
+> | 8 | 24.7 | 25.0 | 25.0 | 24.8 |
+>
+> At k = 1 a DRAM-sized sweep is 17% slower than an L1-sized one, and by k = 4 the difference is
+> gone. **Cache misses are not what the kernel is waiting for.** It sits at 8–11% of peak with every
+> weight already in L1, so the ceiling is the instruction stream. Six cores at 24.7 GMAC/s is
+> 148 GMAC/s, which is the in-model figure, so nothing else in the engine is hiding a cost either.
+>
+> One more number from the same table: per-token cost falls only from 135 ns to 104 ns as k goes from
+> 1 to 8. Sharing the weight unpacking across eight tokens buys 24%. That is the honest measure of
+> how little there is to amortize — the unpacking was never the expensive part.
+>
+> Counting issue slots says where they go. At 0.28 slots per multiply-accumulate, each 32-MAC
+> `dpbusd` is surrounded by about nine slots, and the inner loop has about nine things in it: load
+> the activation block, `sign` it by the weight's sign, `dpbusd`, `cvtepi32_ps`, load the block's
+> fp32 scale, multiply it by the weight scale, broadcast that, and `fmadd`. **Three of the nine are
+> the per-block scale**, which is why the first change below is about scaling and not about the
+> multiply-accumulate.
+>
+> Four changes, in the order their payoff justifies:
+>
+> 1. **Scale once per eight blocks instead of once per block.** Keep each block's `dpbusd` result in
+>    int32, reduce eight blocks' accumulators into one eight-lane vector, and apply the eight scales
+>    with a single vector multiply and a single `fmadd`. That replaces 24 slots of float work per
+>    eight blocks with about three, plus roughly twelve for the reduction. It needs the block scales
+>    contiguous in memory to be loaded as a vector, which is change 4.
+> 2. **Offset trick, to make the activation operand row-independent.** `dpbusd` wants unsigned × signed, which
 >    is why the sign currently moves onto the activation. Keep the nibbles as the unsigned operand instead
 >    (they are already 0…15) and use the identity Σ(q−8)·x = Σq·x − 8·Σx. The Σx term is a property of the
 >    *activation* block alone, so it is computed once when activations are quantized and shared by every row.
 >    This removes two `sign` operations per token per block and, more importantly, makes `xq` the same operand
 >    for all rows.
-> 2. **Register blocking over output rows.** With the activation operand shared, process R rows × T tokens per
+> 3. **Register blocking over output rows.** With the activation operand shared, process R rows × T tokens per
 >    pass, holding R×T accumulators. Each activation load then feeds R `dpbusd`s instead of one, and the
 >    unpacked weights of R rows stay live across T tokens. R=2, T=6 fits the sixteen vector registers with
 >    room for the unpack temporaries.
-> 3. **Aligned in-memory layout, by repacking at load.** A `BlockQ4` is 18 bytes and a `BlockA8` 36, so no
+> 4. **Aligned in-memory layout, by repacking at load.** A `BlockQ4` is 18 bytes and a `BlockA8` 36, so no
 >    block after the first starts on a 32-byte boundary and many 16-byte nibble loads straddle a cache line.
 >    Keeping scales and quantized bytes in separate arrays makes every load aligned. The *file* format stays
 >    as it is — 18-byte blocks are what ggml uses, and keeping them preserves the GGUF path — so the repack
 >    happens when the model is mapped, at no extra memory cost.
 >
-> None of the three changes what is summed or in what order, so the bit-exactness test between a k-token pass
-> and k single-token passes stays valid, and it is the thing that will catch an error in any of them. Nor do
-> they touch the quantization twin, since the arithmetic is unchanged.
+> Changes 2 to 4 alter neither what is summed nor in what order. Change 1 does reorder the float
+> accumulation — eight blocks are reduced before scaling rather than after — so it changes results in
+> the last bits. That is allowed, but only if the single-token and k-token kernels are changed
+> together, because the test that a k-token pass is bit-identical to k single-token passes is what
+> makes greedy speculative decoding reproduce greedy decoding. That test is the guard on all four.
+> None of them touches the quantization twin, which tracks the engine statistically rather than bit
+> for bit.
 >
 > Also pending from the same measurement: the tile constant is 8, but the curve jumps at k=7 because eight
 > per-token accumulators plus the unpack temporaries spill. Until register blocking lands, **the tile should

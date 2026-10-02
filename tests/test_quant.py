@@ -177,3 +177,40 @@ def test_multi_token_kernel_rejects_ragged_input(weight_fmt):
     short = pyq.quantize_a8(sample("normal", 32, 1.0, seed=22))
     with pytest.raises(Exception):
         getattr(cpp, f"dot_{weight_fmt}_a8_multi")(w_blob, short)
+
+
+# --------------------------------------------------------------------- the kernel microbenchmark
+#
+# bench_dot exists to time the kernel away from the engine, so what matters is that the work it
+# reports is the work it actually did -- a benchmark that miscounts is worse than no benchmark.
+
+
+def test_bench_dot_reports_the_work_it_did():
+    result = cpp.bench_dot(rows=4, n_in=64, tokens=3, iters=2, format="q4")
+    assert result["macs"] == 4 * 64 * 3 * 2
+    assert result["weight_bytes"] == 4 * (64 // 32) * 18
+    assert result["weight_bytes_read"] == result["weight_bytes"] * 2
+    assert result["activation_bytes"] == 3 * (64 // 32) * 36
+    assert result["seconds"] > 0.0
+    assert np.isfinite(result["checksum"])
+
+
+def test_bench_dot_q8_blocks_are_larger():
+    result = cpp.bench_dot(rows=4, n_in=64, tokens=1, iters=1, format="q8")
+    assert result["weight_bytes"] == 4 * (64 // 32) * 34
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"rows": 0, "n_in": 32, "tokens": 1},
+        {"rows": 1, "n_in": 0, "tokens": 1},
+        {"rows": 1, "n_in": 32, "tokens": 0},
+        {"rows": 1, "n_in": 32, "tokens": 1, "iters": 0},
+        {"rows": 1, "n_in": 48, "tokens": 1},  # not a whole number of blocks
+        {"rows": 1, "n_in": 32, "tokens": 1, "format": "q3"},
+    ],
+)
+def test_bench_dot_rejects_nonsense(kwargs):
+    with pytest.raises(ValueError):
+        cpp.bench_dot(**kwargs)

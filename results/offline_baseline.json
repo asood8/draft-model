@@ -1,0 +1,115 @@
+{
+  "target": "models\\Qwen3-4B-q4.sdm",
+  "draft": "models\\Qwen3-0.6B-q4.sdm",
+  "target_kind": "engine",
+  "draft_kind": "engine",
+  "mode": "greedy",
+  "sampling": {
+    "temperature": 1.0,
+    "top_k": 0,
+    "top_p": 1.0
+  },
+  "sequences": 24,
+  "positions": 1318,
+  "acceptance": 0.7109256449165402,
+  "greedy_top1": 0.7109256449165402,
+  "sampling_acceptance": 0.7109256449165402,
+  "per_source": {
+    "math_reasoning": {
+      "greedy_top1": 0.8046875,
+      "sampling_acceptance": 0.8046875,
+      "positions": 256
+    },
+    "multiturn": {
+      "greedy_top1": 0.7330097087378641,
+      "sampling_acceptance": 0.7330097087378641,
+      "positions": 206
+    },
+    "qa": {
+      "greedy_top1": 0.609375,
+      "sampling_acceptance": 0.609375,
+      "positions": 256
+    },
+    "rag": {
+      "greedy_top1": 0.72265625,
+      "sampling_acceptance": 0.72265625,
+      "positions": 256
+    },
+    "summarization": {
+      "greedy_top1": 0.6875,
+      "sampling_acceptance": 0.6875,
+      "positions": 256
+    },
+    "translation": {
+      "greedy_top1": 0.7159090909090909,
+      "sampling_acceptance": 0.7159090909090909,
+      "positions": 88
+    }
+  },
+  "tokens_per_pass": {
+    "0.0": {
+      "1": 1.7139141742522757,
+      "2": 2.1821192052980134,
+      "3": 2.5444015444015444,
+      "4": 2.7515657620041756,
+      "5": 2.9419642857142856,
+      "6": 3.0651162790697675,
+      "7": 3.160671462829736,
+      "8": 3.2383292383292384
+    }
+  },
+  "c": 0.22,
+  "o": 0.08,
+  "v": {
+    "1": 1.0,
+    "2": 1.454495494177567,
+    "3": 1.9246533866574898,
+    "4": 2.2694752425143676,
+    "5": 2.817437727591657,
+    "6": 3.4055166167794693,
+    "7": 5.235118453905012,
+    "8": 6.149948781767409,
+    "9": 7.206812893459328,
+    "10": 8.554066153904513,
+    "11": 9.909564646766924,
+    "12": 10.063098173537478
+  },
+  "non_greedy_references": 0,
+  "acceptance_by_token_class": {
+    "word_start": {
+      "positions": 632,
+      "share": 0.4795144157814871,
+      "acceptance": 0.6566455696202531
+    },
+    "punctuation": {
+      "positions": 249,
+      "share": 0.18892261001517452,
+      "acceptance": 0.7630522088353414
+    },
+    "word_continuation": {
+      "positions": 175,
+      "share": 0.13277693474962063,
+      "acceptance": 0.7142857142857143
+    },
+    "word_start_capital": {
+      "positions": 149,
+      "share": 0.11305007587253414,
+      "acceptance": 0.7181208053691275
+    },
+    "digit": {
+      "positions": 64,
+      "share": 0.048558421851289835,
+      "acceptance": 0.921875
+    },
+    "whitespace": {
+      "positions": 44,
+      "share": 0.03338391502276176,
+      "acceptance": 0.8181818181818182
+    },
+    "special": {
+      "positions": 5,
+      "share": 0.0037936267071320183,
+      "acceptance": 1.0
+    }
+  }
+}

@@ -42,17 +42,24 @@ PREFILL_TOKENS = 64
 STEPS_PER_BURST = 16
 
 
-def decode_for(model, seconds: float, context: int) -> float:
+def decode_for(model, seconds: float, context: int, on_start=None) -> float:
     """Decode speed at a fixed context length.
 
     Attention cost grows with the context, so the context has to be held still or the number
     means nothing. Each burst refills the cache to `context` (untimed) and then times a fixed
     number of single-token steps.
+
+    `on_start` runs after the prompt has been prefilled and before the first timed step. The
+    per-stage breakdown uses it to zero the engine's timers there: a prefill pass computes the
+    output projection once for the whole prompt rather than once per token, so counting its
+    tokens makes that stage look several times cheaper than it is during decoding.
     """
     one = np.array([3], dtype=np.int32)
     model.reset()
     if context:
         model.forward(np.array([5] * context, dtype=np.int32))  # filled once, not per burst
+    if on_start is not None:
+        on_start()
 
     tokens = 0
     elapsed = 0.0
@@ -187,8 +194,7 @@ def main() -> None:
     best_options = dict(CONFIGURATIONS)[best]
     model = open_model(best_options)
     model.set_timing(True)
-    model.reset_timings()
-    decode_for(model, args.seconds, args.context)
+    decode_for(model, args.seconds, args.context, on_start=model.reset_timings)
     timings = model.timings()
     model.set_timing(False)
     print(f"\nwhere the time goes ({best}, {timings['tokens']} tokens):")

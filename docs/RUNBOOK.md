@@ -61,32 +61,55 @@ rates. **This is the first real test of the project's premise:** on the 0.6B, v(
 the weights per token, so its curve should be much flatter — if it is not, the honest finding is
 that CPU verification is expensive and small γ wins.
 
+## 3b. Why v(k) has the slope it has (≈3 minutes)
+
+Step 3 gives the curve; this says what is behind it. The same kernel is timed with no model around
+it, at four working-set sizes:
+
+```bash
+python scripts/bench_kernel.py --n-in 2560 --max-tokens 8
+```
+
+A sweep whose weights fit in L1 or L2 is pure instruction throughput, because every weight is
+already in cache. A sweep far larger than L3 pays the memory cost a real decode step pays. The
+difference between the two is how much of v(k) is arithmetic and how much is waiting.
+
+**What to look for:** operations per multiply-accumulate. One `dpbusd` does 32 of them and two can
+issue per cycle, so a kernel doing nothing else would sit near 0.031. Anything far above that is
+the work wrapped around the multiply-accumulate -- unpacking nibbles, the sign trick, the per-block
+scale broadcast -- and §3 of the plan explains why that number, not the acceptance rate, is what
+currently caps the speedup on this machine.
+
 ## 4. Acceptance, without decoding (≈20 minutes)
 
 The cheap grid. Generate the target's own continuations once, then score any draft against them.
 
+The prompts come from Spec-Bench rather than from `generate_data.py`, because the offline scorer
+groups its results by each record's `source` field: putting the Spec-Bench category there means one
+run reports acceptance per category, which is the breakdown worth having. Four prompts from each of
+the six categories is enough for a first number.
+
 ```bash
-# prompts to score on; a few hundred is plenty for acceptance
-python scripts/generate_data.py prompts --out data/dev_prompts.jsonl \
-    --mix ultrachat=200,code=50,gsm8k=50
+# 24 prompts, four per Spec-Bench category, with the category in `source`
+python scripts/build_accept_prompts.py --per-category 4 --out data/accept_prompts.jsonl
 
-python scripts/generate_references.py --model models/Qwen3-4B-q4.sdm \
-    --tokenizer models/Qwen3-4B --prompts data/dev_prompts.jsonl \
-    --mode greedy --max-new-tokens 128 --out data/references_greedy.jsonl
+python scripts/generate_references.py --model models/Qwen3-4B-q4.sdm     --tokenizer models/Qwen3-4B --prompts data/accept_prompts.jsonl     --mode greedy --max-new-tokens 64 --max-prompt-tokens 1024 --cores performance     --out data/references_greedy.jsonl
 
-python scripts/offline_acceptance.py \
-    --target models/Qwen3-4B-q4.sdm --draft models/Qwen3-0.6B-q4.sdm \
-    --references data/references_greedy.jsonl --mode greedy \
-    --tokenizer models/Qwen3-4B --c <c from step 3> --vk results/vk_Qwen3-4B-q4.json \
-    --gammas 1 2 3 4 5 6 8 --out results/offline_baseline.json
+python scripts/offline_acceptance.py     --target models/Qwen3-4B-q4.sdm --draft models/Qwen3-0.6B-q4.sdm     --references data/references_greedy.jsonl --mode greedy     --tokenizer models/Qwen3-4B --c 0.220 --vk results/vk_Qwen3-4B-q4.json --o 0.080     --gammas 1 2 3 4 5 6 7 8 --out results/offline_baseline.json
 ```
 
-Generating references is the slow part (the 4B at ~15 tok/s), so keep `--max-new-tokens` modest the
-first time. The scoring itself is one forward pass per model.
+Generating the references is the slow part and the cost is mostly *prefill*, not generation: 24
+prompts totalling 6,055 prompt tokens plus 1,318 generated ones took 7.6 minutes, because the
+`rag` and `summarization` prompts carry 400–800 token documents. Keep `--max-new-tokens` modest the
+first time. Two notes from running it: pipe nothing through `grep`, which buffers and hides the
+progress lines, and remember that the scorer opens both models at once, so two thread pools share
+the cores.
 
-**What to look for:** the baseline acceptance of the off-the-shelf 0.6B against the 4B. That single
-number, with c and v(k), predicts the whole speedup — and tells you how much distillation has to
-win to be worth the Kaggle hours.
+**What to look for:** the baseline acceptance of the off-the-shelf 0.6B against the 4B, overall and
+per category. That single number, with c and v(k), predicts the whole speedup — and tells you how
+much distillation has to win to be worth the Kaggle hours. Read it against §3 of the plan, which
+sets the ceiling the kernel currently allows: at this v(k) even perfect acceptance reaches only
+1.33×, so a disappointing α and a disappointing speedup are two separate findings.
 
 ## 5. End to end, on Spec-Bench (≈30 minutes for a subset)
 
