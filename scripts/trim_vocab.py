@@ -96,8 +96,7 @@ def main() -> None:
           f"covering {coverage:.3%} of occurrences")
     print(f"so trimming costs at most about {1 - coverage:.3%} of acceptance on *this* text")
     if args.data is None:
-        print("
-WARNING: counted on plain prose, which is not what the draft will have to "
+        print("\nWARNING: counted on plain prose, which is not what the draft will have to "
               "predict. Measured on a 0.6B, a set chosen from WikiText covered 100% of WikiText "
               "but missed 23% of the model's own chat output -- markdown markers, capitalized "
               "names, newline runs -- so acceptance was capped near 0.77. Recount with --data "
