@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 #include "specdraft/cpu.hpp"
 #include "specdraft/simd.hpp"
@@ -481,6 +482,50 @@ SD_TARGET_VNNI inline __m256i reduce8(const __m256i* acc) {
                             _mm256_permute2x128_si256(u0, u1, 0x31));
 }
 
+// The split layout with one block per 16-byte load, kept as the baseline the pair-packed kernel above
+// is measured against. Reads activations in the plain order, so it is driven with `paired` false.
+SD_TARGET_VNNI void dot_q4_soa_flat_one(const uint16_t* w_scales, const uint8_t* w_qs,
+                                        const float* x_scales, const int8_t* x_qs,
+                                        const int32_t* x_offsets, int nblocks, float* out) {
+    const __m256i low_nibble = _mm256_set1_epi8(0x0F);
+    __m256 sum = _mm256_setzero_ps();
+
+    int b = 0;
+    for (; b + kGroup <= nblocks; b += kGroup) {
+        __m256i acc[kGroup];
+        for (int j = 0; j < kGroup; ++j) {
+            const size_t block = static_cast<size_t>(b + j);
+            const __m128i packed =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(w_qs + block * (QK / 2)));
+            const __m256i both = _mm256_set_m128i(_mm_srli_epi16(packed, 4), packed);
+            const __m256i wq = _mm256_and_si256(both, low_nibble);
+            const __m256i xq =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qs + block * QK));
+            acc[j] = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wq, xq);
+        }
+        const __m256i dots = _mm256_sub_epi32(
+            reduce8(acc), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_offsets + b)));
+        const __m256 ws =
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w_scales + b)));
+        const __m256 xs = _mm256_loadu_ps(x_scales + b);
+        sum = _mm256_fmadd_ps(_mm256_mul_ps(ws, xs), _mm256_cvtepi32_ps(dots), sum);
+    }
+
+    for (; b < nblocks; ++b) {
+        const size_t block = static_cast<size_t>(b);
+        const __m128i packed =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(w_qs + block * (QK / 2)));
+        const __m256i both = _mm256_set_m128i(_mm_srli_epi16(packed, 4), packed);
+        const __m256i wq = _mm256_and_si256(both, low_nibble);
+        const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qs + block * QK));
+        const __m256i acc = _mm256_dpbusd_avx_epi32(
+            _mm256_setr_epi32(-x_offsets[b], 0, 0, 0, 0, 0, 0, 0), wq, xq);
+        const float d = fp16_to_fp32(w_scales[b]) * x_scales[b];
+        sum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc), sum);
+    }
+    *out = hsum256(sum);
+}
+
 SD_TARGET_VNNI void dot_q8_soa_one(const uint16_t* w_scales, const int8_t* w_qs,
                                    const float* x_scales, const int8_t* x_qs,
                                    const int32_t* x_offsets, int nblocks, float* out) {
@@ -609,6 +654,24 @@ void dot_q4_soa_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float
         } else {
             out[t] = dot_q4_soa_scalar(w_scales, w_qs, x_scales + offset, x_qs + offset * QK,
                                        x_offsets + offset, nblocks);
+        }
+    }
+}
+
+void dot_q4_soa_flat_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
+                           const int8_t* x_qs, const int32_t* x_offsets, int nblocks, int k,
+                           float* out) {
+    const CpuFeatures& f = cpu_features();
+    const bool simd = f.avx2 && f.avx_vnni && !force_scalar();
+    for (int t = 0; t < k; ++t) {
+        const size_t offset = static_cast<size_t>(t) * nblocks;
+        if (simd) {
+            dot_q4_soa_flat_one(w_scales, w_qs, x_scales + offset, x_qs + offset * QK,
+                                x_offsets + offset, nblocks, out + t);
+        } else {
+            // The scalar reference reads the paired order, so there is nothing to fall back to here
+            // that would still be this kernel. It is a benchmark path and AVX-VNNI is its premise.
+            throw std::runtime_error("dot_q4_soa_flat_multi needs AVX-VNNI");
         }
     }
 }

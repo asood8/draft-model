@@ -165,6 +165,15 @@ void dot_q4_soa_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float
 void dot_q8_soa_multi(const uint16_t* w_scales, const int8_t* w_qs, const float* x_scales,
                       const int8_t* x_qs, const int32_t* x_offsets, int nblocks, int k, float* out);
 
+// The same split layout, but unpacking one block per 16-byte load and reading activations in the plain
+// order (`paired` false). This is the kernel as it stood before the pair-packed one above, kept because
+// comparing kernels is what this project is for and because three attempts to compare them across
+// separate runs produced three different answers -- on this machine only an A/B taken inside one
+// process means anything, and that needs both kernels present. `scripts/bench_kernel.py` reports it.
+void dot_q4_soa_flat_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
+                           const int8_t* x_qs, const int32_t* x_offsets, int nblocks, int k,
+                           float* out);
+
 // The reference the SIMD versions are tested against.
 float dot_q4_soa_scalar(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
                         const int8_t* x_qs, const int32_t* x_offsets, int nblocks);

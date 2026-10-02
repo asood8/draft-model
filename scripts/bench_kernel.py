@@ -35,30 +35,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--format", choices=("q4", "q8"), default="q4")
     parser.add_argument("--seconds", type=float, default=0.35, help="target time per measurement")
     parser.add_argument("--repeats", type=int, default=3, help="measurements per point; the best is kept")
-    parser.add_argument("--layouts", nargs="*", default=["interleaved", "split"],
-                        choices=("interleaved", "split"),
-                        help="split is what the engine runs; interleaved is the earlier baseline")
+    parser.add_argument("--layouts", nargs="*", default=["interleaved", "split-flat", "split"],
+                        choices=("interleaved", "split-flat", "split"),
+                        help="split is what the engine runs; the others are the kernels it replaced")
+    parser.add_argument("--threads", type=int, default=1,
+                        help="6 asks the question the engine cares about, where bandwidth binds")
     return parser.parse_args()
 
 
 def run(rows: int, n_in: int, tokens: int, fmt: str, seconds: float, repeats: int,
-        layout: str = "split") -> dict:
+        layout: str = "split", threads: int = 1) -> dict:
     """Time one point, choosing the iteration count so each measurement lasts about `seconds`.
 
-    `layout` picks the kernel: "split" is the one the engine runs, with the block scales and the
-    quantized bytes in separate arrays; "interleaved" is the earlier one, kept as the baseline it is
-    measured against. Only q4 has both, that being the format the engine stores weights in.
+    `layout` picks the kernel. "split" is the one the engine runs: scales and quantized bytes in
+    separate arrays, two blocks read per 32-byte load. "split-flat" is the same layout read one block
+    at a time, the kernel before pair-packing. "interleaved" is the original, each scale beside its own
+    bytes. Only q4 has all three, that being the format the engine stores weights in.
+
+    `threads` matters more than it looks. On one thread the memory system is nowhere near saturated, so
+    a kernel that wins there need not win on six, where bandwidth is the constraint -- and comparing
+    layouts at one thread answers the wrong question. All of them are timed in this one process, which
+    on this machine is the only comparison worth making: three attempts to compare kernels across
+    separate runs gave three different answers, because an unchanged baseline drifted by a third
+    between them.
     """
-    if layout == "split":
+    if layout in ("split", "split-flat"):
         if fmt != "q4":
-            raise SystemExit("the split-layout kernel is only benchmarked for q4")
+            raise SystemExit("the split-layout kernels are only benchmarked for q4")
+        variant = "flat" if layout == "split-flat" else "paired"
 
         def call(iters):
-            return cpp.bench_dot_soa(rows=rows, n_in=n_in, tokens=tokens, iters=iters)
+            return cpp.bench_dot_soa(rows=rows, n_in=n_in, tokens=tokens, iters=iters,
+                                     threads=threads, row_major=False, variant=variant)
     else:
 
         def call(iters):
-            return cpp.bench_dot(rows=rows, n_in=n_in, tokens=tokens, iters=iters, format=fmt)
+            return cpp.bench_dot(rows=rows, n_in=n_in, tokens=tokens, iters=iters, format=fmt,
+                                 threads=threads)
 
     probe = call(1)
     iters = max(1, int(seconds / max(probe["seconds"], 1e-6)))
@@ -89,7 +102,8 @@ def main() -> None:
     ]
 
     peak = DPBUSD_MACS * DPBUSD_PORTS * ASSUMED_GHZ  # GMAC/s on one core, at the assumed clock
-    print(f"\n{args.format} weights, n_in {args.n_in}, one thread, best of {args.repeats}")
+    print(f"\n{args.format} weights, n_in {args.n_in}, {args.threads} thread(s), "
+          f"best of {args.repeats}")
     print(f"a dpbusd is {DPBUSD_MACS} multiply-accumulates and two can issue per cycle, so one core")
     print(f"at an assumed {ASSUMED_GHZ} GHz could reach {peak:.0f} GMAC/s")
 
@@ -99,13 +113,16 @@ def main() -> None:
         shown = working_set if working_set < 1024 else working_set / 1024
         print(f"\n{name}: {rows} rows, {shown:.0f} {unit} of weights")
         for layout in args.layouts:
-            label = "the engine's kernel" if layout == "split" else "the earlier baseline"
-            print(f"  {layout}, {label}")
+            label = {"split": "split, two blocks a load -- the engine's kernel",
+                     "split-flat": "split, one block a load -- what it replaced",
+                     "interleaved": "interleaved blocks -- the original"}[layout]
+            print(f"  {label}")
             print(f"    {'k':>3} {'GMAC/s':>9} {'% peak':>7} {'ops/MAC':>8} {'ns/row':>8} "
                   f"{'GB/s':>7} {'per tok':>8} {'v(k)':>6}")
             baseline = None
             for tokens in range(1, args.max_tokens + 1):
-                point = run(rows, args.n_in, tokens, args.format, args.seconds, args.repeats, layout)
+                point = run(rows, args.n_in, tokens, args.format, args.seconds, args.repeats, layout,
+                            args.threads)
                 rate = point["rate"] / 1e9
                 per_row = point["seconds"] / (point["iters"] * rows) * 1e9
                 if baseline is None:

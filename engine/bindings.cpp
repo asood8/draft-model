@@ -168,6 +168,7 @@ enum class BenchLayout {
     interleaved,   // each block's scale beside its bytes, as the file stored it before version 4
     split_tensor,  // every row's scales, then every row's bytes
     split_row,     // per row: that row's scales, then that row's bytes
+    split_flat,    // the split layout read one block per load: the kernel before pair-packing
 };
 
 py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
@@ -219,8 +220,9 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
         for (int t = 0; t < tokens; ++t) {
             fill();
             const size_t offset = static_cast<size_t>(t) * width;
+            const bool pair = four_bit && layout != BenchLayout::split_flat;
             quantize_a8_soa(scratch.data(), n_in, zero_point, x_scales.data() + offset,
-                            x_qs.data() + offset * QK, x_offsets.data() + offset, four_bit);
+                            x_qs.data() + offset * QK, x_offsets.data() + offset, pair);
         }
     }
 
@@ -253,6 +255,7 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
                                                             width * sizeof(uint16_t)));
                 }
                 break;
+            case BenchLayout::split_flat:
             case BenchLayout::split_tensor: {
                 // All the scales first, then all the bytes, across the whole buffer.
                 uint8_t* scales_at = weights.data() + static_cast<size_t>(r) * width * sizeof(uint16_t);
@@ -308,6 +311,18 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
                                          x_scales.data(), x_qs.data(), x_offsets.data(), nblocks,
                                          tokens, results);
                     }
+                    break;
+                }
+                case BenchLayout::split_flat: {
+                    const auto* scales = reinterpret_cast<const uint16_t*>(
+                        w_base + static_cast<size_t>(r) * width * sizeof(uint16_t));
+                    const uint8_t* qs =
+                        w_base + scales_region + static_cast<size_t>(r) * width * payload;
+                    if (!four_bit) {
+                        throw std::invalid_argument("split_flat is a q4-only comparison path");
+                    }
+                    dot_q4_soa_flat_multi(scales, qs, x_scales.data(), x_qs.data(), x_offsets.data(),
+                                          nblocks, tokens, results);
                     break;
                 }
                 case BenchLayout::split_tensor: {
@@ -860,12 +875,16 @@ PYBIND11_MODULE(_engine, m) {
     m.def(
         "bench_dot_soa",
         [](int rows, int n_in, int tokens, int iters, const std::string& format, int threads,
-           const std::string& cores, bool row_major) {
-            return bench_kernel(rows, n_in, tokens, iters, threads, format,
-                                row_major ? BenchLayout::split_row : BenchLayout::split_tensor,
-                                cores);
+           const std::string& cores, bool row_major, const std::string& variant) {
+            BenchLayout layout = row_major ? BenchLayout::split_row : BenchLayout::split_tensor;
+            if (variant == "flat") {
+                layout = BenchLayout::split_flat;
+            } else if (variant != "paired") {
+                throw std::invalid_argument("variant must be \"paired\" or \"flat\"");
+            }
+            return bench_kernel(rows, n_in, tokens, iters, threads, format, layout, cores);
         },
         py::arg("rows"), py::arg("n_in"), py::arg("tokens"), py::arg("iters") = 1,
         py::arg("format") = "q4", py::arg("threads") = 1, py::arg("cores") = "performance",
-        py::arg("row_major") = true);
+        py::arg("row_major") = true, py::arg("variant") = "paired");
 }

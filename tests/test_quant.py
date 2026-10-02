@@ -382,3 +382,23 @@ def test_splitting_the_activation_quantizer_changes_nothing(paired, chunks):
     assert np.array_equal(split["qs"], whole["qs"])
     assert np.array_equal(split["scales"], whole["scales"])
     assert np.array_equal(split["offsets"], whole["offsets"])
+
+
+@pytest.mark.parametrize("n_in", [256, 288, 2560])
+@pytest.mark.parametrize("tokens", [1, 3])
+def test_the_two_split_kernels_are_bit_identical(n_in, tokens):
+    """Pair-packing changes how blocks are read, not what is summed.
+
+    Both kernels reduce each block to the same integer and then apply the same eight scales with the
+    same multiply and fmadd, so the float results must match exactly -- not merely closely. That makes
+    this a cross-check of two independent implementations rather than a tolerance test, and it is why
+    the slower one is kept: `scripts/bench_kernel.py` times them against each other in one process,
+    which is the only kind of comparison this machine supports.
+    """
+    if not cpp.cpu_features()["avx_vnni"]:
+        pytest.skip("both kernels are AVX-VNNI paths")
+    paired = cpp.bench_dot_soa(rows=40, n_in=n_in, tokens=tokens, iters=1, row_major=False,
+                               variant="paired")
+    flat = cpp.bench_dot_soa(rows=40, n_in=n_in, tokens=tokens, iters=1, row_major=False,
+                             variant="flat")
+    assert paired["checksum"] == flat["checksum"]
