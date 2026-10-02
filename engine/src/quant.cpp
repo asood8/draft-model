@@ -23,13 +23,15 @@ inline int clamp_int(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Two accumulators, because one would serialize the loop: each block's FMA would wait on the
-// previous block's, and an FMA takes several cycles while a block is only 18 bytes.
+// One accumulator, with an FMA per block. This serializes on the FMA latency, which two
+// accumulators would hide -- but the multi-token kernel has to accumulate in exactly this order for
+// a k-token pass to stay bit-identical to k single-token passes, and it cannot afford two
+// accumulators per token across a tile of eight. Correctness decides the shape; the cost of that
+// choice is measured rather than assumed.
 SD_TARGET_VNNI float dot_q4_a8_vnni(const BlockQ4* w, const BlockA8* x, int nblocks) {
     const __m256i low_nibble = _mm256_set1_epi8(0x0F);
     const __m256i eight = _mm256_set1_epi8(8);
-    __m256 sum0 = _mm256_setzero_ps();
-    __m256 sum1 = _mm256_setzero_ps();
+    __m256 sum = _mm256_setzero_ps();
     for (int b = 0; b < nblocks; ++b) {
         // 16 bytes hold 32 nibbles: low nibbles are weights 0..15, high nibbles 16..31.
         __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w[b].q));
@@ -40,49 +42,42 @@ SD_TARGET_VNNI float dot_q4_a8_vnni(const BlockQ4* w, const BlockA8* x, int nblo
         __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(wq, wq),
                                               _mm256_sign_epi8(xq, wq));
         const float d = fp16_to_fp32(w[b].scale) * x[b].scale;
-        __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc));
-        if ((b & 1) == 0) {
-            sum0 = _mm256_add_ps(sum0, scaled);
-        } else {
-            sum1 = _mm256_add_ps(sum1, scaled);
-        }
+        sum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc), sum);
     }
-    return hsum256(_mm256_add_ps(sum0, sum1));
+    return hsum256(sum);
 }
 
 SD_TARGET_VNNI float dot_q8_a8_vnni(const BlockQ8* w, const BlockA8* x, int nblocks) {
-    __m256 sum0 = _mm256_setzero_ps();
-    __m256 sum1 = _mm256_setzero_ps();
+    __m256 sum = _mm256_setzero_ps();
     for (int b = 0; b < nblocks; ++b) {
         __m256i wq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[b].q));
         __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[b].q));
         __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(wq, wq),
                                               _mm256_sign_epi8(xq, wq));
         const float d = fp16_to_fp32(w[b].scale) * x[b].scale;
-        __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc));
-        if ((b & 1) == 0) {
-            sum0 = _mm256_add_ps(sum0, scaled);
-        } else {
-            sum1 = _mm256_add_ps(sum1, scaled);
-        }
+        sum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc), sum);
     }
-    return hsum256(_mm256_add_ps(sum0, sum1));
+    return hsum256(sum);
 }
 
-// Up to four tokens share one pass over the weights. Four keeps the eight accumulators (two
-// per token, for the parity trick above) in registers; more would spill. A matrix row slice
-// that a thread owns is small enough to sit in its L2 cache, so the second and later tiles
-// read the weights from cache rather than memory.
-constexpr int kTile = 4;
+// How many tokens share one pass over the weights. Every extra tile is another pass, and
+// measurement showed that boundary dominating v(k): with a tile of four, eight tokens cost twice
+// what four did, giving the curve a sawtooth at each multiple of four.
+//
+// Eight tokens with one accumulator each fit the sixteen vector registers, where eight tokens with
+// two each would spill. One accumulator per token is enough here precisely because there are
+// several tokens: their chains are independent, so the processor has plenty to overlap. The
+// single-token case is different -- one chain, nothing to overlap -- so it keeps its own kernel
+// above, which unrolls across blocks instead.
+constexpr int kTile = 8;
 
 SD_TARGET_VNNI void dot_q4_tile(const BlockQ4* w, const BlockA8* x, int nblocks, int tokens,
                                 float* out) {
     const __m256i low_nibble = _mm256_set1_epi8(0x0F);
     const __m256i eight = _mm256_set1_epi8(8);
-    __m256 sum0[kTile], sum1[kTile];
+    __m256 sums[kTile];
     for (int t = 0; t < tokens; ++t) {
-        sum0[t] = _mm256_setzero_ps();
-        sum1[t] = _mm256_setzero_ps();
+        sums[t] = _mm256_setzero_ps();
     }
 
     for (int b = 0; b < nblocks; ++b) {
@@ -98,27 +93,21 @@ SD_TARGET_VNNI void dot_q4_tile(const BlockQ4* w, const BlockA8* x, int nblocks,
             const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block.q));
             const __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), magnitude,
                                                        _mm256_sign_epi8(xq, wq));
-            const __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(weight_scale * block.scale),
-                                                _mm256_cvtepi32_ps(acc));
-            if ((b & 1) == 0) {
-                sum0[t] = _mm256_add_ps(sum0[t], scaled);
-            } else {
-                sum1[t] = _mm256_add_ps(sum1[t], scaled);
-            }
+            sums[t] = _mm256_fmadd_ps(_mm256_set1_ps(weight_scale * block.scale),
+                                      _mm256_cvtepi32_ps(acc), sums[t]);
         }
     }
 
     for (int t = 0; t < tokens; ++t) {
-        out[t] = hsum256(_mm256_add_ps(sum0[t], sum1[t]));
+        out[t] = hsum256(sums[t]);
     }
 }
 
 SD_TARGET_VNNI void dot_q8_tile(const BlockQ8* w, const BlockA8* x, int nblocks, int tokens,
                                 float* out) {
-    __m256 sum0[kTile], sum1[kTile];
+    __m256 sums[kTile];
     for (int t = 0; t < tokens; ++t) {
-        sum0[t] = _mm256_setzero_ps();
-        sum1[t] = _mm256_setzero_ps();
+        sums[t] = _mm256_setzero_ps();
     }
 
     for (int b = 0; b < nblocks; ++b) {
@@ -131,18 +120,13 @@ SD_TARGET_VNNI void dot_q8_tile(const BlockQ8* w, const BlockA8* x, int nblocks,
             const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block.q));
             const __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), magnitude,
                                                        _mm256_sign_epi8(xq, wq));
-            const __m256 scaled = _mm256_mul_ps(_mm256_set1_ps(weight_scale * block.scale),
-                                                _mm256_cvtepi32_ps(acc));
-            if ((b & 1) == 0) {
-                sum0[t] = _mm256_add_ps(sum0[t], scaled);
-            } else {
-                sum1[t] = _mm256_add_ps(sum1[t], scaled);
-            }
+            sums[t] = _mm256_fmadd_ps(_mm256_set1_ps(weight_scale * block.scale),
+                                      _mm256_cvtepi32_ps(acc), sums[t]);
         }
     }
 
     for (int t = 0; t < tokens; ++t) {
-        out[t] = hsum256(_mm256_add_ps(sum0[t], sum1[t]));
+        out[t] = hsum256(sums[t]);
     }
 }
 
@@ -158,7 +142,11 @@ void dot_q4_a8_multi(const BlockQ4* w, const BlockA8* x, int nblocks, int k, flo
     }
     for (int t = 0; t < k; t += kTile) {
         const int tokens = std::min(kTile, k - t);
-        dot_q4_tile(w, x + static_cast<size_t>(t) * nblocks, nblocks, tokens, out + t);
+        if (tokens == 1) {
+            out[t] = dot_q4_a8_vnni(w, x + static_cast<size_t>(t) * nblocks, nblocks);
+        } else {
+            dot_q4_tile(w, x + static_cast<size_t>(t) * nblocks, nblocks, tokens, out + t);
+        }
     }
 }
 
@@ -172,7 +160,11 @@ void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, flo
     }
     for (int t = 0; t < k; t += kTile) {
         const int tokens = std::min(kTile, k - t);
-        dot_q8_tile(w, x + static_cast<size_t>(t) * nblocks, nblocks, tokens, out + t);
+        if (tokens == 1) {
+            out[t] = dot_q8_a8_vnni(w, x + static_cast<size_t>(t) * nblocks, nblocks);
+        } else {
+            dot_q8_tile(w, x + static_cast<size_t>(t) * nblocks, nblocks, tokens, out + t);
+        }
     }
 }
 

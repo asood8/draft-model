@@ -22,7 +22,7 @@ class TrainableDraft(nn.Module):
 
     ``freeze_embeddings`` leaves the tied embedding and output matrix alone, which is about a
     quarter of the 0.6B's parameters and the easiest thing to give up when memory is tight
-    (plan Â§11.5).
+    (plan section 11.5).
     """
 
     def __init__(
