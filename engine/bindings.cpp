@@ -205,7 +205,7 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
     std::vector<BlockA8> act_blocks;
     std::vector<float> x_scales;
     std::vector<int8_t> x_qs;
-    std::vector<int32_t> x_bias;
+    std::vector<int32_t> x_offsets;
     if (layout == BenchLayout::interleaved) {
         act_blocks.resize(width * tokens);
         for (int t = 0; t < tokens; ++t) {
@@ -215,12 +215,12 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
     } else {
         x_scales.resize(width * tokens);
         x_qs.resize(width * tokens * QK);
-        x_bias.resize(width * tokens * 8);
+        x_offsets.resize(width * tokens);
         for (int t = 0; t < tokens; ++t) {
             fill();
             const size_t offset = static_cast<size_t>(t) * width;
             quantize_a8_soa(scratch.data(), n_in, zero_point, x_scales.data() + offset,
-                            x_qs.data() + offset * QK, x_bias.data() + offset * 8);
+                            x_qs.data() + offset * QK, x_offsets.data() + offset);
         }
     }
 
@@ -301,11 +301,11 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
                     const auto* scales = reinterpret_cast<const uint16_t*>(w_base + at);
                     const uint8_t* qs = w_base + at + width * sizeof(uint16_t);
                     if (four_bit) {
-                        dot_q4_soa_multi(scales, qs, x_scales.data(), x_qs.data(), x_bias.data(),
+                        dot_q4_soa_multi(scales, qs, x_scales.data(), x_qs.data(), x_offsets.data(),
                                          nblocks, tokens, results);
                     } else {
                         dot_q8_soa_multi(scales, reinterpret_cast<const int8_t*>(qs),
-                                         x_scales.data(), x_qs.data(), x_bias.data(), nblocks,
+                                         x_scales.data(), x_qs.data(), x_offsets.data(), nblocks,
                                          tokens, results);
                     }
                     break;
@@ -316,11 +316,11 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
                     const uint8_t* qs =
                         w_base + scales_region + static_cast<size_t>(r) * width * payload;
                     if (four_bit) {
-                        dot_q4_soa_multi(scales, qs, x_scales.data(), x_qs.data(), x_bias.data(),
+                        dot_q4_soa_multi(scales, qs, x_scales.data(), x_qs.data(), x_offsets.data(),
                                          nblocks, tokens, results);
                     } else {
                         dot_q8_soa_multi(scales, reinterpret_cast<const int8_t*>(qs),
-                                         x_scales.data(), x_qs.data(), x_bias.data(), nblocks,
+                                         x_scales.data(), x_qs.data(), x_offsets.data(), nblocks,
                                          tokens, results);
                     }
                     break;
@@ -363,7 +363,7 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
     result["activation_bytes"] =
         layout == BenchLayout::interleaved
             ? static_cast<double>(act_blocks.size() * sizeof(BlockA8))
-            : static_cast<double>(x_qs.size() + 4 * x_bias.size() + 4 * x_scales.size());
+            : static_cast<double>(x_qs.size() + 4 * x_offsets.size() + 4 * x_scales.size());
     result["checksum"] = checksum;
     result["threads"] = threads;
     return result;
@@ -690,13 +690,13 @@ PYBIND11_MODULE(_engine, m) {
             const int nblocks = n / QK;
             py::array_t<float> scales(nblocks);
             py::array_t<int8_t> qs(n);
-            py::array_t<int32_t> bias(static_cast<size_t>(nblocks) * 8);
+            py::array_t<int32_t> offsets(nblocks);
             quantize_a8_soa(x.data(), n, zero_point, scales.mutable_data(), qs.mutable_data(),
-                            bias.mutable_data());
+                            offsets.mutable_data());
             py::dict out;
             out["scales"] = scales;
             out["qs"] = qs;
-            out["bias"] = bias;
+            out["offsets"] = offsets;
             return out;
         },
         py::arg("x"), py::arg("zero_point") = 8);
@@ -761,17 +761,17 @@ PYBIND11_MODULE(_engine, m) {
 
             std::vector<float> x_scales(width * tokens);
             std::vector<int8_t> x_qs(width * tokens * QK);
-            std::vector<int32_t> x_bias(width * tokens * 8);
+            std::vector<int32_t> x_offsets(width * tokens);
             const auto* blocks = reinterpret_cast<const BlockA8*>(x.data());
             for (int t = 0; t < tokens; ++t) {
                 const size_t offset = static_cast<size_t>(t) * width;
                 repack_a8_soa(blocks + offset, nblocks, 8, x_scales.data() + offset,
-                              x_qs.data() + offset * QK, x_bias.data() + offset * 8);
+                              x_qs.data() + offset * QK, x_offsets.data() + offset);
             }
 
             py::array_t<float> out(tokens);
             dot_q4_soa_multi(w_scales.data(), w_qs.data(), x_scales.data(), x_qs.data(),
-                             x_bias.data(), nblocks, tokens, out.mutable_data());
+                             x_offsets.data(), nblocks, tokens, out.mutable_data());
             return out;
         },
         py::arg("weights"), py::arg("activations"));
@@ -798,17 +798,17 @@ PYBIND11_MODULE(_engine, m) {
 
             std::vector<float> x_scales(width * tokens);
             std::vector<int8_t> x_qs(width * tokens * QK);
-            std::vector<int32_t> x_bias(width * tokens * 8);
+            std::vector<int32_t> x_offsets(width * tokens);
             const auto* blocks = reinterpret_cast<const BlockA8*>(x.data());
             for (int t = 0; t < tokens; ++t) {
                 const size_t offset = static_cast<size_t>(t) * width;
                 repack_a8_soa(blocks + offset, nblocks, 128, x_scales.data() + offset,
-                              x_qs.data() + offset * QK, x_bias.data() + offset * 8);
+                              x_qs.data() + offset * QK, x_offsets.data() + offset);
             }
 
             py::array_t<float> out(tokens);
             dot_q8_soa_multi(w_scales.data(), w_qs.data(), x_scales.data(), x_qs.data(),
-                             x_bias.data(), nblocks, tokens, out.mutable_data());
+                             x_offsets.data(), nblocks, tokens, out.mutable_data());
             return out;
         },
         py::arg("weights"), py::arg("activations"));

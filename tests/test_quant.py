@@ -290,13 +290,15 @@ def test_soa_activation_quantizer_agrees_byte_for_byte(kind, n):
 
 
 @pytest.mark.parametrize("zero_point", [8, 128])
-def test_soa_activation_bias_is_the_lane_sums(zero_point):
+def test_soa_activation_offset_is_the_block_sum(zero_point):
     x = sample("normal", 256, 1.0, seed=51)
     got = cpp.quantize_a8_soa(x, zero_point)
-    # dpbusd accumulates four byte products into each of eight int32 lanes, so the correction for
-    # the weights being stored `zero_point` too large is split the same way.
-    lanes = got["qs"].astype(np.int32).reshape(-1, 8, 4).sum(axis=2)
-    assert np.array_equal(got["bias"].reshape(-1, 8), -zero_point * lanes)
+    # One integer a block, not one a lane. The kernel reduces its eight accumulators before scaling,
+    # so the correction for the weights being stored `zero_point` too large can be subtracted from
+    # the reduced vector -- which lets eight blocks share one 32-byte load.
+    blocks = got["qs"].astype(np.int32).reshape(-1, 32).sum(axis=1)
+    assert got["offsets"].shape == (x.size // 32,)
+    assert np.array_equal(got["offsets"], zero_point * blocks)
 
 
 @pytest.mark.parametrize("n", [32, 288, 2560])

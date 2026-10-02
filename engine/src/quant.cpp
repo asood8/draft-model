@@ -320,17 +320,15 @@ void repack_q8_soa(const BlockQ8* blocks, int nblocks, uint16_t* scales, int8_t*
 }
 
 void repack_a8_soa(const BlockA8* blocks, int nblocks, int zero_point, float* scales, int8_t* qs,
-                   int32_t* bias) {
+                   int32_t* offsets) {
     for (int b = 0; b < nblocks; ++b) {
         scales[b] = blocks[b].scale;
         std::memcpy(qs + static_cast<size_t>(b) * QK, blocks[b].q, QK);
-        for (int lane = 0; lane < 8; ++lane) {
-            int sum = 0;
-            for (int i = 0; i < 4; ++i) {
-                sum += blocks[b].q[lane * 4 + i];
-            }
-            bias[static_cast<size_t>(b) * 8 + lane] = -zero_point * sum;
+        int sum = 0;
+        for (int i = 0; i < QK; ++i) {
+            sum += blocks[b].q[i];
         }
+        offsets[b] = zero_point * sum;
     }
 }
 
@@ -360,7 +358,7 @@ void dequantize_q8_soa(const uint16_t* scales, const int8_t* qs, int n, float* o
 }
 
 void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_t* qs,
-                     int32_t* bias) {
+                     int32_t* offsets) {
     const int nblocks = n / QK;
     for (int b = 0; b < nblocks; ++b) {
         const float* xb = x + static_cast<size_t>(b) * QK;
@@ -378,28 +376,25 @@ void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_
             bytes[i] =
                 static_cast<int8_t>(clamp_int(static_cast<int>(std::rint(xb[i] * inv)), -127, 127));
         }
-        // dpbusd sums four byte products into each of its eight int32 lanes, so the correction for
-        // every stored weight being `zero_point` too large has to be split the same way.
-        for (int lane = 0; lane < 8; ++lane) {
-            int sum = 0;
-            for (int i = 0; i < 4; ++i) {
-                sum += bytes[lane * 4 + i];
-            }
-            bias[static_cast<size_t>(b) * 8 + lane] = -zero_point * sum;
+        // The correction for every stored weight being `zero_point` too large. One integer a block,
+        // not one a lane: the kernel reduces its eight accumulators before scaling anyway, so the
+        // correction can be subtracted from the reduced vector, and eight blocks then share one
+        // 32-byte load where per-lane biases needed one each.
+        int sum = 0;
+        for (int i = 0; i < QK; ++i) {
+            sum += bytes[i];
         }
+        offsets[b] = zero_point * sum;
     }
 }
 
 float dot_q4_soa_scalar(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
-                        const int8_t* x_qs, const int32_t* x_bias, int nblocks) {
+                        const int8_t* x_qs, const int32_t* x_offsets, int nblocks) {
     float sum = 0.0f;
     for (int b = 0; b < nblocks; ++b) {
         const uint8_t* w = w_qs + static_cast<size_t>(b) * (QK / 2);
         const int8_t* x = x_qs + static_cast<size_t>(b) * QK;
-        int32_t acc = 0;
-        for (int lane = 0; lane < 8; ++lane) {
-            acc += x_bias[static_cast<size_t>(b) * 8 + lane];
-        }
+        int32_t acc = -x_offsets[b];
         for (int i = 0; i < QK / 2; ++i) {
             acc += (w[i] & 0x0F) * x[i] + (w[i] >> 4) * x[i + 16];
         }
@@ -409,15 +404,12 @@ float dot_q4_soa_scalar(const uint16_t* w_scales, const uint8_t* w_qs, const flo
 }
 
 float dot_q8_soa_scalar(const uint16_t* w_scales, const int8_t* w_qs, const float* x_scales,
-                        const int8_t* x_qs, const int32_t* x_bias, int nblocks) {
+                        const int8_t* x_qs, const int32_t* x_offsets, int nblocks) {
     float sum = 0.0f;
     for (int b = 0; b < nblocks; ++b) {
         const int8_t* w = w_qs + static_cast<size_t>(b) * QK;
         const int8_t* x = x_qs + static_cast<size_t>(b) * QK;
-        int32_t acc = 0;
-        for (int lane = 0; lane < 8; ++lane) {
-            acc += x_bias[static_cast<size_t>(b) * 8 + lane];
-        }
+        int32_t acc = -x_offsets[b];
         for (int i = 0; i < QK; ++i) {
             acc += (static_cast<int>(w[i]) + 128) * x[i];  // the unsigned operand dpbusd wants
         }
@@ -473,9 +465,9 @@ SD_TARGET_VNNI void dot_q4_soa_perblock_one(const uint16_t* w_scales, const uint
 
 SD_TARGET_VNNI void dot_q8_soa_one(const uint16_t* w_scales, const int8_t* w_qs,
                                    const float* x_scales, const int8_t* x_qs,
-                                   const int32_t* x_bias, int nblocks, float* out) {
+                                   const int32_t* x_offsets, int nblocks, float* out) {
     // Flipping the sign bit turns an int8 weight into the unsigned byte w + 128 that dpbusd wants,
-    // which is why the bias for a q8 matmul carries a zero point of 128 rather than 8.
+    // which is why a q8 matmul asks for offsets with a zero point of 128 rather than 8.
     const __m256i sign_bit = _mm256_set1_epi8(static_cast<char>(0x80));
     __m256 sum = _mm256_setzero_ps();
 
@@ -488,14 +480,14 @@ SD_TARGET_VNNI void dot_q8_soa_one(const uint16_t* w_scales, const int8_t* w_qs,
                 _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w_qs + block * QK)), sign_bit);
             const __m256i xq =
                 _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qs + block * QK));
-            const __m256i bias =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_bias + block * 8));
-            acc[j] = _mm256_dpbusd_avx_epi32(bias, wq, xq);
+            acc[j] = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wq, xq);
         }
+        const __m256i dots = _mm256_sub_epi32(
+            reduce8(acc), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_offsets + b)));
         const __m256 ws =
             _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w_scales + b)));
         const __m256 xs = _mm256_loadu_ps(x_scales + b);
-        sum = _mm256_fmadd_ps(_mm256_mul_ps(ws, xs), _mm256_cvtepi32_ps(reduce8(acc)), sum);
+        sum = _mm256_fmadd_ps(_mm256_mul_ps(ws, xs), _mm256_cvtepi32_ps(dots), sum);
     }
 
     for (; b < nblocks; ++b) {
@@ -503,9 +495,8 @@ SD_TARGET_VNNI void dot_q8_soa_one(const uint16_t* w_scales, const int8_t* w_qs,
         const __m256i wq = _mm256_xor_si256(
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w_qs + block * QK)), sign_bit);
         const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qs + block * QK));
-        const __m256i bias =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_bias + block * 8));
-        const __m256i acc = _mm256_dpbusd_avx_epi32(bias, wq, xq);
+        const __m256i acc = _mm256_dpbusd_avx_epi32(
+            _mm256_setr_epi32(-x_offsets[b], 0, 0, 0, 0, 0, 0, 0), wq, xq);
         const float d = fp16_to_fp32(w_scales[b]) * x_scales[b];
         sum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc), sum);
     }
@@ -514,7 +505,7 @@ SD_TARGET_VNNI void dot_q8_soa_one(const uint16_t* w_scales, const int8_t* w_qs,
 
 SD_TARGET_VNNI void dot_q4_soa_one(const uint16_t* w_scales, const uint8_t* w_qs,
                                    const float* x_scales, const int8_t* x_qs,
-                                   const int32_t* x_bias, int nblocks, float* out) {
+                                   const int32_t* x_offsets, int nblocks, float* out) {
     const __m256i low_nibble = _mm256_set1_epi8(0x0F);
     __m256 sum = _mm256_setzero_ps();
 
@@ -523,22 +514,25 @@ SD_TARGET_VNNI void dot_q4_soa_one(const uint16_t* w_scales, const uint8_t* w_qs
         __m256i acc[kGroup];
         for (int j = 0; j < kGroup; ++j) {
             const size_t block = static_cast<size_t>(b + j);
-            // The nibbles go in unsigned and uncorrected; the bias carries the -8 per lane.
+            // The nibbles go in unsigned and uncorrected, so this accumulates sum(q * x).
             const __m128i packed =
                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(w_qs + block * (QK / 2)));
             const __m256i both = _mm256_set_m128i(_mm_srli_epi16(packed, 4), packed);
             const __m256i wq = _mm256_and_si256(both, low_nibble);
             const __m256i xq =
                 _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qs + block * QK));
-            const __m256i bias =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_bias + block * 8));
-            acc[j] = _mm256_dpbusd_avx_epi32(bias, wq, xq);
+            acc[j] = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wq, xq);
         }
+        // Reduced to one block a lane, then corrected: lane j loses z * sum(x) for block b + j. One
+        // 32-byte load for all eight, which is the whole reason the offsets are per block and the
+        // subtraction happens here rather than inside each accumulator. Still exact integers.
+        const __m256i dots = _mm256_sub_epi32(
+            reduce8(acc), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_offsets + b)));
         // Eight fp16 weight scales in one instruction, times the eight activation scales.
         const __m256 ws =
             _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w_scales + b)));
         const __m256 xs = _mm256_loadu_ps(x_scales + b);
-        sum = _mm256_fmadd_ps(_mm256_mul_ps(ws, xs), _mm256_cvtepi32_ps(reduce8(acc)), sum);
+        sum = _mm256_fmadd_ps(_mm256_mul_ps(ws, xs), _mm256_cvtepi32_ps(dots), sum);
     }
 
     // The tail, for a row whose block count is not a multiple of eight: the same arithmetic one
@@ -550,9 +544,9 @@ SD_TARGET_VNNI void dot_q4_soa_one(const uint16_t* w_scales, const uint8_t* w_qs
         const __m256i both = _mm256_set_m128i(_mm_srli_epi16(packed, 4), packed);
         const __m256i wq = _mm256_and_si256(both, low_nibble);
         const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qs + block * QK));
-        const __m256i bias =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_bias + block * 8));
-        const __m256i acc = _mm256_dpbusd_avx_epi32(bias, wq, xq);
+        // hsum256 adds every lane at the end, so the correction can go into any one of them.
+        const __m256i acc = _mm256_dpbusd_avx_epi32(
+            _mm256_setr_epi32(-x_offsets[b], 0, 0, 0, 0, 0, 0, 0), wq, xq);
         const float d = fp16_to_fp32(w_scales[b]) * x_scales[b];
         sum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc), sum);
     }
@@ -570,7 +564,7 @@ SD_TARGET_VNNI void dot_q4_soa_one(const uint16_t* w_scales, const uint8_t* w_qs
 // It buys something else too. A k-token pass here *is* k single-token passes, so the property greedy
 // speculative decoding rests on holds by construction instead of by two kernels agreeing.
 void dot_q4_soa_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
-                      const int8_t* x_qs, const int32_t* x_bias, int nblocks, int k, float* out) {
+                      const int8_t* x_qs, const int32_t* x_offsets, int nblocks, int k, float* out) {
     const CpuFeatures& f = cpu_features();
     const bool simd = f.avx2 && f.avx_vnni && !force_scalar();
     const bool grouped = scale_grouping();
@@ -580,27 +574,27 @@ void dot_q4_soa_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float
             dot_q4_soa_perblock_one(w_scales, w_qs, x_scales + offset, x_qs + offset * QK, nblocks,
                                     out + t);
         } else if (simd) {
-            dot_q4_soa_one(w_scales, w_qs, x_scales + offset, x_qs + offset * QK,
-                           x_bias + offset * 8, nblocks, out + t);
+            dot_q4_soa_one(w_scales, w_qs, x_scales + offset, x_qs + offset * QK, x_offsets + offset,
+                           nblocks, out + t);
         } else {
             out[t] = dot_q4_soa_scalar(w_scales, w_qs, x_scales + offset, x_qs + offset * QK,
-                                       x_bias + offset * 8, nblocks);
+                                       x_offsets + offset, nblocks);
         }
     }
 }
 
 void dot_q8_soa_multi(const uint16_t* w_scales, const int8_t* w_qs, const float* x_scales,
-                      const int8_t* x_qs, const int32_t* x_bias, int nblocks, int k, float* out) {
+                      const int8_t* x_qs, const int32_t* x_offsets, int nblocks, int k, float* out) {
     const CpuFeatures& f = cpu_features();
     const bool simd = f.avx2 && f.avx_vnni && !force_scalar();
     for (int t = 0; t < k; ++t) {
         const size_t offset = static_cast<size_t>(t) * nblocks;
         if (simd) {
-            dot_q8_soa_one(w_scales, w_qs, x_scales + offset, x_qs + offset * QK,
-                           x_bias + offset * 8, nblocks, out + t);
+            dot_q8_soa_one(w_scales, w_qs, x_scales + offset, x_qs + offset * QK, x_offsets + offset,
+                           nblocks, out + t);
         } else {
             out[t] = dot_q8_soa_scalar(w_scales, w_qs, x_scales + offset, x_qs + offset * QK,
-                                       x_bias + offset * 8, nblocks);
+                                       x_offsets + offset, nblocks);
         }
     }
 }

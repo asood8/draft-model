@@ -801,6 +801,30 @@ where each result is:
 > the same build, so the curve is not yet pinned down well enough to compare against the 1.45 the
 > interleaved kernel gave.
 
+> **Measured, 2026-10-02: one offset a block instead of eight, and the gain grows with k.** The first
+> version of the offset trick seeded each of dpbusd's eight accumulators with its own correction, which
+> meant a 32-byte load per block per row. But the kernel reduces those eight accumulators before
+> scaling, so the correction can be subtracted from the *reduced* vector instead -- one integer a
+> block, eight sharing a single load, and still exact integers. At six threads over 192 MB:
+>
+> | k | eight offsets a block | one offset a block | | against the interleaved kernel |
+> |---|---|---|---|---|
+> | 1 | 58.3 GMAC/s | 58.3 | 0% | 1.13x |
+> | 2 | 93.3 | 99.6 | +7% | 1.40x |
+> | 4 | 125.2 | 146.0 | +17% | 1.35x |
+> | 8 | 136.6 | 168.8 | +24% | **1.86x** |
+>
+> Single-threaded it is 2-6% *slower*, because the extra `sub` sits on the critical path between the
+> reduction and the `fmadd` and a lone thread has nothing to overlap it with, while at six threads the
+> saved activation traffic -- 28 bytes a block a row -- dominates. The engine runs six threads, and at
+> six threads k=1 is unchanged, so the trade is the right way round. (Comparing these needs care: the
+> figures above are all DRAM-resident. An earlier table's 31-33 GMAC/s single-thread numbers were
+> L2-resident, and reading one against the other makes a 5% cost look like 26%.)
+>
+> The shape is the point. Gains that grow with k are gains on the verification pass rather than on the
+> single-token step it is divided by, and that is what flattens v(k) rather than just making the engine
+> quicker.
+
 > Change 3, register blocking over output rows, is **not** done; it is what the §3 table says is needed to
 > reach a useful speedup.
 

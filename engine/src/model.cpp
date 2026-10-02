@@ -146,7 +146,7 @@ Model::Model(ModelFile file, EngineOptions options) : file_(std::move(file)), op
     scores_.resize(batch * c.num_attention_heads * options_.max_positions);
     act_scales_.resize(batch * blocks_stride_);
     act_qs_.resize(batch * blocks_stride_ * QK);
-    act_bias_.resize(batch * blocks_stride_ * 8);
+    act_offsets_.resize(batch * blocks_stride_);
     kv_scratch_.resize(static_cast<size_t>(pool_->size()) * 2 * c.head_dim);
     row_scratch_.resize(static_cast<size_t>(pool_->size()) * batch);
 
@@ -277,8 +277,8 @@ void Model::matmul(const Tensor& weight, const float* in, uint32_t in_stride, ui
 
     // Quantize each token's activation vector once, here, so the row loop below is pure
     // integer work that any worker can do independently. The zero point comes from the *weight*
-    // format, since the bias it folds into the accumulator corrects for the weights being stored
-    // unsigned -- 8 for q4's nibbles, 128 for q8's bytes.
+    // format, since the offset it precomputes corrects for the weights being stored unsigned --
+    // 8 for q4's nibbles, 128 for q8's bytes.
     const int nblocks = static_cast<int>(n_in / QK);
     const bool four_bit = weight.format == Format::q4;
     const int zero_point = four_bit ? 8 : 128;
@@ -286,11 +286,11 @@ void Model::matmul(const Tensor& weight, const float* in, uint32_t in_stride, ui
         const size_t block = static_cast<size_t>(t) * nblocks;
         quantize_a8_soa(in + static_cast<size_t>(t) * in_stride, static_cast<int>(n_in), zero_point,
                         act_scales_.data() + block, act_qs_.data() + block * QK,
-                        act_bias_.data() + block * 8);
+                        act_offsets_.data() + block);
     }
     const float* x_scales = act_scales_.data();
     const int8_t* x_qs = act_qs_.data();
-    const int32_t* x_bias = act_bias_.data();
+    const int32_t* x_offsets = act_offsets_.data();
     const int batch_width = options_.max_batch;
 
     const auto body = [&](int begin, int end, int worker) {
@@ -302,11 +302,11 @@ void Model::matmul(const Tensor& weight, const float* in, uint32_t in_stride, ui
             if (four_bit) {
                 dot_q4_soa_multi(weight.row_scales(row),
                                  static_cast<const uint8_t*>(weight.row_qs(row)), x_scales, x_qs,
-                                 x_bias, nblocks, tokens, results);
+                                 x_offsets, nblocks, tokens, results);
             } else {
                 dot_q8_soa_multi(weight.row_scales(row),
                                  static_cast<const int8_t*>(weight.row_qs(row)), x_scales, x_qs,
-                                 x_bias, nblocks, tokens, results);
+                                 x_offsets, nblocks, tokens, results);
             }
             for (int t = 0; t < tokens; ++t) {
                 out[static_cast<size_t>(t) * out_stride + r] = results[t];

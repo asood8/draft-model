@@ -111,8 +111,8 @@ void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, flo
 //     of int32 accumulators into a single vector in block order;
 //   * the sign trick gives way to the identity sum((q - z) * x) = sum(q * x) - z * sum(x), for the
 //     format's zero point z, which lets the raw bytes be dpbusd's unsigned operand. The correction
-//     costs nothing in the loop, because the accumulator starts at a precomputed per-lane bias
-//     instead of at zero.
+//     is one precomputed integer a block, subtracted after the reduction rather than seeded into
+//     each accumulator, so eight blocks share a single 32-byte load instead of needing one each.
 //
 // Measured at 1.3x to 1.8x the interleaved kernels, and slightly more accurate, since grouping eight
 // blocks shortens the float accumulation chain. Model files from version 4 on store this layout, so
@@ -120,21 +120,21 @@ void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, flo
 // byte-exactness test against the Python mirror still applies to both.
 //
 // A row of `nblocks` blocks is a pair of arrays: `scales[nblocks]`, and `qs` holding 16 bytes a
-// block for q4 or 32 for q8. Activations are the same plus a bias: `x_bias[nblocks * 8]` holds
-// -z times the sum of the four activations in each of dpbusd's eight int32 lanes.
+// block for q4 or 32 for q8. Activations are the same plus `x_offsets[nblocks]`, holding z times the
+// sum of that block's activations -- the quantity the identity above subtracts.
 
 // Quantize one activation vector straight into that layout. `zero_point` is the weight format's:
 // 8 for q4 nibbles, 128 for q8 bytes. It belongs to the weights rather than the activations, but
 // the bias is a property of the activations, so the caller passes the one its matmul needs.
 void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_t* qs,
-                     int32_t* bias);
+                     int32_t* offsets);
 
 // Rearrange one interleaved row into the split layout. The exporter does this in Python; these
 // exist so tests can drive the kernels from the same blobs the other bindings take.
 void repack_q4_soa(const BlockQ4* blocks, int nblocks, uint16_t* scales, uint8_t* qs);
 void repack_q8_soa(const BlockQ8* blocks, int nblocks, uint16_t* scales, int8_t* qs);
 void repack_a8_soa(const BlockA8* blocks, int nblocks, int zero_point, float* scales, int8_t* qs,
-                   int32_t* bias);
+                   int32_t* offsets);
 
 void dequantize_q4_soa(const uint16_t* scales, const uint8_t* qs, int n, float* out);
 void dequantize_q8_soa(const uint16_t* scales, const int8_t* qs, int n, float* out);
@@ -144,14 +144,14 @@ void dequantize_q8_soa(const uint16_t* scales, const int8_t* qs, int n, float* o
 // memory once however large k is -- and a k-token pass is bit-identical to k single-token passes by
 // construction rather than by agreement between two kernels.
 void dot_q4_soa_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
-                      const int8_t* x_qs, const int32_t* x_bias, int nblocks, int k, float* out);
+                      const int8_t* x_qs, const int32_t* x_offsets, int nblocks, int k, float* out);
 void dot_q8_soa_multi(const uint16_t* w_scales, const int8_t* w_qs, const float* x_scales,
-                      const int8_t* x_qs, const int32_t* x_bias, int nblocks, int k, float* out);
+                      const int8_t* x_qs, const int32_t* x_offsets, int nblocks, int k, float* out);
 
 // The reference the SIMD versions are tested against.
 float dot_q4_soa_scalar(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
-                        const int8_t* x_qs, const int32_t* x_bias, int nblocks);
+                        const int8_t* x_qs, const int32_t* x_offsets, int nblocks);
 float dot_q8_soa_scalar(const uint16_t* w_scales, const int8_t* w_qs, const float* x_scales,
-                        const int8_t* x_qs, const int32_t* x_bias, int nblocks);
+                        const int8_t* x_qs, const int32_t* x_offsets, int nblocks);
 
 }  // namespace specdraft
