@@ -389,11 +389,10 @@ void dequantize_q8_soa(const uint16_t* scales, const int8_t* qs, int n, float* o
     }
 }
 
-void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_t* qs,
-                     int32_t* offsets, bool paired) {
-    const int nblocks = n / QK;
+void quantize_a8_soa_blocks(const float* x, int nblocks, int begin, int end, int zero_point,
+                           float* scales, int8_t* qs, int32_t* offsets, bool paired) {
     const int pairs_end = paired ? nblocks - nblocks % kGroup : 0;  // blocks the kernel pairs up
-    for (int b = 0; b < nblocks; ++b) {
+    for (int b = begin; b < end; ++b) {
         const float* xb = x + static_cast<size_t>(b) * QK;
         float amax = 0.0f;
         for (int i = 0; i < QK; ++i) {
@@ -423,6 +422,11 @@ void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_
         // 32-byte load where per-lane biases needed one each.
         offsets[b] = zero_point * sum;
     }
+}
+
+void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_t* qs,
+                     int32_t* offsets, bool paired) {
+    quantize_a8_soa_blocks(x, n / QK, 0, n / QK, zero_point, scales, qs, offsets, paired);
 }
 
 float dot_q4_soa_scalar(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,

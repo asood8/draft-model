@@ -698,6 +698,40 @@ PYBIND11_MODULE(_engine, m) {
         },
         py::arg("x"), py::arg("zero_point") = 8, py::arg("paired") = true);
 
+    // The same, done in `chunks` separate block ranges, which is how the engine spreads it over its
+    // workers. Splitting must not change a byte -- every block's scale comes from its own 32 values --
+    // and this is what a test checks, because the alternative is the engine quietly disagreeing with
+    // the PyTorch twin only at whatever block boundary the thread count happens to produce.
+    m.def(
+        "quantize_a8_soa_chunked",
+        [](const FloatArray& x, int zero_point, bool paired, int chunks) {
+            if (x.ndim() != 1 || x.size() == 0 || x.size() % QK != 0) {
+                throw std::invalid_argument("x must be a non-empty 1-D array of whole blocks");
+            }
+            if (chunks < 1) {
+                throw std::invalid_argument("chunks must be positive");
+            }
+            const int n = static_cast<int>(x.size());
+            const int nblocks = n / QK;
+            py::array_t<float> scales(nblocks);
+            py::array_t<int8_t> qs(n);
+            py::array_t<int32_t> offsets(nblocks);
+            std::memset(qs.mutable_data(), 0, static_cast<size_t>(n));
+            for (int c = 0; c < chunks; ++c) {
+                const int begin = static_cast<int>(static_cast<int64_t>(c) * nblocks / chunks);
+                const int end = static_cast<int>(static_cast<int64_t>(c + 1) * nblocks / chunks);
+                quantize_a8_soa_blocks(x.data(), nblocks, begin, end, zero_point,
+                                      scales.mutable_data(), qs.mutable_data(),
+                                      offsets.mutable_data(), paired);
+            }
+            py::dict out;
+            out["scales"] = scales;
+            out["qs"] = qs;
+            out["offsets"] = offsets;
+            return out;
+        },
+        py::arg("x"), py::arg("zero_point") = 8, py::arg("paired") = true, py::arg("chunks") = 1);
+
     m.def("quantize_q4", &quantize_py<BlockQ4, quantize_q4>, py::arg("x"));
     m.def("quantize_q8", &quantize_py<BlockQ8, quantize_q8>, py::arg("x"));
     m.def("quantize_a8", &quantize_py<BlockA8, quantize_a8>, py::arg("x"));

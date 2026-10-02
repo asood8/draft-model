@@ -364,3 +364,21 @@ def test_the_two_layouts_agree(weight_fmt):
     wq = _PY_DEQUANTIZE[weight_fmt](w_blob).astype(np.float64)
     terms = float(np.abs(wq).sum()) * 0.5
     assert np.abs(split - interleaved).max() <= 1e-6 * terms
+
+
+@pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize("chunks", [1, 2, 3, 6, 7, 80])
+def test_splitting_the_activation_quantizer_changes_nothing(paired, chunks):
+    """The engine spreads this over its workers, so a split must be byte-identical.
+
+    Every block's scale comes from its own 32 values, so this holds by construction -- but the failure
+    it guards against is nasty: the engine would disagree with the PyTorch twin only at whichever block
+    boundary the thread count happened to land on, and only on the machines with that many cores.
+    """
+    x = sample("normal", 2560, 1.0, seed=60)
+    whole = cpp.quantize_a8_soa(x, 8, paired)
+    split = cpp.quantize_a8_soa_chunked(x, 8, paired, chunks)
+
+    assert np.array_equal(split["qs"], whole["qs"])
+    assert np.array_equal(split["scales"], whole["scales"])
+    assert np.array_equal(split["offsets"], whole["offsets"])

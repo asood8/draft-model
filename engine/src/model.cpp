@@ -282,11 +282,28 @@ void Model::matmul(const Tensor& weight, const float* in, uint32_t in_stride, ui
     const int nblocks = static_cast<int>(n_in / QK);
     const bool four_bit = weight.format == Format::q4;
     const int zero_point = four_bit ? 8 : 128;
-    for (int t = 0; t < tokens; ++t) {
-        const size_t block = static_cast<size_t>(t) * nblocks;
-        quantize_a8_soa(in + static_cast<size_t>(t) * in_stride, static_cast<int>(n_in), zero_point,
-                        act_scales_.data() + block, act_qs_.data() + block * QK,
-                        act_offsets_.data() + block, four_bit);
+
+    // One flat index over (token, block), so a wide ffn_down input splits as evenly across workers as
+    // a batch of tokens does, and a slice that spans two tokens becomes one call per token.
+    const auto quantize_range = [&](int begin, int end, int) {
+        while (begin < end) {
+            const int t = begin / nblocks;
+            const size_t base = static_cast<size_t>(t) * nblocks;
+            quantize_a8_soa_blocks(in + static_cast<size_t>(t) * in_stride, nblocks,
+                                  begin - t * nblocks, std::min(nblocks, end - t * nblocks),
+                                  zero_point, act_scales_.data() + base,
+                                  act_qs_.data() + base * QK, act_offsets_.data() + base, four_bit);
+            begin = (t + 1) * nblocks;
+        }
+    };
+    // Below the threshold the dispatch costs more than the work: a forward pass makes about 180 of
+    // these calls per token, and a parallel job is 1-5 us depending on how quiet the machine is. The
+    // wide ones -- ffn_down takes a 9728-value input, 304 blocks -- are where the time actually is.
+    constexpr int kParallelBlocks = 64;
+    if (tokens * nblocks >= kParallelBlocks && pool_->size() > 1) {
+        pool_->run(tokens * nblocks, quantize_range);
+    } else {
+        quantize_range(0, tokens * nblocks, 0);
     }
     const float* x_scales = act_scales_.data();
     const int8_t* x_qs = act_qs_.data();

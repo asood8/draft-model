@@ -137,6 +137,15 @@ void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, flo
 void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_t* qs,
                      int32_t* offsets, bool paired);
 
+// The same, for blocks [begin, end) of a vector that is `nblocks` long. Every block is independent, so
+// the engine splits this across its workers rather than leaving five cores idle while one quantizes --
+// it is per-token work, so it inflates a k-token pass k times over. The range is in *global* block
+// numbers because the paired layout's destination depends on where a block sits in the row, which a
+// shifted pointer would get wrong. Splitting changes no byte: each block's scale comes from its own
+// 32 values.
+void quantize_a8_soa_blocks(const float* x, int nblocks, int begin, int end, int zero_point,
+                           float* scales, int8_t* qs, int32_t* offsets, bool paired);
+
 // Rearrange one interleaved row into the split layout. The exporter does this in Python; these
 // exist so tests can drive the kernels from the same blobs the other bindings take.
 void repack_q4_soa(const BlockQ4* blocks, int nblocks, uint16_t* scales, uint8_t* qs);
