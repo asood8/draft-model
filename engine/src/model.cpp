@@ -144,7 +144,9 @@ Model::Model(ModelFile file, EngineOptions options) : file_(std::move(file)), op
     att_.resize(batch * c.q_dim());
     mlp_.resize(batch * mlp_stride_);
     scores_.resize(batch * c.num_attention_heads * options_.max_positions);
-    activations_.resize(batch * blocks_stride_);
+    act_scales_.resize(batch * blocks_stride_);
+    act_qs_.resize(batch * blocks_stride_ * QK);
+    act_bias_.resize(batch * blocks_stride_ * 8);
     kv_scratch_.resize(static_cast<size_t>(pool_->size()) * 2 * c.head_dim);
     row_scratch_.resize(static_cast<size_t>(pool_->size()) * batch);
 
@@ -235,16 +237,18 @@ void Model::embed(int32_t token, float* out) const {
     if (token < 0 || static_cast<uint32_t>(token) >= c.vocab_size) {
         throw std::runtime_error("token id out of range");
     }
-    const void* row = embedding_.row(static_cast<uint32_t>(token));
+    const uint32_t id = static_cast<uint32_t>(token);
     switch (embedding_.format) {
         case Format::fp32:
-            std::memcpy(out, row, c.hidden_size * sizeof(float));
+            std::memcpy(out, embedding_.row(id), c.hidden_size * sizeof(float));
             break;
         case Format::q4:
-            dequantize_q4(static_cast<const BlockQ4*>(row), c.hidden_size, out);
+            dequantize_q4_soa(embedding_.row_scales(id),
+                              static_cast<const uint8_t*>(embedding_.row_qs(id)), c.hidden_size, out);
             break;
         case Format::q8:
-            dequantize_q8(static_cast<const BlockQ8*>(row), c.hidden_size, out);
+            dequantize_q8_soa(embedding_.row_scales(id),
+                              static_cast<const int8_t*>(embedding_.row_qs(id)), c.hidden_size, out);
             break;
     }
 }
@@ -272,14 +276,21 @@ void Model::matmul(const Tensor& weight, const float* in, uint32_t in_stride, ui
     }
 
     // Quantize each token's activation vector once, here, so the row loop below is pure
-    // integer work that any worker can do independently.
+    // integer work that any worker can do independently. The zero point comes from the *weight*
+    // format, since the bias it folds into the accumulator corrects for the weights being stored
+    // unsigned -- 8 for q4's nibbles, 128 for q8's bytes.
     const int nblocks = static_cast<int>(n_in / QK);
-    for (int t = 0; t < tokens; ++t) {
-        quantize_a8(in + static_cast<size_t>(t) * in_stride, static_cast<int>(n_in),
-                    activations_.data() + static_cast<size_t>(t) * nblocks);
-    }
-    const BlockA8* activations = activations_.data();
     const bool four_bit = weight.format == Format::q4;
+    const int zero_point = four_bit ? 8 : 128;
+    for (int t = 0; t < tokens; ++t) {
+        const size_t block = static_cast<size_t>(t) * nblocks;
+        quantize_a8_soa(in + static_cast<size_t>(t) * in_stride, static_cast<int>(n_in), zero_point,
+                        act_scales_.data() + block, act_qs_.data() + block * QK,
+                        act_bias_.data() + block * 8);
+    }
+    const float* x_scales = act_scales_.data();
+    const int8_t* x_qs = act_qs_.data();
+    const int32_t* x_bias = act_bias_.data();
     const int batch_width = options_.max_batch;
 
     const auto body = [&](int begin, int end, int worker) {
@@ -287,12 +298,15 @@ void Model::matmul(const Tensor& weight, const float* in, uint32_t in_stride, ui
         // verifying γ+1 guesses cheaper than γ+1 separate steps.
         float* results = row_scratch_.data() + static_cast<size_t>(worker) * batch_width;
         for (int r = begin; r < end; ++r) {
+            const uint32_t row = static_cast<uint32_t>(r);
             if (four_bit) {
-                dot_q4_a8_multi(static_cast<const BlockQ4*>(weight.row(r)), activations, nblocks,
-                                tokens, results);
+                dot_q4_soa_multi(weight.row_scales(row),
+                                 static_cast<const uint8_t*>(weight.row_qs(row)), x_scales, x_qs,
+                                 x_bias, nblocks, tokens, results);
             } else {
-                dot_q8_a8_multi(static_cast<const BlockQ8*>(weight.row(r)), activations, nblocks,
-                                tokens, results);
+                dot_q8_soa_multi(weight.row_scales(row),
+                                 static_cast<const int8_t*>(weight.row_qs(row)), x_scales, x_qs,
+                                 x_bias, nblocks, tokens, results);
             }
             for (int t = 0; t < tokens; ++t) {
                 out[static_cast<size_t>(t) * out_stride + r] = results[t];

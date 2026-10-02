@@ -115,7 +115,11 @@ private:
     // All sized for max_batch tokens; strides are the per-token widths below.
     std::vector<float> x_, xb_, xb2_, qkv_, att_, scores_, mlp_, kv_scratch_, row_scratch_;
     uint32_t qkv_stride_ = 0, mlp_stride_ = 0, blocks_stride_ = 0;
-    std::vector<BlockA8> activations_;
+    // Quantized activations in the split layout the kernels read: one scale a block, the bytes, and
+    // the per-lane bias that carries the weight format's zero point.
+    std::vector<float> act_scales_;
+    std::vector<int8_t> act_qs_;
+    std::vector<int32_t> act_bias_;
     std::vector<uint16_t> key_cache_, value_cache_;  // [layer][kv_head][position][head_dim], fp16
 
     bool timing_ = false;

@@ -155,6 +155,220 @@ GenerateOptions make_options(int max_new_tokens, int gamma, float temperature, i
     return options;
 }
 
+// ---------------------------------------------------------------------- the kernel benchmark
+//
+// The k-token kernel on its own, with no model around it. Measuring v(k) through the engine mixes
+// several things: how efficiently the kernel issues its multiply-accumulates, how often it stalls on
+// memory, and whatever the rest of the forward pass costs. This isolates the first two -- choosing
+// `rows` so the weights fit a given cache level separates them -- and `threads` matters more than it
+// looks: on one core the memory system is nowhere near saturated, so a kernel that wins there need
+// not win on six, where bandwidth is the constraint and the *layout* of the weights decides how much
+// of it is reachable. Comparing layouts at one thread would answer the wrong question.
+enum class BenchLayout {
+    interleaved,   // each block's scale beside its bytes, as the file stored it before version 4
+    split_tensor,  // every row's scales, then every row's bytes
+    split_row,     // per row: that row's scales, then that row's bytes
+};
+
+py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
+                      const std::string& format, BenchLayout layout, const std::string& cores) {
+    if (rows < 1 || n_in < 1 || tokens < 1 || iters < 1 || threads < 1) {
+        throw std::invalid_argument("rows, n_in, tokens, iters and threads must all be positive");
+    }
+    if (n_in % QK != 0) {
+        throw std::invalid_argument("n_in must be a multiple of " + std::to_string(QK));
+    }
+    const bool four_bit = format == "q4";
+    if (!four_bit && format != "q8") {
+        throw std::invalid_argument("format must be \"q4\" or \"q8\"");
+    }
+    CoreSelection selection = CoreSelection::performance;
+    if (!parse_core_selection(cores.c_str(), &selection)) {
+        throw std::invalid_argument("unknown core selection " + cores);
+    }
+
+    const int nblocks = n_in / QK;
+    const size_t width = static_cast<size_t>(nblocks);
+    const size_t payload = four_bit ? QK / 2 : QK;  // quantized bytes a block
+    const int zero_point = four_bit ? 8 : 128;
+
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+    std::vector<float> scratch(static_cast<size_t>(n_in));
+    const auto fill = [&] {
+        for (float& value : scratch) {
+            value = uniform(rng);
+        }
+    };
+
+    // Activations, in whichever shape this layout's kernel reads.
+    std::vector<BlockA8> act_blocks;
+    std::vector<float> x_scales;
+    std::vector<int8_t> x_qs;
+    std::vector<int32_t> x_bias;
+    if (layout == BenchLayout::interleaved) {
+        act_blocks.resize(width * tokens);
+        for (int t = 0; t < tokens; ++t) {
+            fill();
+            quantize_a8(scratch.data(), n_in, act_blocks.data() + static_cast<size_t>(t) * width);
+        }
+    } else {
+        x_scales.resize(width * tokens);
+        x_qs.resize(width * tokens * QK);
+        x_bias.resize(width * tokens * 8);
+        for (int t = 0; t < tokens; ++t) {
+            fill();
+            const size_t offset = static_cast<size_t>(t) * width;
+            quantize_a8_soa(scratch.data(), n_in, zero_point, x_scales.data() + offset,
+                            x_qs.data() + offset * QK, x_bias.data() + offset * 8);
+        }
+    }
+
+    // Weights. One buffer whatever the layout, so no layout gets an allocation advantage; only the
+    // arithmetic that finds a row inside it differs.
+    const size_t row_stride = width * sizeof(uint16_t) + width * payload;
+    std::vector<uint8_t> weights(static_cast<size_t>(rows) * row_stride);
+    std::vector<uint8_t> staging(width * (four_bit ? sizeof(BlockQ4) : sizeof(BlockQ8)));
+    for (int r = 0; r < rows; ++r) {
+        fill();
+        if (four_bit) {
+            quantize_q4(scratch.data(), n_in, reinterpret_cast<BlockQ4*>(staging.data()));
+        } else {
+            quantize_q8(scratch.data(), n_in, reinterpret_cast<BlockQ8*>(staging.data()));
+        }
+        const size_t at = static_cast<size_t>(r) * row_stride;
+        switch (layout) {
+            case BenchLayout::interleaved:
+                std::memcpy(weights.data() + at, staging.data(), staging.size());
+                break;
+            case BenchLayout::split_row:
+                if (four_bit) {
+                    repack_q4_soa(reinterpret_cast<const BlockQ4*>(staging.data()), nblocks,
+                                  reinterpret_cast<uint16_t*>(weights.data() + at),
+                                  weights.data() + at + width * sizeof(uint16_t));
+                } else {
+                    repack_q8_soa(reinterpret_cast<const BlockQ8*>(staging.data()), nblocks,
+                                  reinterpret_cast<uint16_t*>(weights.data() + at),
+                                  reinterpret_cast<int8_t*>(weights.data() + at +
+                                                            width * sizeof(uint16_t)));
+                }
+                break;
+            case BenchLayout::split_tensor: {
+                // All the scales first, then all the bytes, across the whole buffer.
+                uint8_t* scales_at = weights.data() + static_cast<size_t>(r) * width * sizeof(uint16_t);
+                uint8_t* qs_at = weights.data() + static_cast<size_t>(rows) * width * sizeof(uint16_t) +
+                                 static_cast<size_t>(r) * width * payload;
+                if (four_bit) {
+                    repack_q4_soa(reinterpret_cast<const BlockQ4*>(staging.data()), nblocks,
+                                  reinterpret_cast<uint16_t*>(scales_at), qs_at);
+                } else {
+                    repack_q8_soa(reinterpret_cast<const BlockQ8*>(staging.data()), nblocks,
+                                  reinterpret_cast<uint16_t*>(scales_at),
+                                  reinterpret_cast<int8_t*>(qs_at));
+                }
+                break;
+            }
+        }
+    }
+
+    // Each worker's output and checksum get a cache line to themselves. Without the padding the six
+    // workers write their results into one line and every row invalidates it in the other five
+    // cores, which costs more than the kernel and costs it unevenly across k -- it reads as though
+    // the layouts differ by eightfold at k=2 and not at all at k=4.
+    constexpr size_t kLineFloats = 16;  // 64 bytes
+    const size_t out_stride = ((static_cast<size_t>(tokens) + kLineFloats - 1) / kLineFloats) * kLineFloats;
+    std::vector<float> out(static_cast<size_t>(threads) * out_stride);
+    std::vector<double> checksums(static_cast<size_t>(threads) * kLineFloats, 0.0);
+    const uint8_t* w_base = weights.data();
+    const size_t scales_region = static_cast<size_t>(rows) * width * sizeof(uint16_t);
+
+    const auto body = [&](int begin, int end, int worker) {
+        float* results = out.data() + static_cast<size_t>(worker) * out_stride;
+        double sum = 0.0;
+        for (int r = begin; r < end; ++r) {
+            const size_t at = static_cast<size_t>(r) * row_stride;
+            switch (layout) {
+                case BenchLayout::interleaved:
+                    if (four_bit) {
+                        dot_q4_a8_multi(reinterpret_cast<const BlockQ4*>(w_base + at),
+                                        act_blocks.data(), nblocks, tokens, results);
+                    } else {
+                        dot_q8_a8_multi(reinterpret_cast<const BlockQ8*>(w_base + at),
+                                        act_blocks.data(), nblocks, tokens, results);
+                    }
+                    break;
+                case BenchLayout::split_row: {
+                    const auto* scales = reinterpret_cast<const uint16_t*>(w_base + at);
+                    const uint8_t* qs = w_base + at + width * sizeof(uint16_t);
+                    if (four_bit) {
+                        dot_q4_soa_multi(scales, qs, x_scales.data(), x_qs.data(), x_bias.data(),
+                                         nblocks, tokens, results);
+                    } else {
+                        dot_q8_soa_multi(scales, reinterpret_cast<const int8_t*>(qs),
+                                         x_scales.data(), x_qs.data(), x_bias.data(), nblocks,
+                                         tokens, results);
+                    }
+                    break;
+                }
+                case BenchLayout::split_tensor: {
+                    const auto* scales = reinterpret_cast<const uint16_t*>(
+                        w_base + static_cast<size_t>(r) * width * sizeof(uint16_t));
+                    const uint8_t* qs =
+                        w_base + scales_region + static_cast<size_t>(r) * width * payload;
+                    if (four_bit) {
+                        dot_q4_soa_multi(scales, qs, x_scales.data(), x_qs.data(), x_bias.data(),
+                                         nblocks, tokens, results);
+                    } else {
+                        dot_q8_soa_multi(scales, reinterpret_cast<const int8_t*>(qs),
+                                         x_scales.data(), x_qs.data(), x_bias.data(), nblocks,
+                                         tokens, results);
+                    }
+                    break;
+                }
+            }
+            sum += results[0];  // so nothing in the timed loop can be dropped as dead
+        }
+        checksums[static_cast<size_t>(worker) * kLineFloats] += sum;
+    };
+
+    double seconds = 0.0;
+    {
+        py::gil_scoped_release unlocked;
+        ThreadPool pool(threads, selection);
+        const auto sweep = [&] {
+            if (threads == 1) {
+                body(0, rows, 0);
+            } else {
+                pool.run(rows, body);
+            }
+        };
+        sweep();  // untimed, so the measurement is not paying for cold caches
+        const auto started = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            sweep();
+        }
+        seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    }
+
+    double checksum = 0.0;
+    for (double value : checksums) {
+        checksum += value;
+    }
+    const double weight_bytes = static_cast<double>(rows) * row_stride;
+    py::dict result;
+    result["seconds"] = seconds;
+    result["macs"] = static_cast<double>(rows) * n_in * tokens * iters;
+    result["weight_bytes"] = weight_bytes;
+    result["weight_bytes_read"] = weight_bytes * iters;
+    result["activation_bytes"] =
+        layout == BenchLayout::interleaved
+            ? static_cast<double>(act_blocks.size() * sizeof(BlockA8))
+            : static_cast<double>(x_qs.size() + 4 * x_bias.size() + 4 * x_scales.size());
+    result["checksum"] = checksum;
+    result["threads"] = threads;
+    return result;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_engine, m) {
@@ -457,9 +671,35 @@ PYBIND11_MODULE(_engine, m) {
     m.def("set_force_scalar", &set_force_scalar, py::arg("force"),
           "Use the scalar kernels even where AVX-VNNI exists, so the reference path stays tested.");
     m.def("force_scalar", &force_scalar);
+    m.def("set_scale_grouping", &set_scale_grouping, py::arg("enabled"),
+          "Apply q4 block scales eight at a time (default) or one at a time.");
+    m.def("scale_grouping", &scale_grouping);
 
     m.def("fp32_to_fp16", &fp32_to_fp16, py::arg("value"));
     m.def("fp16_to_fp32", &fp16_to_fp32, py::arg("bits"));
+
+    // Activations in the split layout, returned as the three arrays the kernels read, so a test can
+    // check they hold the same bytes and scales quantize_a8 produces.
+    m.def(
+        "quantize_a8_soa",
+        [](const FloatArray& x, int zero_point) {
+            if (x.ndim() != 1 || x.size() == 0 || x.size() % QK != 0) {
+                throw std::invalid_argument("x must be a non-empty 1-D array of whole blocks");
+            }
+            const int n = static_cast<int>(x.size());
+            const int nblocks = n / QK;
+            py::array_t<float> scales(nblocks);
+            py::array_t<int8_t> qs(n);
+            py::array_t<int32_t> bias(static_cast<size_t>(nblocks) * 8);
+            quantize_a8_soa(x.data(), n, zero_point, scales.mutable_data(), qs.mutable_data(),
+                            bias.mutable_data());
+            py::dict out;
+            out["scales"] = scales;
+            out["qs"] = qs;
+            out["bias"] = bias;
+            return out;
+        },
+        py::arg("x"), py::arg("zero_point") = 8);
 
     m.def("quantize_q4", &quantize_py<BlockQ4, quantize_q4>, py::arg("x"));
     m.def("quantize_q8", &quantize_py<BlockQ8, quantize_q8>, py::arg("x"));
@@ -496,102 +736,9 @@ PYBIND11_MODULE(_engine, m) {
         },
         py::arg("weights"), py::arg("activations"));
 
-    // The k-token kernel on its own, with no model around it. Measuring v(k) through the engine
-    // mixes two different things: how efficiently the kernel issues its multiply-accumulates, and
-    // how often it stalls waiting for weights. Choosing `rows` so the weights fit L2 separates them
-    // -- a cache-resident run is a pure throughput figure, and the fall-off as `rows` grows past the
-    // cache is the memory cost. Single-threaded on purpose, so the thread pool is not in the way.
-    m.def(
-        "bench_dot",
-        [](int rows, int n_in, int tokens, int iters, const std::string& format) {
-            if (rows < 1 || n_in < 1 || tokens < 1 || iters < 1) {
-                throw std::invalid_argument("rows, n_in, tokens and iters must all be positive");
-            }
-            if (n_in % QK != 0) {
-                throw std::invalid_argument("n_in must be a multiple of " + std::to_string(QK));
-            }
-            const bool four_bit = format == "q4";
-            if (!four_bit && format != "q8") {
-                throw std::invalid_argument("format must be \"q4\" or \"q8\"");
-            }
-
-            const int nblocks = n_in / QK;
-            std::mt19937 rng(1234);
-            std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
-            std::vector<float> scratch(static_cast<size_t>(n_in));
-            const auto fill = [&] {
-                for (float& value : scratch) {
-                    value = uniform(rng);
-                }
-            };
-
-            std::vector<BlockA8> activations(static_cast<size_t>(tokens) * nblocks);
-            for (int t = 0; t < tokens; ++t) {
-                fill();
-                quantize_a8(scratch.data(), n_in, activations.data() + static_cast<size_t>(t) * nblocks);
-            }
-
-            std::vector<BlockQ4> w4;
-            std::vector<BlockQ8> w8;
-            if (four_bit) {
-                w4.resize(static_cast<size_t>(rows) * nblocks);
-            } else {
-                w8.resize(static_cast<size_t>(rows) * nblocks);
-            }
-            for (int r = 0; r < rows; ++r) {
-                fill();
-                if (four_bit) {
-                    quantize_q4(scratch.data(), n_in, w4.data() + static_cast<size_t>(r) * nblocks);
-                } else {
-                    quantize_q8(scratch.data(), n_in, w8.data() + static_cast<size_t>(r) * nblocks);
-                }
-            }
-
-            std::vector<float> out(static_cast<size_t>(tokens));
-            double checksum = 0.0;
-            // The checksum is not a correctness check -- the tests do that -- it is only there so
-            // that nothing in the timed loop can be optimized away as dead.
-            const auto sweep = [&] {
-                for (int r = 0; r < rows; ++r) {
-                    if (four_bit) {
-                        dot_q4_a8_multi(w4.data() + static_cast<size_t>(r) * nblocks,
-                                        activations.data(), nblocks, tokens, out.data());
-                    } else {
-                        dot_q8_a8_multi(w8.data() + static_cast<size_t>(r) * nblocks,
-                                        activations.data(), nblocks, tokens, out.data());
-                    }
-                    checksum += out[0];
-                }
-            };
-
-            sweep();  // untimed, so the measurement is not paying for cold caches
-            double seconds = 0.0;
-            {
-                py::gil_scoped_release unlocked;
-                const auto started = std::chrono::steady_clock::now();
-                for (int i = 0; i < iters; ++i) {
-                    sweep();
-                }
-                seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
-                              .count();
-            }
-
-            const double weight_bytes = static_cast<double>(rows) * nblocks
-                                        * (four_bit ? sizeof(BlockQ4) : sizeof(BlockQ8));
-            py::dict result;
-            result["seconds"] = seconds;
-            result["macs"] = static_cast<double>(rows) * n_in * tokens * iters;
-            result["weight_bytes"] = weight_bytes;
-            result["weight_bytes_read"] = weight_bytes * iters;
-            result["activation_bytes"] = static_cast<double>(activations.size()) * sizeof(BlockA8);
-            result["checksum"] = checksum;
-            return result;
-        },
-        py::arg("rows"), py::arg("n_in"), py::arg("tokens"), py::arg("iters") = 1,
-        py::arg("format") = "q4");
-
-    // The SoA prototype, taking the same interleaved blobs the other bindings take and repacking
-    // them, so a test can compare it against the scalar reference without knowing the layout.
+    // The split-layout kernels, taking the same interleaved blobs the other dot bindings take and
+    // repacking them, so a test can check them against the scalar reference without knowing the
+    // layout. The zero point differs by format: 8 for q4's nibbles, 128 for q8's bytes.
     m.def(
         "dot_q4_a8_soa",
         [](const py::bytes& weights, const py::bytes& activations) {
@@ -601,115 +748,93 @@ PYBIND11_MODULE(_engine, m) {
                 throw std::invalid_argument("weights must be a whole number of Q4 blocks");
             }
             const int nblocks = static_cast<int>(w.size() / sizeof(BlockQ4));
-            if (x.size() % (static_cast<size_t>(nblocks) * sizeof(BlockA8)) != 0 || x.empty()) {
+            const size_t width = static_cast<size_t>(nblocks);
+            if (x.size() % (width * sizeof(BlockA8)) != 0 || x.empty()) {
                 throw std::invalid_argument("activations must be k whole vectors of the same width");
             }
-            const int tokens = static_cast<int>(x.size() / (static_cast<size_t>(nblocks) * sizeof(BlockA8)));
+            const int tokens = static_cast<int>(x.size() / (width * sizeof(BlockA8)));
 
-            std::vector<uint16_t> w_scales(nblocks);
-            std::vector<uint8_t> w_qs(static_cast<size_t>(nblocks) * (QK / 2));
+            std::vector<uint16_t> w_scales(width);
+            std::vector<uint8_t> w_qs(width * (QK / 2));
             repack_q4_soa(reinterpret_cast<const BlockQ4*>(w.data()), nblocks, w_scales.data(),
                           w_qs.data());
 
-            const size_t width = static_cast<size_t>(nblocks);
             std::vector<float> x_scales(width * tokens);
             std::vector<int8_t> x_qs(width * tokens * QK);
             std::vector<int32_t> x_bias(width * tokens * 8);
-            const BlockA8* blocks = reinterpret_cast<const BlockA8*>(x.data());
+            const auto* blocks = reinterpret_cast<const BlockA8*>(x.data());
             for (int t = 0; t < tokens; ++t) {
                 const size_t offset = static_cast<size_t>(t) * width;
-                repack_a8_soa(blocks + offset, nblocks, x_scales.data() + offset,
+                repack_a8_soa(blocks + offset, nblocks, 8, x_scales.data() + offset,
                               x_qs.data() + offset * QK, x_bias.data() + offset * 8);
             }
 
             py::array_t<float> out(tokens);
-            dot_q4_a8_soa(w_scales.data(), w_qs.data(), x_scales.data(), x_qs.data(), x_bias.data(),
-                          nblocks, tokens, out.mutable_data());
+            dot_q4_soa_multi(w_scales.data(), w_qs.data(), x_scales.data(), x_qs.data(),
+                             x_bias.data(), nblocks, tokens, out.mutable_data());
             return out;
         },
         py::arg("weights"), py::arg("activations"));
 
-    // The same sweep as bench_dot, on the SoA layout, so the two are directly comparable.
     m.def(
-        "bench_dot_soa",
-        [](int rows, int n_in, int tokens, int iters) {
-            if (rows < 1 || n_in < 1 || tokens < 1 || iters < 1) {
-                throw std::invalid_argument("rows, n_in, tokens and iters must all be positive");
+        "dot_q8_a8_soa",
+        [](const py::bytes& weights, const py::bytes& activations) {
+            std::string w = weights;
+            std::string x = activations;
+            if (w.size() % sizeof(BlockQ8) != 0 || w.empty()) {
+                throw std::invalid_argument("weights must be a whole number of Q8 blocks");
             }
-            if (n_in % QK != 0) {
-                throw std::invalid_argument("n_in must be a multiple of " + std::to_string(QK));
-            }
-            const int nblocks = n_in / QK;
-            std::mt19937 rng(1234);
-            std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
-            std::vector<float> scratch(static_cast<size_t>(n_in));
-            const auto fill = [&] {
-                for (float& value : scratch) {
-                    value = uniform(rng);
-                }
-            };
-
-            // Activations, repacked once.
+            const int nblocks = static_cast<int>(w.size() / sizeof(BlockQ8));
             const size_t width = static_cast<size_t>(nblocks);
+            if (x.size() % (width * sizeof(BlockA8)) != 0 || x.empty()) {
+                throw std::invalid_argument("activations must be k whole vectors of the same width");
+            }
+            const int tokens = static_cast<int>(x.size() / (width * sizeof(BlockA8)));
+
+            std::vector<uint16_t> w_scales(width);
+            std::vector<int8_t> w_qs(width * QK);
+            repack_q8_soa(reinterpret_cast<const BlockQ8*>(w.data()), nblocks, w_scales.data(),
+                          w_qs.data());
+
             std::vector<float> x_scales(width * tokens);
             std::vector<int8_t> x_qs(width * tokens * QK);
             std::vector<int32_t> x_bias(width * tokens * 8);
-            std::vector<BlockA8> staging(width);
+            const auto* blocks = reinterpret_cast<const BlockA8*>(x.data());
             for (int t = 0; t < tokens; ++t) {
-                fill();
-                quantize_a8(scratch.data(), n_in, staging.data());
                 const size_t offset = static_cast<size_t>(t) * width;
-                repack_a8_soa(staging.data(), nblocks, x_scales.data() + offset,
+                repack_a8_soa(blocks + offset, nblocks, 128, x_scales.data() + offset,
                               x_qs.data() + offset * QK, x_bias.data() + offset * 8);
             }
 
-            // Weights: scales for every row contiguous, then the nibbles, as a real file would.
-            std::vector<uint16_t> w_scales(width * rows);
-            std::vector<uint8_t> w_qs(width * rows * (QK / 2));
-            std::vector<BlockQ4> w_staging(width);
-            for (int r = 0; r < rows; ++r) {
-                fill();
-                quantize_q4(scratch.data(), n_in, w_staging.data());
-                const size_t offset = static_cast<size_t>(r) * width;
-                repack_q4_soa(w_staging.data(), nblocks, w_scales.data() + offset,
-                              w_qs.data() + offset * (QK / 2));
-            }
-
-            std::vector<float> out(static_cast<size_t>(tokens));
-            double checksum = 0.0;
-            const auto sweep = [&] {
-                for (int r = 0; r < rows; ++r) {
-                    const size_t offset = static_cast<size_t>(r) * width;
-                    dot_q4_a8_soa(w_scales.data() + offset, w_qs.data() + offset * (QK / 2),
-                                  x_scales.data(), x_qs.data(), x_bias.data(), nblocks, tokens,
-                                  out.data());
-                    checksum += out[0];
-                }
-            };
-
-            sweep();
-            double seconds = 0.0;
-            {
-                py::gil_scoped_release unlocked;
-                const auto started = std::chrono::steady_clock::now();
-                for (int i = 0; i < iters; ++i) {
-                    sweep();
-                }
-                seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
-                              .count();
-            }
-
-            // The same bytes as the interleaved layout: 18 per block, now in two arrays.
-            const double weight_bytes = static_cast<double>(rows) * nblocks * sizeof(BlockQ4);
-            py::dict result;
-            result["seconds"] = seconds;
-            result["macs"] = static_cast<double>(rows) * n_in * tokens * iters;
-            result["weight_bytes"] = weight_bytes;
-            result["weight_bytes_read"] = weight_bytes * iters;
-            result["activation_bytes"] =
-                static_cast<double>(x_qs.size() + x_bias.size() * 4 + x_scales.size() * 4);
-            result["checksum"] = checksum;
-            return result;
+            py::array_t<float> out(tokens);
+            dot_q8_soa_multi(w_scales.data(), w_qs.data(), x_scales.data(), x_qs.data(),
+                             x_bias.data(), nblocks, tokens, out.mutable_data());
+            return out;
         },
-        py::arg("rows"), py::arg("n_in"), py::arg("tokens"), py::arg("iters") = 1);
+        py::arg("weights"), py::arg("activations"));
+
+    // Both benchmarks go through one implementation, so the only difference between them is the
+    // layout being measured. `threads` defaults to one for a pure throughput figure; pass six to ask
+    // the question the engine cares about, where the memory system is the constraint.
+    m.def(
+        "bench_dot",
+        [](int rows, int n_in, int tokens, int iters, const std::string& format, int threads,
+           const std::string& cores) {
+            return bench_kernel(rows, n_in, tokens, iters, threads, format,
+                                BenchLayout::interleaved, cores);
+        },
+        py::arg("rows"), py::arg("n_in"), py::arg("tokens"), py::arg("iters") = 1,
+        py::arg("format") = "q4", py::arg("threads") = 1, py::arg("cores") = "performance");
+
+    m.def(
+        "bench_dot_soa",
+        [](int rows, int n_in, int tokens, int iters, const std::string& format, int threads,
+           const std::string& cores, bool row_major) {
+            return bench_kernel(rows, n_in, tokens, iters, threads, format,
+                                row_major ? BenchLayout::split_row : BenchLayout::split_tensor,
+                                cores);
+        },
+        py::arg("rows"), py::arg("n_in"), py::arg("tokens"), py::arg("iters") = 1,
+        py::arg("format") = "q4", py::arg("threads") = 1, py::arg("cores") = "performance",
+        py::arg("row_major") = true);
 }

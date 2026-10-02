@@ -20,6 +20,18 @@ ranged 40–70 tok/s, and medians taken minutes apart have differed by 75%.
 - [ ] Other programs closed; OneDrive, Windows Update and search indexing paused.
 - [ ] Nothing else of yours running: the engine pins threads to the performance cores and spins on
       them, so a background build will show up in the numbers.
+- [ ] **Cool.** Not at the end of a long session. This is not only about absolute tokens per second:
+      v(k) itself reads differently on a hot machine, because throttling cuts the clock and so the
+      arithmetic, while leaving the memory bandwidth alone -- a one-token pass is bandwidth-bound and
+      a k-token pass is compute-bound, so heat makes the curve look steeper. The same 4B measured
+      70.6 ms a step early in a session and 99.0 ms after hours of load, with v(2) reading 1.45 and
+      1.63. Idle for ten or fifteen minutes first.
+- [ ] **Never compare two engine builds by their v(k).** An hour of load between the two measurements
+      swamps anything a kernel change does. Kernel comparisons go through step 3b, which measures the
+      kernels back to back in one process.
+- [ ] Models exported by the **current** build. The file format is at version 4; an older file is
+      refused with a message saying so, but a stale *re-export* is silent, so re-run step 1 after any
+      change to the exporter or the formats.
 
 Everything below writes JSON into `results/`, so a run is reproducible and comparable later.
 
@@ -73,6 +85,12 @@ python scripts/bench_kernel.py --n-in 2560 --max-tokens 8
 A sweep whose weights fit in L1 or L2 is pure instruction throughput, because every weight is
 already in cache. A sweep far larger than L3 pays the memory cost a real decode step pays. The
 difference between the two is how much of v(k) is arithmetic and how much is waiting.
+
+It prints both layouts, the engine's split one and the interleaved baseline it replaced, which makes
+this **the** place to compare kernels: back to back in one process, so an hour of thermal drift
+cannot be mistaken for a change. Pass `threads=6` through the bindings for the question the engine
+cares about -- at one thread the memory system is nowhere near saturated, and a kernel that wins
+there need not win on six.
 
 **What to look for:** operations per multiply-accumulate. One `dpbusd` does 32 of them and two can
 issue per cycle, so a kernel doing nothing else would sit near 0.031. Anything far above that is

@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "specdraft/quant.hpp"  // QK, and the block layouts the formats describe
+
 // Reading the weights file written by python/specdraft/export.py. The file is
 // memory-mapped and never copied: the OS pages weights in as the forward pass touches
 // them, which is also what makes the process start instantly.
@@ -43,16 +45,33 @@ struct ModelConfig {
     uint32_t group_size() const { return num_attention_heads / num_key_value_heads; }
 };
 
+// A quantized tensor is stored as two regions rather than one array of blocks: every row's scales
+// first, then every row's quantized bytes. The kernels need eight consecutive scales to convert in
+// one instruction, which interleaved blocks cannot give them. `data` points at the first region, or
+// at the values themselves for fp32 and i32; `qs` points at the second, and is null for those.
 struct Tensor {
     const void* data = nullptr;
+    const void* qs = nullptr;
     Format format = Format::fp32;
     uint32_t rows = 0;
     uint32_t cols = 1;  // 1 for vectors
     size_t nbytes = 0;
 
+    bool quantized() const { return format == Format::q4 || format == Format::q8; }
+    uint32_t blocks_per_row() const { return cols / QK; }
+    size_t qs_bytes_per_row() const { return format == Format::q4 ? blocks_per_row() * (QK / 2)
+                                                                 : blocks_per_row() * QK; }
+
     size_t stride() const { return row_bytes(format, cols); }
+    // For fp32 and i32 only; a quantized row needs the two accessors below.
     const void* row(uint32_t index) const {
         return static_cast<const uint8_t*>(data) + static_cast<size_t>(index) * stride();
+    }
+    const uint16_t* row_scales(uint32_t index) const {
+        return static_cast<const uint16_t*>(data) + static_cast<size_t>(index) * blocks_per_row();
+    }
+    const void* row_qs(uint32_t index) const {
+        return static_cast<const uint8_t*>(qs) + static_cast<size_t>(index) * qs_bytes_per_row();
     }
 };
 

@@ -83,9 +83,12 @@ float dot_q4_a8(const BlockQ4* w, const BlockA8* x, int nblocks);
 float dot_q8_a8(const BlockQ8* w, const BlockA8* x, int nblocks);
 
 // One weight row against k activation vectors, unpacking each weight block once and reusing
-// it for every token. This is the kernel that decides v(k): the cost of verifying γ+1
-// guesses relative to producing one token. Reading the weights is what a single token's step
-// is made of, so k tokens that share those reads cost far less than k separate steps.
+// it for every token.
+//
+// **No longer the engine's path.** It was, and the project's v(k) figures up to 2026-10-01 come from
+// it, so it stays as the measured baseline the split-layout kernels below are compared against --
+// `scripts/bench_kernel.py` reports both. It is also a second implementation of the same arithmetic,
+// which is worth having when the other one is the one in use.
 //
 // Activations are laid out as k consecutive vectors of `nblocks` blocks each; `out` receives
 // one float per token. Each token accumulates in exactly the order the single-token kernel
@@ -94,29 +97,61 @@ float dot_q8_a8(const BlockQ8* w, const BlockA8* x, int nblocks);
 void dot_q4_a8_multi(const BlockQ4* w, const BlockA8* x, int nblocks, int k, float* out);
 void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, float* out);
 
-// ---------------------------------------------------------------------- the SoA prototype
+// ------------------------------------------------------------------- the layout the engine uses
 //
-// A measurement, not yet the engine's path. The kernels above are limited by the ports that issue
-// dpbusd, and each block spends about five such operations to perform one multiply-accumulate
-// instruction: the sign trick costs two, and converting and applying the block scale costs three.
-// Both are avoidable, but only if the block scales and the quantized bytes live in separate arrays:
+// The kernels above keep each block's scale next to its quantized bytes, which is how the file
+// stores them and how ggml lays out q4_0. It is the wrong shape for the processor. Those kernels are
+// limited by the ports that issue dpbusd, and measurement put each block at about five such
+// operations to perform one multiply-accumulate instruction: two for the sign trick, three to
+// convert the fp16 scale, multiply it by the activation scale and broadcast the result. Both costs
+// disappear once the scales and the quantized bytes live in separate arrays:
 //
 //   * eight fp16 scales convert in one vcvtph2ps instead of eight scalar conversions, and the eight
 //     per-block products apply with one multiply and one fmadd, after reducing eight blocks worth
 //     of int32 accumulators into a single vector in block order;
-//   * the sign trick gives way to the identity sum((q - 8) * x) = sum(q * x) - 8 * sum(x), which
-//     lets the raw nibbles be the unsigned operand. The correction costs nothing in the loop: the
-//     accumulator is seeded with a precomputed per-lane bias instead of with zero.
+//   * the sign trick gives way to the identity sum((q - z) * x) = sum(q * x) - z * sum(x), for the
+//     format's zero point z, which lets the raw bytes be dpbusd's unsigned operand. The correction
+//     costs nothing in the loop, because the accumulator starts at a precomputed per-lane bias
+//     instead of at zero.
 //
-// Laid out as w_scales[nblocks], w_qs[nblocks * 16], x_scales[tokens * nblocks],
-// x_qs[tokens * nblocks * 32] and x_bias[tokens * nblocks * 8], where x_bias holds -8 times the sum
-// of the four activations in each of dpbusd's eight int32 lanes.
+// Measured at 1.3x to 1.8x the interleaved kernels, and slightly more accurate, since grouping eight
+// blocks shortens the float accumulation chain. Model files from version 4 on store this layout, so
+// the engine maps it and never repacks; the quantization itself is unchanged, which is why every
+// byte-exactness test against the Python mirror still applies to both.
 //
-// If this wins, the model file gains a version with this layout. The quantization itself is
-// unchanged either way, so every byte-exactness test against the Python mirror still applies.
+// A row of `nblocks` blocks is a pair of arrays: `scales[nblocks]`, and `qs` holding 16 bytes a
+// block for q4 or 32 for q8. Activations are the same plus a bias: `x_bias[nblocks * 8]` holds
+// -z times the sum of the four activations in each of dpbusd's eight int32 lanes.
+
+// Quantize one activation vector straight into that layout. `zero_point` is the weight format's:
+// 8 for q4 nibbles, 128 for q8 bytes. It belongs to the weights rather than the activations, but
+// the bias is a property of the activations, so the caller passes the one its matmul needs.
+void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_t* qs,
+                     int32_t* bias);
+
+// Rearrange one interleaved row into the split layout. The exporter does this in Python; these
+// exist so tests can drive the kernels from the same blobs the other bindings take.
 void repack_q4_soa(const BlockQ4* blocks, int nblocks, uint16_t* scales, uint8_t* qs);
-void repack_a8_soa(const BlockA8* blocks, int nblocks, float* scales, int8_t* qs, int32_t* bias);
-void dot_q4_a8_soa(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
-                   const int8_t* x_qs, const int32_t* x_bias, int nblocks, int tokens, float* out);
+void repack_q8_soa(const BlockQ8* blocks, int nblocks, uint16_t* scales, int8_t* qs);
+void repack_a8_soa(const BlockA8* blocks, int nblocks, int zero_point, float* scales, int8_t* qs,
+                   int32_t* bias);
+
+void dequantize_q4_soa(const uint16_t* scales, const uint8_t* qs, int n, float* out);
+void dequantize_q8_soa(const uint16_t* scales, const int8_t* qs, int n, float* out);
+
+// One weight row against k activation vectors, in the split layout. Tokens are computed one after
+// another over a row that a single pass has already brought into L1, so the weights are read from
+// memory once however large k is -- and a k-token pass is bit-identical to k single-token passes by
+// construction rather than by agreement between two kernels.
+void dot_q4_soa_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
+                      const int8_t* x_qs, const int32_t* x_bias, int nblocks, int k, float* out);
+void dot_q8_soa_multi(const uint16_t* w_scales, const int8_t* w_qs, const float* x_scales,
+                      const int8_t* x_qs, const int32_t* x_bias, int nblocks, int k, float* out);
+
+// The reference the SIMD versions are tested against.
+float dot_q4_soa_scalar(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
+                        const int8_t* x_qs, const int32_t* x_bias, int nblocks);
+float dot_q8_soa_scalar(const uint16_t* w_scales, const int8_t* w_qs, const float* x_scales,
+                        const int8_t* x_qs, const int32_t* x_bias, int nblocks);
 
 }  // namespace specdraft

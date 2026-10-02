@@ -9,7 +9,14 @@ The layout is fixed-size binary so the engine can read it with ``memcpy`` and no
                        | uint64 offset | uint64 nbytes
     ...  tensor payloads, each at a 64-byte aligned offset
 
-Two things happen here beyond quantizing:
+A quantized payload is **not** an array of blocks. Every row's fp16 scales come first, then every
+row's quantized bytes -- the same bytes an interleaved layout holds, rearranged. The engine's kernels
+convert eight consecutive scales in a single instruction, which they cannot do when each scale sits
+between its neighbours' quantized bytes, and that is worth 1.3x to 1.8x on the kernel. ``quant.py``
+still produces and consumes the interleaved form, which is what ggml's q4_0 uses and what the
+byte-exactness tests pin; ``split_blocks`` is the only thing between the two.
+
+Three things happen here beyond quantizing:
 
 * **Matrices are fused.** Q, K and V become one matrix and gate and up become another. Each
   output row is still an independent dot product, so the arithmetic is unchanged, but the
@@ -32,7 +39,7 @@ from . import quant
 from .reference import Qwen3Config
 
 MAGIC = b"SDM2"
-VERSION = 3
+VERSION = 4
 HEADER_BYTES = 128
 DIRECTORY_ENTRY_BYTES = 72
 NAME_BYTES = 40
@@ -69,6 +76,21 @@ class TensorEntry:
     nbytes: int
 
 
+def split_blocks(blob: bytes, block_bytes: int) -> bytes:
+    """Rearrange interleaved quantized blocks into a scales region then a bytes region.
+
+    The quantizers produce ggml's shape, each block's fp16 scale immediately before its quantized
+    bytes. The engine's kernels want eight consecutive scales so they convert in one instruction, so
+    the file stores all the scales first and all the bytes after. The same bytes either way, and
+    nothing about the quantization changes -- only where each piece sits.
+    """
+    raw = np.frombuffer(blob, dtype=np.uint8)
+    if raw.size % block_bytes != 0:
+        raise ValueError(f"{raw.size} bytes is not a whole number of {block_bytes}-byte blocks")
+    blocks = raw.reshape(-1, block_bytes)
+    return blocks[:, :2].tobytes() + blocks[:, 2:].tobytes()
+
+
 def _encode(array: np.ndarray, fmt: str) -> bytes:
     if fmt == "i32":
         return np.ascontiguousarray(array, dtype=np.int32).tobytes()
@@ -76,10 +98,22 @@ def _encode(array: np.ndarray, fmt: str) -> bytes:
     if fmt == "fp32":
         return array.tobytes()
     if fmt == "q4":
-        return quant.quantize_q4(array)
+        return split_blocks(quant.quantize_q4(array), quant.BLOCK_BYTES["q4"])
     if fmt == "q8":
-        return quant.quantize_q8(array)
+        return split_blocks(quant.quantize_q8(array), quant.BLOCK_BYTES["q8"])
     raise ValueError(f"unknown format {fmt!r}; expected one of {WEIGHT_FORMATS}")
+
+
+def join_blocks(blob: bytes, block_bytes: int) -> bytes:
+    """Inverse of ``split_blocks``: the interleaved form the quantizers and ggml use."""
+    raw = np.frombuffer(blob, dtype=np.uint8)
+    payload = block_bytes - 2
+    if raw.size % block_bytes != 0:
+        raise ValueError(f"{raw.size} bytes is not a whole number of {block_bytes}-byte blocks")
+    count = raw.size // block_bytes
+    scales = raw[: count * 2].reshape(count, 2)
+    values = raw[count * 2 :].reshape(count, payload)
+    return np.concatenate([scales, values], axis=1).tobytes()
 
 
 def decode(blob: bytes, fmt: str, shape: tuple[int, ...]) -> np.ndarray:
@@ -89,9 +123,9 @@ def decode(blob: bytes, fmt: str, shape: tuple[int, ...]) -> np.ndarray:
     if fmt == "fp32":
         values = np.frombuffer(blob, dtype=np.float32)
     elif fmt == "q4":
-        values = quant.dequantize_q4(blob)
+        values = quant.dequantize_q4(join_blocks(blob, quant.BLOCK_BYTES["q4"]))
     elif fmt == "q8":
-        values = quant.dequantize_q8(blob)
+        values = quant.dequantize_q8(join_blocks(blob, quant.BLOCK_BYTES["q8"]))
     else:
         raise ValueError(f"unknown format {fmt!r}")
     return values.reshape(shape)

@@ -28,25 +28,42 @@ import numpy as np
 from specdraft import _engine as cpp
 
 
-def time_forward(model, tokens: int, context: int, samples: int, inner: int = 4) -> float:
-    """Median seconds for one forward pass over `tokens` tokens at a fixed context."""
-    batch = np.array([7] * tokens, dtype=np.int32)
-    model.reset()
-    if context:
-        model.forward(np.array([5] * context, dtype=np.int32))
+def time_passes(jobs: list[tuple], context: int, samples: int, inner: int = 4) -> dict:
+    """Median seconds per forward pass for each job, with the jobs interleaved.
 
-    for _ in range(2):  # warm up
-        model.set_pos(context)
-        model.forward(batch)
+    A job is ``(label, model, tokens)``. Measuring every sample of one k before moving to the next
+    lets a drifting clock masquerade as a change in v(k), and on this machine it does: a sweep taken
+    that way came out non-monotonic, k=4 cheaper than k=3, which is impossible for the same work plus
+    one more token. Rotating through the jobs spreads a drift over all of them, which is plan
+    section 13's rule about interleaving configurations.
 
-    timings = []
+    What interleaving does *not* buy is independence from the machine's state, and it is tempting to
+    think it does, v(k) being a ratio. Throttling cuts the clock, which governs the arithmetic, and
+    leaves the memory bandwidth alone; a one-token pass is bandwidth-bound while a k-token pass is
+    compute-bound, so a hot machine reports a steeper curve. Take this measurement cool.
+    """
+    batches = {label: np.array([7] * tokens, dtype=np.int32) for label, _, tokens in jobs}
+    prepared = set()
+    for label, model, _ in jobs:
+        if id(model) not in prepared:
+            model.reset()
+            if context:
+                model.forward(np.array([5] * context, dtype=np.int32))
+            prepared.add(id(model))
+        for _ in range(2):  # warm up this shape
+            model.set_pos(context)
+            model.forward(batches[label])
+
+    timings: dict = {label: [] for label, _, _ in jobs}
     for _ in range(samples):
-        started = time.perf_counter()
-        for _ in range(inner):
-            model.set_pos(context)  # the cached prefix stays valid; only the tail is rewritten
-            model.forward(batch)
-        timings.append((time.perf_counter() - started) / inner)
-    return statistics.median(timings)
+        for label, model, _ in jobs:
+            batch = batches[label]
+            started = time.perf_counter()
+            for _ in range(inner):
+                model.set_pos(context)  # the cached prefix stays valid; only the tail is rewritten
+                model.forward(batch)
+            timings[label].append((time.perf_counter() - started) / inner)
+    return {label: statistics.median(values) for label, values in timings.items()}
 
 
 def tau(alpha: float, gamma: int) -> float:
@@ -86,9 +103,16 @@ def main() -> None:
     print(f"target {args.target.name}: {target.threads} threads on {target.core_selection} cores, "
           f"context {args.context}")
 
-    costs = {}
-    for k in range(1, args.max_k + 1):
-        costs[k] = time_forward(target, k, args.context, args.samples)
+    # The draft joins the rotation rather than being timed afterwards, so c is a ratio taken under
+    # the same conditions as v(k) -- and so that the draft's weights compete for cache with the
+    # target's, which is what happens during real speculative decoding.
+    draft = open_model(args.draft) if args.draft is not None else None
+    jobs = [(k, target, k) for k in range(1, args.max_k + 1)]
+    if draft is not None:
+        jobs.append(("draft", draft, 1))
+    measured = time_passes(jobs, args.context, args.samples)
+
+    costs = {k: measured[k] for k in range(1, args.max_k + 1)}
     single = costs[1]
 
     print(f"\none target step: {single * 1e3:.2f} ms  ({1 / single:.1f} tok/s)")
@@ -107,12 +131,9 @@ def main() -> None:
         "pass_seconds": {str(k): seconds for k, seconds in costs.items()},
         "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    del target
-
     draft_step = 0.0
-    if args.draft is not None:
-        draft = open_model(args.draft)
-        draft_step = time_forward(draft, 1, args.context, args.samples)
+    if draft is not None:
+        draft_step = measured["draft"]
         del draft
         c = draft_step / single
         record["draft"] = str(args.draft)
@@ -155,6 +176,9 @@ def main() -> None:
         # took beyond that is overhead. Differencing two runs was tried first and failed, because
         # this machine's run-to-run variance is larger than the quantity being measured.
         gamma = min(args.overhead_gamma, args.max_k - 1)
+        # Reopened: the round loop needs both models timing-enabled, and closing them first keeps
+        # one 4B in memory rather than two, with one thread pool rather than two spinning.
+        del target
         target = open_model(args.target)
         draft = open_model(args.draft)
         for model in (target, draft):

@@ -261,3 +261,78 @@ def test_bench_dot_soa_reports_the_same_work_as_the_interleaved_one():
     assert soa["macs"] == aos["macs"]
     assert soa["weight_bytes"] == aos["weight_bytes"]  # the same 18 bytes a block, in two arrays
     assert soa["seconds"] > 0.0
+
+
+# ------------------------------------------------- activations in the layout the engine's kernels read
+#
+# quantize_a8_soa is a second implementation of quantize_a8's arithmetic writing to a different
+# shape. If the two ever disagree the engine stops matching the PyTorch twin, and the twin is what
+# every offline acceptance number is scored through, so pin them together.
+
+
+def split_a8(blob: bytes):
+    """The scales and the quantized bytes of an interleaved a8 blob."""
+    raw = np.frombuffer(blob, dtype=np.uint8).reshape(-1, 36)
+    scales = raw[:, :4].copy().view(np.float32).ravel()
+    qs = raw[:, 4:].copy().view(np.int8).ravel()
+    return scales, qs
+
+
+@pytest.mark.parametrize("kind", ["normal", "uniform", "spiky", "ties"])
+@pytest.mark.parametrize("n", [32, 256, 2560])
+def test_soa_activation_quantizer_agrees_byte_for_byte(kind, n):
+    x = sample(kind, n, 1.0, seed=50)
+    want_scales, want_qs = split_a8(pyq.quantize_a8(x))
+    got = cpp.quantize_a8_soa(x, 8)
+
+    assert np.array_equal(got["qs"], want_qs)
+    assert np.array_equal(got["scales"], want_scales)
+
+
+@pytest.mark.parametrize("zero_point", [8, 128])
+def test_soa_activation_bias_is_the_lane_sums(zero_point):
+    x = sample("normal", 256, 1.0, seed=51)
+    got = cpp.quantize_a8_soa(x, zero_point)
+    # dpbusd accumulates four byte products into each of eight int32 lanes, so the correction for
+    # the weights being stored `zero_point` too large is split the same way.
+    lanes = got["qs"].astype(np.int32).reshape(-1, 8, 4).sum(axis=2)
+    assert np.array_equal(got["bias"].reshape(-1, 8), -zero_point * lanes)
+
+
+@pytest.mark.parametrize("n", [32, 288, 2560])
+@pytest.mark.parametrize("tokens", [1, 3])
+def test_soa_q8_kernel_matches_the_exact_reference(n, tokens):
+    w = sample("normal", n, 1.0, seed=52)
+    vectors = [sample("normal", n, 0.5, seed=53 + i) for i in range(tokens)]
+    w_blob = pyq.quantize_q8(w)
+    blobs = [pyq.quantize_a8(v) for v in vectors]
+
+    wq = pyq.dequantize_q8(w_blob).astype(np.float64)
+    exact = np.array([wq @ pyq.dequantize_a8(b).astype(np.float64) for b in blobs])
+    tolerance = 1e-6 * float(np.abs(wq).sum()) * 0.5
+
+    got = cpp.dot_q8_a8_soa(w_blob, b"".join(blobs))
+    assert got.shape == (tokens,)
+    assert np.abs(got - exact).max() <= tolerance
+
+
+@pytest.mark.parametrize("weight_fmt", ["q4", "q8"])
+def test_the_two_layouts_agree(weight_fmt):
+    """The split and interleaved kernels are independent implementations of one computation."""
+    n = 2560
+    w = sample("normal", n, 1.0, seed=54)
+    w_blob = _PY_QUANTIZE[weight_fmt](w)
+    vectors = [sample("normal", n, 0.5, seed=55 + i) for i in range(4)]
+    blobs = [pyq.quantize_a8(v) for v in vectors]
+    joined = b"".join(blobs)
+
+    split = getattr(cpp, f"dot_{weight_fmt}_a8_soa")(w_blob, joined)
+    interleaved = getattr(cpp, f"dot_{weight_fmt}_a8_multi")(w_blob, joined)
+
+    # Not bit-identical: the split kernel groups eight blocks before adding in float, a different
+    # summation order -- and a shorter one, so if anything the more accurate of the two. The tolerance
+    # has to scale with the terms being summed rather than with the answer, which for a dot product of
+    # independent signs is far smaller than the terms and tells you nothing about the rounding.
+    wq = _PY_DEQUANTIZE[weight_fmt](w_blob).astype(np.float64)
+    terms = float(np.abs(wq).sum()) * 0.5
+    assert np.abs(split - interleaved).max() <= 1e-6 * terms

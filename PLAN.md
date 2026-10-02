@@ -12,6 +12,7 @@ their own. Section 17 tracks decisions and open questions.
 
 | Date | Where things stand |
 |---|---|
+| 2026-10-02 | **The engine's kernel is rewritten and the file format is at version 4.** Quantized tensors are stored as a scales region then a bytes region, so eight fp16 scales convert in one instruction and the sign trick gives way to the offset identity; `dot_q4_soa_multi` and `dot_q8_soa_multi` are the engine's kernels, with the interleaved ones kept as the measured baseline. Measured back to back at six pinned cores over a 192 MB working set, the new layout wins at every k: 1.13x at k=1, 1.32x at k=2, 1.16x at k=4, 1.42x at k=8, reaching 32.8 GB/s of a 35-39 GB/s ceiling at k=1. Per-tensor and per-row splitting proved indistinguishable, so no second format change. Getting there needed two corrections to my own instruments: the threaded comparison gave every worker its own cache line (without it, six workers wrote inside one line and the table read as eightfold layout differences that reversed with k), and measure_vk now interleaves the k values instead of taking all samples of one before the next (without it a sweep came out non-monotonic, k=4 cheaper than k=3). The broader lesson is in §13: **v(k) is not drift-resistant**, since throttling cuts the clock and so the arithmetic but not the bandwidth, making a hot machine report a steeper curve -- the same 4B read 70.6 and 99.0 ms a step hours apart. Kernel comparisons belong in `bench_kernel.py`, never in a before-and-after of the model. 691 tests pass. |
 | 2026-10-01 | **Milestone 5 built, and the evaluation harness with it.** Distillation exists end to end: five losses with a chunked form that keeps a 151,669-token vocabulary in memory, a trainable draft that reuses the verified reference forward pass, the training loop (teacher as a callable, so the full-precision target, the 4-bit twin or cached logits all fit), the data pipeline with 13-gram decontamination, and runnable scripts for both. An integration test trains a miniature Qwen3 carrying the real tokenizer, saves it, exports it and runs it in the engine. Spec-Bench harness runs target-alone, the draft, prompt lookup and early stopping, interleaved, into a per-category table. Layer pruning scores and cuts layers; see §11.7 for what that measured. 620 tests pass. Remaining before results: the 4B target, then the grid. |
 | 2026-10-01 | **The real numbers for the real pair, and they say the kernel is the problem.** Acceptance of the off-the-shelf Qwen3-0.6B against Qwen3-4B, both 4-bit, greedy, scored offline over 1,318 response positions from 24 Spec-Bench prompts: **alpha = 0.711**, by category 0.80 math_reasoning, 0.73 multiturn, 0.72 rag, 0.72 translation, 0.69 summarization, 0.61 qa. That is a healthy baseline before any distillation. With the measured v(k), c = 0.220 and o = 0.080 it predicts **0.98x at gamma = 1** -- speculation loses by 2%. Break-even needs alpha >= 0.75, which distillation can reach; 1.2x would need alpha >= 0.93, which it cannot. At the bandwidth floor the *same* alpha gives 1.92x at gamma = 3, so the missing factor of two is entirely the k-token kernel, which a microbenchmark shows running at 8-11% of AVX-VNNI peak **with every weight in L1** -- instruction-bound, not memory-starved. See §3 and §10.1. Also fixed a bug in my own harness: the per-stage breakdown counted a 128-token prefill among its tokens, which made the output projection look like 2.9% of a step against 9.7% of the bytes, i.e. 104 GB/s on a machine that measures 39. It is 7.5% once the prefill is excluded. 656 tests pass. |
 | 2026-10-01 | **Milestone 4 core done.** The k-token kernel shares one pass over the weights across the tokens being verified, and is bit-identical to calling the single-token kernel once per token (tested for 1–13 tokens, across tile boundaries). The forward pass is now batched to match. The decoding loops moved into C++ — sampling warps, a seeded xoshiro generator, the acceptance rule and the round loop — so Python overhead never lands in a timing. Greedy output from the C++ loop matches both plain decoding and the Python loop token for token; its sampling passes the same chi-square over every two-token continuation. First v(k) numbers for the 0.6B at context 128: v(2) ≈ 2.1 falling to v(5) ≈ 3.1, i.e. per-token cost inside a pass drops from 19.5 ms to about 11.5 ms. **Verification is not nearly free for a 0.6B**, because its weights are small next to its arithmetic; the 4B is where the term should flatten, and that needs the 4B downloaded. 507 tests pass. |
@@ -473,6 +474,13 @@ Expect the 0.6B to lose more at 4-bit. That result feeds the choice of draft pre
 - **File layout:** one binary file. It starts with a header (magic number, version, config, and a tensor
   directory giving each tensor's name, format, shape and offset). The data follows at **64-byte-aligned offsets**.
   C++ memory-maps it (`CreateFileMapping`/`MapViewOfFile`).
+- **A quantized payload is not an array of blocks** (version 4 on). Every row's fp16 scales come first, then every
+  row's quantized bytes. The kernels convert eight consecutive scales in one instruction, which they cannot do
+  while each scale sits between its neighbours' bytes, and that is worth 1.13x to 1.42x (§10.1). `quant.py` still
+  produces and consumes the interleaved form, which is ggml's q4_0 shape and what the byte-exactness tests pin;
+  `export.split_blocks` is the only thing between the two, so the GGUF path stays open. The engine maps the file
+  and never repacks, which is why this is a format change rather than a load-time one: repacking 2.3 GB on every
+  open would cost both the start-up time and the file-backed pages.
 - **Test:** reload the file in Python, dequantize it, and compare with the twin's weights (they must be exact).
 
 **Done when:** the reference matches Hugging Face, the perplexity table exists, and export round-trips byte for
@@ -735,6 +743,67 @@ where each result is:
 > absolute terms, and speculative decoding worth about 1.25-1.3x** at the acceptance rate already
 > measured -- with distillation on top of that, not instead of it.
 >
+> **Adopted, 2026-10-01: changes 1, 2 and 4 are in the engine, and the question they raised needed a
+> better instrument to answer.** Model files are version 4, storing each quantized tensor as a scales
+> region followed by a bytes region; `dot_q4_soa_multi` and `dot_q8_soa_multi` are the engine's kernels.
+> The quantization is untouched, so the Python mirror and every byte-exactness test still apply; version 3
+> files are refused with a message saying to re-export, since the bytes moved.
+>
+> The single-thread prototype measured 1.3x to 1.8x, and the first model-level measurement after adopting
+> it looked like a *regression* -- 96.6 ms a step against 84.3 ms for the interleaved kernel earlier in the
+> session. The control said not to believe it: the `attention` stage, which touches none of this, had also
+> slowed by 36%. Hence the rules now in §13, and a threaded mode in `bench_kernel.py` so the comparison can
+> be made properly -- back to back, layouts interleaved, at six pinned cores, with a 192 MB working set so
+> the memory system is the constraint it is in the engine:
+>
+> | k | interleaved | split, per tensor | split, per row | best |
+> |---|---|---|---|---|
+> | 1 | 51.7 GMAC/s (29.1 GB/s) | 58.3 (32.8) | 57.2 (32.2) | **1.13x** |
+> | 2 | 71.1 (20.0) | 93.3 (26.2) | 94.1 (26.5) | **1.32x** |
+> | 4 | 108.1 (15.2) | 125.2 (17.6) | 121.5 (17.1) | **1.16x** |
+> | 8 | 90.6 (6.4) | 128.5 (9.0) | 125.4 (8.8) | **1.42x** |
+>
+> So the split layout wins at six threads too, by 1.13x to 1.42x. Two things in that table are worth
+> keeping. At k = 1 it reaches 32.8 GB/s against the 35-39 GB/s this machine measures, so a single-token
+> pass is genuinely bandwidth-bound and the new layout's gain there is simply reaching more of the
+> bandwidth, not doing less work. And **per-tensor and per-row splitting are indistinguishable**, which
+> settles a worry worth having had: a row's scales and its bytes end up megabytes apart in the per-tensor
+> layout, giving each thread two streams instead of one, and that costs nothing measurable. No second
+> format change needed.
+>
+> One cost found and left alone for now: quantizing activations is 5.1 ms a token for the 4B and runs on a
+> single thread, about 6% of a step. It is now the largest unparallelized piece of a forward pass. Folding
+> the per-lane bias in cost nothing -- the loop measured 0.97x the old quantizer, inside the noise.
+>
+> **Measured, 2026-10-02: the model-level confirmation, and a reading on when to believe one.** The
+> single-threaded decode went **2.8 to 4.6 tok/s, 1.64x**, against the microbenchmark's 1.69x at one
+> thread -- the two instruments agree. The six-core figure cannot be compared today: it reads 10.5
+> tok/s against a 12.4 tok/s baseline, but at an **interquartile range of 58%** where the baseline's was
+> 5%, and §13's rule is that overlapping ranges are not a difference. The stage totals, with the prefill
+> now correctly excluded from both, went 84.3 ms to 79.8 ms a token.
+>
+> What made the machine untrustworthy is worth knowing, because it is visible in a number that has
+> nothing to do with the kernel: **dispatch overhead went from 1.16 us to 5.11 us per parallel job**, and
+> the measured read bandwidth from 39.5 to 38.4 GB/s. A browser and half a dozen background agents were
+> running. The engine spins on pinned cores through something like 180 barriers a token, so a process
+> that wakes occasionally does not slow it a little -- it holds up a barrier, and the interquartile range
+> goes to 58%. **Dispatch overhead is the cheap check for whether the machine is fit to measure on**, and
+> it is in every `bench_engine.py` record.
+>
+> The three results are consistent once the regimes are separated. A single-token step at six cores is
+> bandwidth-bound -- 32.8 of 38.4 GB/s -- so cheaper arithmetic buys it little, about 5%. At one thread,
+> bandwidth is nowhere near the limit, so the full 1.64x shows. And a k-token pass at six cores is
+> compute-bound, which is where the 1.16x to 1.42x lands. **That last regime is the one speculative
+> decoding lives in**: the gain falls on the verification passes rather than on the step they are
+> measured against, which is exactly what flattens v(k).
+>
+> Outstanding: v(k) itself still wants a quiet machine. The runs taken today put v(2) at 1.44 and 1.63 on
+> the same build, so the curve is not yet pinned down well enough to compare against the 1.45 the
+> interleaved kernel gave.
+
+> Change 3, register blocking over output rows, is **not** done; it is what the §3 table says is needed to
+> reach a useful speedup.
+
 > Changes 2 to 4 alter neither what is summed nor in what order. Change 1 does reorder the float
 > accumulation — eight blocks are reduced before scaling rather than after — so it changes results in
 > the last bits. That is allowed, but only if the single-token and k-token kernels are changed
@@ -792,6 +861,15 @@ The caller stops at an end-of-sequence token, even one that lands inside an acce
    the engine's accepted counts, apart from documented near-ties between twin and engine.
 5. **Edge cases:** end-of-sequence inside an accepted block; `max_new_tokens` reached mid-round; γ = 1; several
    all-accepted rounds in a row.
+
+> **Note, 2026-10-01: test 1 now holds by construction, which is a reason to keep testing it rather than to
+> stop.** The engine's kernel computes a k-token pass as k single-token passes over a row that the first token
+> has already pulled into L1 -- eight accumulators and the unpack temporaries fill the registers, leaving no
+> room to share the unpack across a tile, and measurement said sharing it was worth only 24% anyway. So "a
+> k-token pass equals k single-token passes" is no longer two kernels agreeing by convention; it is the same
+> code path. The test stays because the property is what greedy speculative decoding rests on, and the next
+> change to the kernel -- register blocking over output rows -- will reintroduce exactly the kind of sharing
+> that can break it.
 
 ```python
 import torch
@@ -1107,6 +1185,26 @@ verification and distilled a quantization-matched 0.6B draft, speeding up Qwen3-
 > interquartile range beside them, and **overlapping ranges read as no difference**. Per-token latency percentiles
 > are more informative than averages here, because the averages are dragged around by the tail. An optimization
 > worth less than about 20% cannot be confirmed on this machine without a quieter setup.
+> **Measured, 2026-10-01: v(k) is not drift-resistant, which invalidates the obvious way to compare two
+> kernels.** The appealing argument is that v(k) = pass(k) / pass(1) is a ratio taken inside one run, so a
+> drifting clock cancels. It does not. Throttling cuts the clock, and the clock governs the *arithmetic*;
+> the memory bandwidth it does not govern. A single-token pass is bandwidth-bound and a k-token pass is
+> compute-bound, so heat slows the numerator more than the denominator and **a hot machine reports a
+> steeper v(k)**. The same 4B measured 70.6 ms a step early in a session and 99.0 ms after hours of load,
+> and its v(2) read 1.45 and 1.63 -- the second from the faster of the two kernels.
+>
+> Two rules follow. **Take v(k) on a cool machine**, after idling, not at the end of a long session; and
+> **never compare two kernels through the model's v(k)**. Kernel comparisons belong in
+> `scripts/bench_kernel.py`, which measures the kernels back to back inside one process with the layouts
+> interleaved, at the thread count the engine uses. A model-level before-and-after separated by an hour of
+> load measures the hour, not the change.
+>
+> A third rule, learned the hard way in that same harness: **give every worker its own cache line.** The
+> first version of the threaded comparison had each worker write its results into `out[worker * tokens]`,
+> so at k = 1..8 all six wrote inside one 64-byte line and every row invalidated it in the other five
+> cores. The numbers it produced were not merely noisy but *plausible-looking nonsense* -- one layout
+> eightfold slower at k=2 and faster at k=4 -- and the fix changed every figure in the table.
+
 - **Throttling:** laptops slow down as they heat up. Report sustained speed after a minute of load, not the first
   few seconds. Log CPU clocks and temperatures (e.g., with HWiNFO).
 - **Runs:** run each configuration several times and report the median and interquartile range. Use identical

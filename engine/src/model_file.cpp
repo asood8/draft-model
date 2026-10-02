@@ -21,7 +21,10 @@ namespace {
 
 // Must match python/specdraft/export.py.
 constexpr char MAGIC[4] = {'S', 'D', 'M', '2'};
-constexpr uint32_t VERSION = 3;
+// 4 split each quantized tensor into a scales region and a bytes region, which is the layout the
+// kernels read. Nothing about the quantization changed, but the bytes moved, so version 3 files
+// have to be re-exported rather than silently misread.
+constexpr uint32_t VERSION = 4;
 constexpr size_t HEADER_BYTES = 128;
 constexpr size_t ENTRY_BYTES = 72;
 constexpr size_t NAME_BYTES = 40;
@@ -167,7 +170,10 @@ ModelFile ModelFile::open(const std::string& path) {
     }
     const uint32_t version = read_at<uint32_t>(base, 4);
     if (version != VERSION) {
-        throw std::runtime_error("unsupported model file version " + std::to_string(version));
+        throw std::runtime_error("model file version " + std::to_string(version) + ", expected " +
+                                std::to_string(VERSION) +
+                                (version < VERSION ? "; re-export it with scripts/export_model.py"
+                                                   : ""));
     }
     const uint32_t count = read_at<uint32_t>(base, 8);
     const uint32_t data_start = read_at<uint32_t>(base, 12);
@@ -207,6 +213,25 @@ ModelFile ModelFile::open(const std::string& path) {
             throw std::runtime_error(std::string("tensor ") + name + " runs past the end of " + path);
         }
         tensor.data = base + offset;
+        if (tensor.quantized()) {
+            if (tensor.cols % QK != 0) {
+                throw std::runtime_error(std::string("tensor ") + name + " has " +
+                                        std::to_string(tensor.cols) +
+                                        " columns, not a whole number of blocks");
+            }
+            // The scales region comes first, then the quantized bytes; together they are exactly
+            // the interleaved size, so a mismatch means the file was written by another layout.
+            const size_t scale_bytes =
+                static_cast<size_t>(tensor.rows) * tensor.blocks_per_row() * sizeof(uint16_t);
+            const size_t expected =
+                scale_bytes + static_cast<size_t>(tensor.rows) * tensor.qs_bytes_per_row();
+            if (tensor.nbytes != expected) {
+                throw std::runtime_error(std::string("tensor ") + name + " is " +
+                                        std::to_string(tensor.nbytes) + " bytes, expected " +
+                                        std::to_string(expected));
+            }
+            tensor.qs = base + offset + scale_bytes;
+        }
         file.tensors_.emplace(name, tensor);
     }
     return file;
