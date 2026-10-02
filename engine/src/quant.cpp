@@ -24,6 +24,12 @@ inline int clamp_int(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// Blocks sharing one application of the scales, and also the unit the paired activation layout is
+// built in: only whole groups are paired, so a row whose block count is not a multiple of this keeps
+// its last few blocks in the plain order and the kernel's one-block-at-a-time tail reads them.
+constexpr int kGroup = 8;
+static_assert(kGroup == 8, "the q4 kernel reduces exactly four pair-accumulators with three hadds");
+
 // One accumulator, with an FMA per block. This serializes on the FMA latency, which two
 // accumulators would hide -- but the multi-token kernel has to accumulate in exactly this order for
 // a k-token pass to stay bit-identical to k single-token passes, and it cannot afford two
@@ -305,6 +311,25 @@ float dot_q8_a8(const BlockQ8* w, const BlockA8* x, int nblocks) {
 
 // ------------------------------------------------------------------- the layout the engine uses
 
+// Where block `b`'s value `i` goes in the paired activation layout.
+//
+// The q4 kernel reads two blocks with one 32-byte weight load, because their nibbles are adjacent in
+// the file: masking gives the low nibbles of both blocks in one register and the high nibbles in
+// another. The activations have to be ordered to match, so a pair of blocks is stored as
+//
+//     x[b][0:16]  x[b+1][0:16]  x[b][16:32]  x[b+1][16:32]
+//
+// and the kernel's two loads land on exactly the right bytes. Blocks past the last whole group of
+// eight keep the plain order, since the kernel reads those one at a time. Activations are quantized at
+// every matmul, so this is a runtime layout and the file is unaffected.
+inline size_t paired_index(int b, int i) {
+    const int pair = b / 2;                    // which pair of blocks
+    const int which = b & 1;                   // first or second block of the pair
+    const int half = i / 16;                   // low nibbles or high nibbles
+    return static_cast<size_t>(pair) * 2 * QK + (static_cast<size_t>(half) * 2 + which) * 16 +
+           (i % 16);
+}
+
 void repack_q4_soa(const BlockQ4* blocks, int nblocks, uint16_t* scales, uint8_t* qs) {
     for (int b = 0; b < nblocks; ++b) {
         scales[b] = blocks[b].scale;
@@ -320,13 +345,20 @@ void repack_q8_soa(const BlockQ8* blocks, int nblocks, uint16_t* scales, int8_t*
 }
 
 void repack_a8_soa(const BlockA8* blocks, int nblocks, int zero_point, float* scales, int8_t* qs,
-                   int32_t* offsets) {
+                   int32_t* offsets, bool paired) {
+    const int pairs_end = paired ? nblocks - nblocks % kGroup : 0;
     for (int b = 0; b < nblocks; ++b) {
         scales[b] = blocks[b].scale;
-        std::memcpy(qs + static_cast<size_t>(b) * QK, blocks[b].q, QK);
+        int8_t* flat = qs + static_cast<size_t>(b) * QK;
         int sum = 0;
         for (int i = 0; i < QK; ++i) {
-            sum += blocks[b].q[i];
+            const int8_t q = blocks[b].q[i];
+            if (b < pairs_end) {
+                qs[paired_index(b, i)] = q;
+            } else {
+                flat[i] = q;
+            }
+            sum += q;
         }
         offsets[b] = zero_point * sum;
     }
@@ -358,8 +390,9 @@ void dequantize_q8_soa(const uint16_t* scales, const int8_t* qs, int n, float* o
 }
 
 void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_t* qs,
-                     int32_t* offsets) {
+                     int32_t* offsets, bool paired) {
     const int nblocks = n / QK;
+    const int pairs_end = paired ? nblocks - nblocks % kGroup : 0;  // blocks the kernel pairs up
     for (int b = 0; b < nblocks; ++b) {
         const float* xb = x + static_cast<size_t>(b) * QK;
         float amax = 0.0f;
@@ -371,32 +404,41 @@ void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_
         const float scale = amax / 127.0f;
         const float inv = (scale != 0.0f) ? 1.0f / scale : 0.0f;
         scales[b] = scale;
-        int8_t* bytes = qs + static_cast<size_t>(b) * QK;
-        for (int i = 0; i < QK; ++i) {
-            bytes[i] =
-                static_cast<int8_t>(clamp_int(static_cast<int>(std::rint(xb[i] * inv)), -127, 127));
-        }
-        // The correction for every stored weight being `zero_point` too large. One integer a block,
-        // not one a lane: the kernel reduces its eight accumulators before scaling anyway, so the
-        // correction can be subtracted from the reduced vector, and eight blocks then share one
-        // 32-byte load where per-lane biases needed one each.
+        const bool pair_this = b < pairs_end;
+        int8_t* flat = qs + static_cast<size_t>(b) * QK;
         int sum = 0;
         for (int i = 0; i < QK; ++i) {
-            sum += bytes[i];
+            const int8_t q =
+                static_cast<int8_t>(clamp_int(static_cast<int>(std::rint(xb[i] * inv)), -127, 127));
+            if (pair_this) {
+                qs[paired_index(b, i)] = q;
+            } else {
+                flat[i] = q;
+            }
+            sum += q;
         }
+        // The correction for every stored weight being `zero_point` too large. One integer a block,
+        // not one a lane: the kernel reduces its accumulators before scaling anyway, so the
+        // correction can be subtracted from the reduced vector, and eight blocks then share one
+        // 32-byte load where per-lane biases needed one each.
         offsets[b] = zero_point * sum;
     }
 }
 
 float dot_q4_soa_scalar(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
                         const int8_t* x_qs, const int32_t* x_offsets, int nblocks) {
+    const int pairs_end = nblocks - nblocks % kGroup;  // the paired region, as the quantizer wrote it
     float sum = 0.0f;
     for (int b = 0; b < nblocks; ++b) {
         const uint8_t* w = w_qs + static_cast<size_t>(b) * (QK / 2);
-        const int8_t* x = x_qs + static_cast<size_t>(b) * QK;
+        const bool paired = b < pairs_end;
+        const int8_t* flat = x_qs + static_cast<size_t>(b) * QK;
+        const auto activation = [&](int i) {
+            return paired ? x_qs[paired_index(b, i)] : flat[i];
+        };
         int32_t acc = -x_offsets[b];
         for (int i = 0; i < QK / 2; ++i) {
-            acc += (w[i] & 0x0F) * x[i] + (w[i] >> 4) * x[i + 16];
+            acc += (w[i] & 0x0F) * activation(i) + (w[i] >> 4) * activation(i + 16);
         }
         sum += fp16_to_fp32(w_scales[b]) * x_scales[b] * static_cast<float>(acc);
     }
@@ -420,8 +462,6 @@ float dot_q8_soa_scalar(const uint16_t* w_scales, const int8_t* w_qs, const floa
 
 namespace {
 
-constexpr int kGroup = 8;  // blocks sharing one scale application; also the lanes of one vector
-
 // Eight accumulators reduced to one vector holding one block per lane, in block order. hadd works
 // within each 128-bit half, so three levels of it leave every lane mixing two blocks; the two
 // vperm2i128s put the halves back together, making lane j exactly block j total. Nine instructions
@@ -435,32 +475,6 @@ SD_TARGET_VNNI inline __m256i reduce8(const __m256i* acc) {
     const __m256i u1 = _mm256_hadd_epi32(t2, t3);  // and the upper half over source lanes 4-7
     return _mm256_add_epi32(_mm256_permute2x128_si256(u0, u1, 0x20),
                             _mm256_permute2x128_si256(u0, u1, 0x31));
-}
-
-// The *earlier* arithmetic on the split layout: a scale converted, multiplied and broadcast for every
-// block, and the sign trick instead of the offset identity. It exists only to be measured against the
-// grouped kernel below, because adopting the grouped one came with a model-level slowdown that the
-// isolated benchmarks contradicted, and "arithmetic" and "layout" had to be separated to see which
-// half was responsible. Selected at runtime by set_scale_grouping(false).
-SD_TARGET_VNNI void dot_q4_soa_perblock_one(const uint16_t* w_scales, const uint8_t* w_qs,
-                                            const float* x_scales, const int8_t* x_qs, int nblocks,
-                                            float* out) {
-    const __m256i low_nibble = _mm256_set1_epi8(0x0F);
-    const __m256i eight = _mm256_set1_epi8(8);
-    __m256 sum = _mm256_setzero_ps();
-    for (int b = 0; b < nblocks; ++b) {
-        const size_t block = static_cast<size_t>(b);
-        const __m128i packed =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(w_qs + block * (QK / 2)));
-        const __m256i both = _mm256_set_m128i(_mm_srli_epi16(packed, 4), packed);
-        const __m256i wq = _mm256_sub_epi8(_mm256_and_si256(both, low_nibble), eight);
-        const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qs + block * QK));
-        const __m256i acc = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(wq, wq),
-                                                    _mm256_sign_epi8(xq, wq));
-        const float d = fp16_to_fp32(w_scales[b]) * x_scales[b];
-        sum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(acc), sum);
-    }
-    *out = hsum256(sum);
 }
 
 SD_TARGET_VNNI void dot_q8_soa_one(const uint16_t* w_scales, const int8_t* w_qs,
@@ -509,25 +523,41 @@ SD_TARGET_VNNI void dot_q4_soa_one(const uint16_t* w_scales, const uint8_t* w_qs
     const __m256i low_nibble = _mm256_set1_epi8(0x0F);
     __m256 sum = _mm256_setzero_ps();
 
+    // Three hadds leave the eight block totals as [0,2,4,6 | 1,3,5,7], because hadd works inside each
+    // 128-bit half; this puts them back in block order so the scales below line up.
+    const __m256i order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
     int b = 0;
     for (; b + kGroup <= nblocks; b += kGroup) {
-        __m256i acc[kGroup];
-        for (int j = 0; j < kGroup; ++j) {
-            const size_t block = static_cast<size_t>(b + j);
-            // The nibbles go in unsigned and uncorrected, so this accumulates sum(q * x).
-            const __m128i packed =
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(w_qs + block * (QK / 2)));
-            const __m256i both = _mm256_set_m128i(_mm_srli_epi16(packed, 4), packed);
-            const __m256i wq = _mm256_and_si256(both, low_nibble);
-            const __m256i xq =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_qs + block * QK));
-            acc[j] = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wq, xq);
+        __m256i acc[kGroup / 2];
+        for (int j = 0; j < kGroup / 2; ++j) {
+            // One 32-byte load is 64 nibbles, which is *two* blocks -- their bytes are adjacent in
+            // the file, so nothing had to move for this. Masking gives both blocks' low nibbles in
+            // one register and both blocks' high nibbles in the other, and the activations are stored
+            // pair-interleaved so each half meets its own 32-byte load. The nibbles go in unsigned
+            // and uncorrected, so this accumulates sum(q * x).
+            const size_t pair = static_cast<size_t>(b / 2 + j);
+            const __m256i packed =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w_qs + pair * QK));
+            const __m256i lo = _mm256_and_si256(packed, low_nibble);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_nibble);
+            const int8_t* xp = x_qs + pair * 2 * QK;
+            const __m256i xlo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xp));
+            const __m256i xhi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xp + QK));
+            // dpbusd sums four bytes into each int32 lane, so the first block of the pair lands in
+            // lanes 0-3 and the second in lanes 4-7: one accumulator holds both, which is what frees
+            // half the registers.
+            acc[j] = _mm256_dpbusd_avx_epi32(
+                _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), lo, xlo), hi, xhi);
         }
-        // Reduced to one block a lane, then corrected: lane j loses z * sum(x) for block b + j. One
-        // 32-byte load for all eight, which is the whole reason the offsets are per block and the
-        // subtraction happens here rather than inside each accumulator. Still exact integers.
+        const __m256i u = _mm256_hadd_epi32(_mm256_hadd_epi32(acc[0], acc[1]),
+                                           _mm256_hadd_epi32(acc[2], acc[3]));
+        // One block a lane, then corrected: lane j loses z * sum(x) for block b + j. One 32-byte load
+        // for all eight, which is why the offsets are per block and the subtraction happens here
+        // rather than inside each accumulator. Still exact integers.
         const __m256i dots = _mm256_sub_epi32(
-            reduce8(acc), _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_offsets + b)));
+            _mm256_permutevar8x32_epi32(u, order),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_offsets + b)));
         // Eight fp16 weight scales in one instruction, times the eight activation scales.
         const __m256 ws =
             _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w_scales + b)));
@@ -567,13 +597,9 @@ void dot_q4_soa_multi(const uint16_t* w_scales, const uint8_t* w_qs, const float
                       const int8_t* x_qs, const int32_t* x_offsets, int nblocks, int k, float* out) {
     const CpuFeatures& f = cpu_features();
     const bool simd = f.avx2 && f.avx_vnni && !force_scalar();
-    const bool grouped = scale_grouping();
     for (int t = 0; t < k; ++t) {
         const size_t offset = static_cast<size_t>(t) * nblocks;
-        if (simd && !grouped) {
-            dot_q4_soa_perblock_one(w_scales, w_qs, x_scales + offset, x_qs + offset * QK, nblocks,
-                                    out + t);
-        } else if (simd) {
+        if (simd) {
             dot_q4_soa_one(w_scales, w_qs, x_scales + offset, x_qs + offset * QK, x_offsets + offset,
                            nblocks, out + t);
         } else {

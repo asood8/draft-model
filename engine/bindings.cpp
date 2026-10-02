@@ -220,7 +220,7 @@ py::dict bench_kernel(int rows, int n_in, int tokens, int iters, int threads,
             fill();
             const size_t offset = static_cast<size_t>(t) * width;
             quantize_a8_soa(scratch.data(), n_in, zero_point, x_scales.data() + offset,
-                            x_qs.data() + offset * QK, x_offsets.data() + offset);
+                            x_qs.data() + offset * QK, x_offsets.data() + offset, four_bit);
         }
     }
 
@@ -671,9 +671,6 @@ PYBIND11_MODULE(_engine, m) {
     m.def("set_force_scalar", &set_force_scalar, py::arg("force"),
           "Use the scalar kernels even where AVX-VNNI exists, so the reference path stays tested.");
     m.def("force_scalar", &force_scalar);
-    m.def("set_scale_grouping", &set_scale_grouping, py::arg("enabled"),
-          "Apply q4 block scales eight at a time (default) or one at a time.");
-    m.def("scale_grouping", &scale_grouping);
 
     m.def("fp32_to_fp16", &fp32_to_fp16, py::arg("value"));
     m.def("fp16_to_fp32", &fp16_to_fp32, py::arg("bits"));
@@ -682,7 +679,7 @@ PYBIND11_MODULE(_engine, m) {
     // check they hold the same bytes and scales quantize_a8 produces.
     m.def(
         "quantize_a8_soa",
-        [](const FloatArray& x, int zero_point) {
+        [](const FloatArray& x, int zero_point, bool paired) {
             if (x.ndim() != 1 || x.size() == 0 || x.size() % QK != 0) {
                 throw std::invalid_argument("x must be a non-empty 1-D array of whole blocks");
             }
@@ -692,14 +689,14 @@ PYBIND11_MODULE(_engine, m) {
             py::array_t<int8_t> qs(n);
             py::array_t<int32_t> offsets(nblocks);
             quantize_a8_soa(x.data(), n, zero_point, scales.mutable_data(), qs.mutable_data(),
-                            offsets.mutable_data());
+                            offsets.mutable_data(), paired);
             py::dict out;
             out["scales"] = scales;
             out["qs"] = qs;
             out["offsets"] = offsets;
             return out;
         },
-        py::arg("x"), py::arg("zero_point") = 8);
+        py::arg("x"), py::arg("zero_point") = 8, py::arg("paired") = true);
 
     m.def("quantize_q4", &quantize_py<BlockQ4, quantize_q4>, py::arg("x"));
     m.def("quantize_q8", &quantize_py<BlockQ8, quantize_q8>, py::arg("x"));
@@ -766,7 +763,7 @@ PYBIND11_MODULE(_engine, m) {
             for (int t = 0; t < tokens; ++t) {
                 const size_t offset = static_cast<size_t>(t) * width;
                 repack_a8_soa(blocks + offset, nblocks, 8, x_scales.data() + offset,
-                              x_qs.data() + offset * QK, x_offsets.data() + offset);
+                              x_qs.data() + offset * QK, x_offsets.data() + offset, true);
             }
 
             py::array_t<float> out(tokens);
@@ -803,7 +800,7 @@ PYBIND11_MODULE(_engine, m) {
             for (int t = 0; t < tokens; ++t) {
                 const size_t offset = static_cast<size_t>(t) * width;
                 repack_a8_soa(blocks + offset, nblocks, 128, x_scales.data() + offset,
-                              x_qs.data() + offset * QK, x_offsets.data() + offset);
+                              x_qs.data() + offset * QK, x_offsets.data() + offset, false);
             }
 
             py::array_t<float> out(tokens);

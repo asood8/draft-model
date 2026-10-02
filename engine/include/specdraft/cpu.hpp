@@ -26,12 +26,6 @@ const char* active_kernel_path();
 void set_force_scalar(bool force);
 bool force_scalar();
 
-// Whether the q4 kernel applies block scales eight at a time (the default) or one at a time. A
-// measurement switch, not a tuning knob: adopting the grouped form came with a model-level slowdown
-// that the isolated benchmarks contradicted, and the two have to be comparable inside one process to
-// tell an arithmetic change from a layout change. Both compute the same dot product.
-void set_scale_grouping(bool enabled);
-bool scale_grouping();
 
 // One logical processor. On a hybrid CPU like the i7-13620H there are two kinds of core,
 // and which kind a thread lands on changes throughput a lot, so the engine needs to be

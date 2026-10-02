@@ -286,7 +286,7 @@ void Model::matmul(const Tensor& weight, const float* in, uint32_t in_stride, ui
         const size_t block = static_cast<size_t>(t) * nblocks;
         quantize_a8_soa(in + static_cast<size_t>(t) * in_stride, static_cast<int>(n_in), zero_point,
                         act_scales_.data() + block, act_qs_.data() + block * QK,
-                        act_offsets_.data() + block);
+                        act_offsets_.data() + block, four_bit);
     }
     const float* x_scales = act_scales_.data();
     const int8_t* x_qs = act_qs_.data();

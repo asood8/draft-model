@@ -868,6 +868,31 @@ where each result is:
 > some 21 ms, is attention, the norms, the output projection and the barriers. Chasing the kernel alone
 > cannot get past the floor while half of what scales with k sits outside it.
 
+> **Built, 2026-10-02: the pair-packed kernel is in, correct, and its speed is not yet settled.** One
+> 32-byte load now covers two blocks, masking gives both blocks' low nibbles in one register and both
+> high nibbles in the other, and the two land in separate halves of a single accumulator -- so eight
+> blocks need four accumulators, and the reduction is three `hadd`s plus a `vpermd` (index
+> [0,4,1,5,2,6,3,7], derived symbolically) rather than nine instructions. Activations are stored
+> pair-interleaved to match, which is a runtime layout: the file is untouched, and only whole groups of
+> eight are paired so the one-block-at-a-time tail reads the rest unchanged.
+>
+> Correct: 796 tests pass, including the engine against the PyTorch twin layer by layer for q4 and q8,
+> and the kernel against a float64 reference at 1, 2, 8, 9, 80 and 304 blocks -- the paired region, the
+> tail and the single-block case.
+>
+> **Not settled: whether it is faster.** The run meant to show it put the split kernel at 1.34x, 1.84x,
+> 1.72x and 1.47x the interleaved baseline for k = 1, 2, 4, 8, against 1.13x, 1.40x, 1.35x and 1.86x
+> before pair-packing -- better at three of four, worse at k=8. But the baseline *itself* fell from
+> 51.7/71.1/108.1/90.6 to 36.3/42.0/54.7/61.4 GMAC/s in that run, and nothing about the interleaved
+> kernel changed, so the machine was a different instrument. Inside the run the split numbers were also
+> non-monotonic (90.3 at k=8 against 94.1 at k=4), which is a noise signature rather than a result.
+>
+> Settling it needs an in-process A/B of the two split variants, which means keeping the pre-pair-pack
+> kernel as a benchmark-only path with the benchmark building both activation layouts -- the lesson
+> already learned twice here, that on this machine only comparisons taken inside one process mean
+> anything. Until then the defensible claim is the instruction count: 43 per eight blocks per row
+> against 64, with 18.6% of them multiply-accumulates rather than 12.5%.
+
 > Change 3, register blocking over output rows, is **not** done; it is what the §3 table says is needed to
 > reach a useful speedup.
 

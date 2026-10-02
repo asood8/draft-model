@@ -69,17 +69,6 @@ bool force_scalar() {
     return g_force_scalar.load(std::memory_order_relaxed);
 }
 
-namespace {
-std::atomic<bool> g_scale_grouping{true};
-}  // namespace
-
-void set_scale_grouping(bool enabled) {
-    g_scale_grouping.store(enabled, std::memory_order_relaxed);
-}
-
-bool scale_grouping() {
-    return g_scale_grouping.load(std::memory_order_relaxed);
-}
 
 const char* active_kernel_path() {
     const CpuFeatures& f = cpu_features();

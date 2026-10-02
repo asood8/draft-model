@@ -278,25 +278,51 @@ def split_a8(blob: bytes):
     return scales, qs
 
 
+def unpair_a8(qs: np.ndarray) -> np.ndarray:
+    """Undo the paired activation order, returning one row of 32 values per block.
+
+    The q4 kernel reads two blocks with one 32-byte weight load, so a pair of blocks is stored as
+    x[b][0:16], x[b+1][0:16], x[b][16:32], x[b+1][16:32]. Only whole groups of eight blocks are
+    paired; the rest keep the plain order. This mirrors `paired_index` in quant.cpp -- if the two ever
+    disagree, the tests below are the ones that notice.
+    """
+    nblocks = qs.size // 32
+    pairs_end = nblocks - nblocks % 8
+    out = np.empty((nblocks, 32), dtype=np.int8)
+    for b in range(nblocks):
+        for i in range(32):
+            if b < pairs_end:
+                out[b, i] = qs[(b // 2) * 64 + ((i // 16) * 2 + (b & 1)) * 16 + (i % 16)]
+            else:
+                out[b, i] = qs[b * 32 + i]
+    return out
+
+
 @pytest.mark.parametrize("kind", ["normal", "uniform", "spiky", "ties"])
 @pytest.mark.parametrize("n", [32, 256, 2560])
-def test_soa_activation_quantizer_agrees_byte_for_byte(kind, n):
+@pytest.mark.parametrize("paired", [False, True])
+def test_soa_activation_quantizer_agrees_byte_for_byte(kind, n, paired):
     x = sample(kind, n, 1.0, seed=50)
     want_scales, want_qs = split_a8(pyq.quantize_a8(x))
-    got = cpp.quantize_a8_soa(x, 8)
+    got = cpp.quantize_a8_soa(x, 8, paired)
 
-    assert np.array_equal(got["qs"], want_qs)
+    # The same bytes either way; `paired` only decides where each one sits.
+    laid_out = unpair_a8(got["qs"]) if paired else got["qs"].reshape(-1, 32)
+    assert np.array_equal(laid_out.ravel(), want_qs)
     assert np.array_equal(got["scales"], want_scales)
 
 
 @pytest.mark.parametrize("zero_point", [8, 128])
-def test_soa_activation_offset_is_the_block_sum(zero_point):
+@pytest.mark.parametrize("paired", [False, True])
+def test_soa_activation_offset_is_the_block_sum(zero_point, paired):
     x = sample("normal", 256, 1.0, seed=51)
-    got = cpp.quantize_a8_soa(x, zero_point)
-    # One integer a block, not one a lane. The kernel reduces its eight accumulators before scaling,
-    # so the correction for the weights being stored `zero_point` too large can be subtracted from
-    # the reduced vector -- which lets eight blocks share one 32-byte load.
-    blocks = got["qs"].astype(np.int32).reshape(-1, 32).sum(axis=1)
+    got = cpp.quantize_a8_soa(x, zero_point, paired)
+    # One integer a block, not one a lane. The kernel reduces its accumulators before scaling, so the
+    # correction for the weights being stored `zero_point` too large can be subtracted from the
+    # reduced vector -- which lets eight blocks share one 32-byte load. The sum is over a block's own
+    # values, so the paired order has to be undone first or neighbouring blocks get mixed.
+    laid_out = unpair_a8(got["qs"]) if paired else got["qs"].reshape(-1, 32)
+    blocks = laid_out.astype(np.int32).sum(axis=1)
     assert got["offsets"].shape == (x.size // 32,)
     assert np.array_equal(got["offsets"], zero_point * blocks)
 

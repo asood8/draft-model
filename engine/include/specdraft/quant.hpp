@@ -124,17 +124,25 @@ void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, flo
 // sum of that block's activations -- the quantity the identity above subtracts.
 
 // Quantize one activation vector straight into that layout. `zero_point` is the weight format's:
-// 8 for q4 nibbles, 128 for q8 bytes. It belongs to the weights rather than the activations, but
-// the bias is a property of the activations, so the caller passes the one its matmul needs.
+// 8 for q4 nibbles, 128 for q8 bytes. It belongs to the weights rather than the activations, but the
+// offset it precomputes is a property of the activations, so the caller passes the one its matmul
+// needs.
+//
+// `paired` reorders the bytes for the q4 kernel, which reads two blocks per 32-byte weight load since
+// their nibbles are adjacent in the file: a pair of blocks is stored as x[b][0:16], x[b+1][0:16],
+// x[b][16:32], x[b+1][16:32], so masking the low and high nibbles lines each half up with one
+// activation load. Only whole groups of eight blocks are paired; anything past the last whole group
+// keeps the plain order, which is what the kernels' one-block-at-a-time tail reads. The q8 kernel
+// loads a block's 32 bytes directly and wants `paired` false.
 void quantize_a8_soa(const float* x, int n, int zero_point, float* scales, int8_t* qs,
-                     int32_t* offsets);
+                     int32_t* offsets, bool paired);
 
 // Rearrange one interleaved row into the split layout. The exporter does this in Python; these
 // exist so tests can drive the kernels from the same blobs the other bindings take.
 void repack_q4_soa(const BlockQ4* blocks, int nblocks, uint16_t* scales, uint8_t* qs);
 void repack_q8_soa(const BlockQ8* blocks, int nblocks, uint16_t* scales, int8_t* qs);
 void repack_a8_soa(const BlockA8* blocks, int nblocks, int zero_point, float* scales, int8_t* qs,
-                   int32_t* offsets);
+                   int32_t* offsets, bool paired);
 
 void dequantize_q4_soa(const uint16_t* scales, const uint8_t* qs, int n, float* out);
 void dequantize_q8_soa(const uint16_t* scales, const int8_t* qs, int n, float* out);
