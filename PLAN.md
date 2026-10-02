@@ -825,6 +825,49 @@ where each result is:
 > single-token step it is divided by, and that is what flattens v(k) rather than just making the engine
 > quicker.
 
+> **Counted, 2026-10-02: change 3 as written does not pay, and what to do instead.** Register blocking
+> over output rows wants R rows live at once, but at G=8 that is 16 accumulators, which does not fit
+> sixteen vector registers. Forcing the group down to G=4 doubles both the reduction and the scale
+> application per block, and that costs more than sharing the activation load saves: 66 instructions per
+> eight blocks per row against the 64 the kernel spends now.
+>
+> Counting where those 64 go says what to do instead. **Half of them, 32, are unpacking nibbles** --
+> a 16-byte load, a shift, a `vinserti128` and a mask, eight times over. But a *32-byte* load covers two
+> blocks, and their nibbles are already adjacent in the file, so one load, one shift and two masks give
+> two blocks' worth. Better still, `dpbusd` accumulates four bytes into each int32 lane, so with the
+> activations in a matching order the two blocks land in separate halves of one accumulator: lanes 0-3
+> for the first, 4-7 for the second. Eight blocks then need four accumulators rather than eight, the
+> reduction becomes three `hadd`s and a `vpermd` rather than nine instructions, and 43 instructions a
+> row replace 64 -- **1.49x fewer, and 18.6% of them doing multiply-accumulates rather than 12.5%**.
+> With four accumulators, R=2 row blocking then does fit, taking it to 39 and 1.64x.
+>
+> The activations have to be stored pair-interleaved to match -- x[b][0:16], x[b+1][0:16], x[b][16:32],
+> x[b+1][16:32] -- but they are quantized at every matmul anyway, so this is a runtime layout and **no
+> file format change**. The weight layout already has what it needs.
+>
+> **Projected, from the measured curve, and the shape of it is the surprise.** Fitting the cool-machine
+> passes gives pass(k) = 38 + 53.6k ms, and a kernel speedup divides only the 53.6. Flooring a pass at
+> the 57.3 ms it takes to stream 2.26 GB once:
+>
+> | kernel | α=.711, c=.24 | α=.80, c=.19 | α=.85, c=.19 | tok/s | v(2) |
+> |---|---|---|---|---|---|
+> | today | 0.89x | 0.97x | 0.99x | 10.9 | 1.59 |
+> | 1.3x (pair-packed) | 0.92x | 1.00x | 1.03x | 12.6 | 1.52 |
+> | 2x | 0.98x | 1.06x | 1.12x | 15.4 | 1.41 |
+> | 4x | **1.17x** | **1.33x** | **1.41x** | 17.5 | 1.13 |
+>
+> Kernel work pays *superlinearly* on the speculative ratio, but only after pass(1) reaches the floor.
+> Below it a faster kernel shrinks the single-token step as much as the k-token pass, so the ratio hardly
+> moves -- pair-packing alone buys 0.89x to 0.92x, while adding 1.7 tok/s of absolute speed. Above it,
+> pass(1) cannot improve further while verification keeps getting cheaper, and v(2) falls from 1.59 to
+> 1.13. **So the kernel is worth pushing, but for the floor rather than for the next 30%.**
+>
+> One more thing the fit shows: of the 53.6 ms an extra token costs, only about 27.5 ms is the matmuls at
+> the rate the microbenchmark measures. About 5.1 ms is **quantizing activations, on one thread** -- a
+> tenth of everything that scales with k, and the only piece of a forward pass still serial. The rest,
+> some 21 ms, is attention, the norms, the output projection and the barriers. Chasing the kernel alone
+> cannot get past the floor while half of what scales with k sits outside it.
+
 > Change 3, register blocking over output rows, is **not** done; it is what the §3 table says is needed to
 > reach a useful speedup.
 
