@@ -589,4 +589,127 @@ PYBIND11_MODULE(_engine, m) {
         },
         py::arg("rows"), py::arg("n_in"), py::arg("tokens"), py::arg("iters") = 1,
         py::arg("format") = "q4");
+
+    // The SoA prototype, taking the same interleaved blobs the other bindings take and repacking
+    // them, so a test can compare it against the scalar reference without knowing the layout.
+    m.def(
+        "dot_q4_a8_soa",
+        [](const py::bytes& weights, const py::bytes& activations) {
+            std::string w = weights;
+            std::string x = activations;
+            if (w.size() % sizeof(BlockQ4) != 0 || w.empty()) {
+                throw std::invalid_argument("weights must be a whole number of Q4 blocks");
+            }
+            const int nblocks = static_cast<int>(w.size() / sizeof(BlockQ4));
+            if (x.size() % (static_cast<size_t>(nblocks) * sizeof(BlockA8)) != 0 || x.empty()) {
+                throw std::invalid_argument("activations must be k whole vectors of the same width");
+            }
+            const int tokens = static_cast<int>(x.size() / (static_cast<size_t>(nblocks) * sizeof(BlockA8)));
+
+            std::vector<uint16_t> w_scales(nblocks);
+            std::vector<uint8_t> w_qs(static_cast<size_t>(nblocks) * (QK / 2));
+            repack_q4_soa(reinterpret_cast<const BlockQ4*>(w.data()), nblocks, w_scales.data(),
+                          w_qs.data());
+
+            const size_t width = static_cast<size_t>(nblocks);
+            std::vector<float> x_scales(width * tokens);
+            std::vector<int8_t> x_qs(width * tokens * QK);
+            std::vector<int32_t> x_bias(width * tokens * 8);
+            const BlockA8* blocks = reinterpret_cast<const BlockA8*>(x.data());
+            for (int t = 0; t < tokens; ++t) {
+                const size_t offset = static_cast<size_t>(t) * width;
+                repack_a8_soa(blocks + offset, nblocks, x_scales.data() + offset,
+                              x_qs.data() + offset * QK, x_bias.data() + offset * 8);
+            }
+
+            py::array_t<float> out(tokens);
+            dot_q4_a8_soa(w_scales.data(), w_qs.data(), x_scales.data(), x_qs.data(), x_bias.data(),
+                          nblocks, tokens, out.mutable_data());
+            return out;
+        },
+        py::arg("weights"), py::arg("activations"));
+
+    // The same sweep as bench_dot, on the SoA layout, so the two are directly comparable.
+    m.def(
+        "bench_dot_soa",
+        [](int rows, int n_in, int tokens, int iters) {
+            if (rows < 1 || n_in < 1 || tokens < 1 || iters < 1) {
+                throw std::invalid_argument("rows, n_in, tokens and iters must all be positive");
+            }
+            if (n_in % QK != 0) {
+                throw std::invalid_argument("n_in must be a multiple of " + std::to_string(QK));
+            }
+            const int nblocks = n_in / QK;
+            std::mt19937 rng(1234);
+            std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+            std::vector<float> scratch(static_cast<size_t>(n_in));
+            const auto fill = [&] {
+                for (float& value : scratch) {
+                    value = uniform(rng);
+                }
+            };
+
+            // Activations, repacked once.
+            const size_t width = static_cast<size_t>(nblocks);
+            std::vector<float> x_scales(width * tokens);
+            std::vector<int8_t> x_qs(width * tokens * QK);
+            std::vector<int32_t> x_bias(width * tokens * 8);
+            std::vector<BlockA8> staging(width);
+            for (int t = 0; t < tokens; ++t) {
+                fill();
+                quantize_a8(scratch.data(), n_in, staging.data());
+                const size_t offset = static_cast<size_t>(t) * width;
+                repack_a8_soa(staging.data(), nblocks, x_scales.data() + offset,
+                              x_qs.data() + offset * QK, x_bias.data() + offset * 8);
+            }
+
+            // Weights: scales for every row contiguous, then the nibbles, as a real file would.
+            std::vector<uint16_t> w_scales(width * rows);
+            std::vector<uint8_t> w_qs(width * rows * (QK / 2));
+            std::vector<BlockQ4> w_staging(width);
+            for (int r = 0; r < rows; ++r) {
+                fill();
+                quantize_q4(scratch.data(), n_in, w_staging.data());
+                const size_t offset = static_cast<size_t>(r) * width;
+                repack_q4_soa(w_staging.data(), nblocks, w_scales.data() + offset,
+                              w_qs.data() + offset * (QK / 2));
+            }
+
+            std::vector<float> out(static_cast<size_t>(tokens));
+            double checksum = 0.0;
+            const auto sweep = [&] {
+                for (int r = 0; r < rows; ++r) {
+                    const size_t offset = static_cast<size_t>(r) * width;
+                    dot_q4_a8_soa(w_scales.data() + offset, w_qs.data() + offset * (QK / 2),
+                                  x_scales.data(), x_qs.data(), x_bias.data(), nblocks, tokens,
+                                  out.data());
+                    checksum += out[0];
+                }
+            };
+
+            sweep();
+            double seconds = 0.0;
+            {
+                py::gil_scoped_release unlocked;
+                const auto started = std::chrono::steady_clock::now();
+                for (int i = 0; i < iters; ++i) {
+                    sweep();
+                }
+                seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+                              .count();
+            }
+
+            // The same bytes as the interleaved layout: 18 per block, now in two arrays.
+            const double weight_bytes = static_cast<double>(rows) * nblocks * sizeof(BlockQ4);
+            py::dict result;
+            result["seconds"] = seconds;
+            result["macs"] = static_cast<double>(rows) * n_in * tokens * iters;
+            result["weight_bytes"] = weight_bytes;
+            result["weight_bytes_read"] = weight_bytes * iters;
+            result["activation_bytes"] =
+                static_cast<double>(x_qs.size() + x_bias.size() * 4 + x_scales.size() * 4);
+            result["checksum"] = checksum;
+            return result;
+        },
+        py::arg("rows"), py::arg("n_in"), py::arg("tokens"), py::arg("iters") = 1);
 }

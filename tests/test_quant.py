@@ -214,3 +214,50 @@ def test_bench_dot_q8_blocks_are_larger():
 def test_bench_dot_rejects_nonsense(kwargs):
     with pytest.raises(ValueError):
         cpp.bench_dot(**kwargs)
+
+
+# ------------------------------------------------------------------------------ the SoA prototype
+#
+# Two things in it are easy to get subtly wrong and impossible to notice from a benchmark: the
+# offset trick, which replaces the sign trick with a per-lane bias, and the eight-block reduction,
+# whose lane order has to come out in block order or every scale lands on the wrong block.
+
+
+@pytest.mark.parametrize("n", [32, 64, 256, 288, 2560])  # 288 is nine blocks, exercising the tail
+@pytest.mark.parametrize("tokens", [1, 3])
+def test_soa_kernel_matches_the_exact_reference(n, tokens):
+    w = sample("normal", n, 1.0, seed=40)
+    vectors = [sample("normal", n, 0.5, seed=41 + i) for i in range(tokens)]
+    w_blob = pyq.quantize_q4(w)
+    blobs = [pyq.quantize_a8(v) for v in vectors]
+
+    wq = pyq.dequantize_q4(w_blob).astype(np.float64)
+    exact = np.array([wq @ pyq.dequantize_a8(b).astype(np.float64) for b in blobs])
+    tolerance = 1e-6 * float(np.abs(wq).sum()) * 0.5
+
+    got = cpp.dot_q4_a8_soa(w_blob, b"".join(blobs))
+    assert got.shape == (tokens,)
+    assert np.abs(got - exact).max() <= tolerance
+
+
+def test_soa_kernel_handles_zero_activations():
+    w_blob = pyq.quantize_q4(sample("normal", 256, 1.0, seed=43))
+    x_blob = pyq.quantize_a8(np.zeros(256, dtype=np.float32))
+    # The bias is zero when every activation is zero, so this also checks the offset correction
+    # is not adding a constant of its own.
+    assert cpp.dot_q4_a8_soa(w_blob, x_blob)[0] == 0.0
+
+
+def test_soa_kernel_rejects_ragged_input():
+    w_blob = pyq.quantize_q4(sample("normal", 64, 1.0, seed=44))
+    short = pyq.quantize_a8(sample("normal", 32, 1.0, seed=45))
+    with pytest.raises(ValueError):
+        cpp.dot_q4_a8_soa(w_blob, short)
+
+
+def test_bench_dot_soa_reports_the_same_work_as_the_interleaved_one():
+    soa = cpp.bench_dot_soa(rows=4, n_in=64, tokens=3, iters=2)
+    aos = cpp.bench_dot(rows=4, n_in=64, tokens=3, iters=2, format="q4")
+    assert soa["macs"] == aos["macs"]
+    assert soa["weight_bytes"] == aos["weight_bytes"]  # the same 18 bytes a block, in two arrays
+    assert soa["seconds"] > 0.0

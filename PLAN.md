@@ -693,6 +693,48 @@ where each result is:
 >    as it is — 18-byte blocks are what ggml uses, and keeping them preserves the GGUF path — so the repack
 >    happens when the model is mapped, at no extra memory cost.
 >
+> **Measured, 2026-10-01: the prototype of changes 1 and 2 runs 1.26-1.82x faster, and the port
+> analysis was right.** `dot_q4_a8_soa` in `quant.cpp` does the same arithmetic with the scales and
+> the quantized bytes in separate arrays, eight blocks reduced before scaling, and the sign trick
+> replaced by the offset identity. One thread, n_in 2560, against the current kernel:
+>
+> | k | current | prototype | | | current ns/token | prototype ns/token |
+> |---|---|---|---|---|---|---|
+> | 1 | 18.5 GMAC/s | 31.1 | **1.69x** | | 139 | 82 |
+> | 2 | 17.6 | 32.1 | **1.82x** | | 146 | 80 |
+> | 4 | 22.7 | 32.6 | **1.44x** | | 113 | 79 |
+> | 8 | 25.4 | 32.9 | **1.30x** | | 101 | 78 |
+>
+> It is also *more* accurate -- 3.8e-6 against 7.6e-6 at n_in 2560 -- because grouping eight blocks
+> shortens the float accumulation chain. And note the prototype's per-token cost barely moves with k:
+> it gave up sharing the weight unpacking across tokens, since eight accumulators plus the unpack
+> temporaries already fill the registers, and it still beats the sharing kernel at every k. That
+> settles the question the 24% measurement raised.
+>
+> **But a faster kernel does not translate into speculative speedup one-for-one, and this is the
+> thing to understand before doing the work.** A single token's step is memory-bound at 57 ms, so
+> making the arithmetic cheaper leaves it roughly where it is; what changes is the k-token pass,
+> which is compute-bound. Optimistically modelling a pass as sharing all the memory traffic,
+> v(k) = 1 + (C/57)(k-1) where C is per-token compute:
+>
+> | GMAC/s per core | % of peak | C | v(2) | v(3) | best speedup at α=0.711 |
+> |---|---|---|---|---|---|
+> | 18.5 (today) | 8.3% | 36 ms | 1.63 | 2.26 | 0.92x (γ=1) |
+> | 32 (prototype) | 14.3% | 21 ms | 1.37 | 1.73 | 1.07x (γ=1) |
+> | 48 | 21.4% | 14 ms | 1.24 | 1.49 | 1.19x (γ=2) |
+> | 64 | 28.6% | 10 ms | 1.18 | 1.37 | 1.27x (γ=2) |
+> | 128 | 57.1% | 5 ms | 1.09 | 1.18 | 1.43x (γ=3) |
+>
+> So the prototype buys about 1.07x where today loses, and getting to a *useful* speedup means
+> reaching roughly 30% of AVX-VNNI peak -- four times today's rate, not the 1.3-1.8x the prototype
+> gives. That needs changes 3 and 4 as well, as a genuine blocked microkernel rather than a dot
+> product: T tokens by G blocks by R rows, with the register budget being the whole design
+> constraint, since G*T*R accumulators have to stay live in sixteen vector registers. Counting
+> operations for T=4, G=4, R=2 gives about 3.1 per 32-MAC `dpbusd`, or 32% of peak, which is the
+> target. The honest expected outcome of the whole program is **the engine about twice as fast in
+> absolute terms, and speculative decoding worth about 1.25-1.3x** at the acceptance rate already
+> measured -- with distillation on top of that, not instead of it.
+>
 > Changes 2 to 4 alter neither what is summed nor in what order. Change 1 does reorder the float
 > accumulation — eight blocks are reduced before scaling rather than after — so it changes results in
 > the last bits. That is allowed, but only if the single-token and k-token kernels are changed

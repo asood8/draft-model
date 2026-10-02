@@ -94,4 +94,29 @@ float dot_q8_a8(const BlockQ8* w, const BlockA8* x, int nblocks);
 void dot_q4_a8_multi(const BlockQ4* w, const BlockA8* x, int nblocks, int k, float* out);
 void dot_q8_a8_multi(const BlockQ8* w, const BlockA8* x, int nblocks, int k, float* out);
 
+// ---------------------------------------------------------------------- the SoA prototype
+//
+// A measurement, not yet the engine's path. The kernels above are limited by the ports that issue
+// dpbusd, and each block spends about five such operations to perform one multiply-accumulate
+// instruction: the sign trick costs two, and converting and applying the block scale costs three.
+// Both are avoidable, but only if the block scales and the quantized bytes live in separate arrays:
+//
+//   * eight fp16 scales convert in one vcvtph2ps instead of eight scalar conversions, and the eight
+//     per-block products apply with one multiply and one fmadd, after reducing eight blocks worth
+//     of int32 accumulators into a single vector in block order;
+//   * the sign trick gives way to the identity sum((q - 8) * x) = sum(q * x) - 8 * sum(x), which
+//     lets the raw nibbles be the unsigned operand. The correction costs nothing in the loop: the
+//     accumulator is seeded with a precomputed per-lane bias instead of with zero.
+//
+// Laid out as w_scales[nblocks], w_qs[nblocks * 16], x_scales[tokens * nblocks],
+// x_qs[tokens * nblocks * 32] and x_bias[tokens * nblocks * 8], where x_bias holds -8 times the sum
+// of the four activations in each of dpbusd's eight int32 lanes.
+//
+// If this wins, the model file gains a version with this layout. The quantization itself is
+// unchanged either way, so every byte-exactness test against the Python mirror still applies.
+void repack_q4_soa(const BlockQ4* blocks, int nblocks, uint16_t* scales, uint8_t* qs);
+void repack_a8_soa(const BlockA8* blocks, int nblocks, float* scales, int8_t* qs, int32_t* bias);
+void dot_q4_a8_soa(const uint16_t* w_scales, const uint8_t* w_qs, const float* x_scales,
+                   const int8_t* x_qs, const int32_t* x_bias, int nblocks, int tokens, float* out);
+
 }  // namespace specdraft
