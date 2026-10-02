@@ -216,6 +216,60 @@ Realistic targets on this laptop are about 1.3–1.7× with the off-the-shelf dr
 distillation pushes α toward 0.8 *and* the k-token kernel keeps s small. The table is the prediction the
 measurements get checked against.
 
+> **Measured, 2026-10-01: the real slope is 0.48, nearly two and a half times the most pessimistic row above —
+> and that, not the draft, is what caps the speedup.** On Qwen3-4B at 4 bits, six performance cores,
+> context 128: a single target step is 70.6 ms and a k-token pass costs **32 ms + 34 ms per token**
+> (fitted over k = 2…6, residuals within 8 ms), so v(k) ≈ 0.46 + 0.48k.
+>
+> The two terms are worth separating carefully, because the obvious reading is wrong. Streaming the 2.26 GB
+> of 4-bit weights at the measured 39.5 GB/s takes **57 ms**, not 32 — so the intercept is not the memory
+> traffic. It is the part of that traffic which fails to hide behind the arithmetic; about 25 ms of
+> streaming does overlap, and the rest does not. The 34 ms slope is the integer arithmetic per token, which
+> k tokens cannot share. Comparing the measurement against a perfectly overlapped `max(memory, compute)`
+> makes the gap plain: that model predicts 57, 68, 102, 135, 169, 203 ms for k = 1…6 where the engine takes
+> 71, 103, 136, 160, 199, 240. Every pass runs about 35 ms over the ideal, which is roughly one token's
+> worth of compute that never overlaps with anything.
+>
+> So the arithmetic, not the bandwidth, is what k tokens fail to amortize. On a GPU the same ratio is
+> perhaps a hundredth, which is why v ≈ 1 there and the original formula omits the term.
+>
+> With c = 0.220 and o = 0.080 measured alongside it, the predicted speedup is:
+>
+> | α | γ=1 | γ=2 | γ=3 | γ=4 | γ=5 | best |
+> |---|---|---|---|---|---|---|
+> | 0.70 | 0.97 | 0.90 | 0.84 | 0.73 | 0.64 | 0.97× (γ=1) |
+> | 0.80 | 1.03 | 1.00 | 0.98 | 0.89 | 0.80 | 1.03× (γ=1) |
+> | 0.90 | 1.09 | 1.11 | 1.14 | 1.08 | 1.02 | 1.14× (γ=3) |
+> | 1.00 | 1.14 | 1.23 | **1.33** | 1.32 | 1.31 | 1.33× (γ=3) |
+>
+> The last row is the one that matters: **α = 1 is a draft that is never wrong, and it still only reaches
+> 1.33×.** No amount of distillation can beat that line, because it is set by v(k) alone. So the
+> "realistic 1.3–1.7×" above was wrong about where the difficulty lies. Acceptance is not the binding
+> constraint on this machine; the kernel's arithmetic is.
+>
+> But 1.33× is the ceiling **of this kernel**, not of this laptop, and the difference is the whole point.
+> The kernel sustains about 114 GMAC/s across six cores, roughly 8% of what AVX-VNNI can issue at this
+> clock, so the inner loop is limited by the work *around* `dpbusd` — unpacking nibbles, the sign trick,
+> the per-block scale broadcast — not by the multiply-accumulate. Ask instead what the *bandwidth* permits:
+> if the arithmetic were free, a k-token pass would cost only the 57 ms of streaming, giving v(k) ≈ 0.81
+> flat for every k. With that floor and a 4-bit draft at c ≈ 0.15:
+>
+> | α | best speedup at the bandwidth floor | measured today |
+> |---|---|---|
+> | 0.70 | 1.89× (γ=3) | 0.97× |
+> | 0.80 | 2.25× (γ=4) | 1.03× |
+> | 0.90 | 2.93× (γ=7) | 1.14× |
+>
+> **The gap between those two columns is entirely the kernel's arithmetic efficiency.** That reframes the
+> project: the interesting quantity is not whether speculation pays on a CPU, but how much of the
+> bandwidth-floor speedup a good k-token kernel can recover. See §10.1 for the three changes that chase it.
+>
+> Two caveats on the numbers above. Beyond k = 6 the measured curve jumps (+129 ms at k = 7, against
+> +42 ms at k = 6) because eight per-token accumulators plus the unpack temporaries stop fitting in
+> registers; the fit is taken over k ≤ 6, and the useful γ range sits inside it. And the tile constant is
+> currently 8, so a tile of 6 would be the better choice — it would keep k = 7…12 at two cheap passes
+> instead of one spilling pass plus one cheap one.
+
 **Back-of-envelope for this laptop.** The bandwidth figure is an assumption until Milestone 0 measures it.
 
 | | Qwen3-0.6B | Qwen3-4B |
@@ -576,6 +630,44 @@ where each result is:
   **bit for bit**. That is a much stronger test than a tolerance.
   - *Also required:* the same thread split per row, attention accumulated in the same order, and no fast-math.
 - Prompt processing runs in chunks of k. Report its speed separately from generation.
+
+> **Measured, 2026-10-01: the kernel runs at about 8% of the hardware's integer throughput, and §3 shows
+> that this — not acceptance — is what caps the speedup. So it gets its own work item.** Across six
+> performance cores the k-token kernel sustains roughly 114 GMAC/s, where two `dpbusd` ports at this clock
+> could issue on the order of 1.3 TMAC/s. Counting the inner loop explains it: per token per block there is
+> one activation load, one `sign` to move the weight's sign onto the activation, one `dpbusd`, one
+> `cvtepi32_ps`, one scalar multiply plus broadcast for the two scales, and one `fmadd` — seven operations
+> wrapped around the one that does the 32 multiply-accumulates.
+>
+> The structural problem is that the kernel computes **one output row at a time**. A matmul row loop reloads
+> every activation block once per row, and the `_mm256_sign_epi8(xq, wq)` operand depends on the *weight*
+> row, so nothing about the activation side can be hoisted out of the row loop either.
+>
+> Three changes, in the order their payoff justifies:
+>
+> 1. **Offset trick, to make the activation operand row-independent.** `dpbusd` wants unsigned × signed, which
+>    is why the sign currently moves onto the activation. Keep the nibbles as the unsigned operand instead
+>    (they are already 0…15) and use the identity Σ(q−8)·x = Σq·x − 8·Σx. The Σx term is a property of the
+>    *activation* block alone, so it is computed once when activations are quantized and shared by every row.
+>    This removes two `sign` operations per token per block and, more importantly, makes `xq` the same operand
+>    for all rows.
+> 2. **Register blocking over output rows.** With the activation operand shared, process R rows × T tokens per
+>    pass, holding R×T accumulators. Each activation load then feeds R `dpbusd`s instead of one, and the
+>    unpacked weights of R rows stay live across T tokens. R=2, T=6 fits the sixteen vector registers with
+>    room for the unpack temporaries.
+> 3. **Aligned in-memory layout, by repacking at load.** A `BlockQ4` is 18 bytes and a `BlockA8` 36, so no
+>    block after the first starts on a 32-byte boundary and many 16-byte nibble loads straddle a cache line.
+>    Keeping scales and quantized bytes in separate arrays makes every load aligned. The *file* format stays
+>    as it is — 18-byte blocks are what ggml uses, and keeping them preserves the GGUF path — so the repack
+>    happens when the model is mapped, at no extra memory cost.
+>
+> None of the three changes what is summed or in what order, so the bit-exactness test between a k-token pass
+> and k single-token passes stays valid, and it is the thing that will catch an error in any of them. Nor do
+> they touch the quantization twin, since the arithmetic is unchanged.
+>
+> Also pending from the same measurement: the tile constant is 8, but the curve jumps at k=7 because eight
+> per-token accumulators plus the unpack temporaries spill. Until register blocking lands, **the tile should
+> be 6** — the comment in `quant.cpp` claiming eight fit is simply wrong, and the measurement is what says so.
 
 ### 10.2 The round loop
 
