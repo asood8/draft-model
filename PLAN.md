@@ -12,6 +12,7 @@ their own. Section 17 tracks decisions and open questions.
 
 | Date | Where things stand |
 |---|---|
+| 2026-10-02 | **Three kernel changes, and the kernel's own v(2) falls from 2.02 to 1.12.** The scales now apply eight blocks at a time instead of one; the sign trick is gone, replaced by sum((q-z)x) = sum(qx) - z sum(x) with one precomputed integer a block subtracted after the reduction; and one 32-byte load covers two blocks, whose nibbles are already adjacent, landing them in separate halves of a single accumulator so that eight blocks need four accumulators and the reduction is three hadds and a vpermd. 43 instructions per eight blocks per row against 64, and the share doing multiply-accumulates goes 9.9% to 23.6%. Measured in one process with the variants alternating -- the only comparison this machine supports -- pair-packing alone is 1.09x at k=1 rising to 1.28x at k=8. Activation quantization, the last serial piece of a forward pass at 5.1 ms a token, now spreads over the workers. Also retired change 3: register blocking over output rows needs 16 accumulators at G=8 and costs more than it saves at G=4, which is what counting instructions is for. The projection in §10.1 says the remaining distance is the bandwidth floor: past it v(2) reaches 1.13 and, with distillation, 1.33-1.41x. 814 tests pass. |
 | 2026-10-02 | **The engine's kernel is rewritten and the file format is at version 4.** Quantized tensors are stored as a scales region then a bytes region, so eight fp16 scales convert in one instruction and the sign trick gives way to the offset identity; `dot_q4_soa_multi` and `dot_q8_soa_multi` are the engine's kernels, with the interleaved ones kept as the measured baseline. Measured back to back at six pinned cores over a 192 MB working set, the new layout wins at every k: 1.13x at k=1, 1.32x at k=2, 1.16x at k=4, 1.42x at k=8, reaching 32.8 GB/s of a 35-39 GB/s ceiling at k=1. Per-tensor and per-row splitting proved indistinguishable, so no second format change. Getting there needed two corrections to my own instruments: the threaded comparison gave every worker its own cache line (without it, six workers wrote inside one line and the table read as eightfold layout differences that reversed with k), and measure_vk now interleaves the k values instead of taking all samples of one before the next (without it a sweep came out non-monotonic, k=4 cheaper than k=3). The broader lesson is in §13: **v(k) is not drift-resistant**, since throttling cuts the clock and so the arithmetic but not the bandwidth, making a hot machine report a steeper curve -- the same 4B read 70.6 and 99.0 ms a step hours apart. Kernel comparisons belong in `bench_kernel.py`, never in a before-and-after of the model. 691 tests pass. |
 | 2026-10-01 | **Milestone 5 built, and the evaluation harness with it.** Distillation exists end to end: five losses with a chunked form that keeps a 151,669-token vocabulary in memory, a trainable draft that reuses the verified reference forward pass, the training loop (teacher as a callable, so the full-precision target, the 4-bit twin or cached logits all fit), the data pipeline with 13-gram decontamination, and runnable scripts for both. An integration test trains a miniature Qwen3 carrying the real tokenizer, saves it, exports it and runs it in the engine. Spec-Bench harness runs target-alone, the draft, prompt lookup and early stopping, interleaved, into a per-category table. Layer pruning scores and cuts layers; see §11.7 for what that measured. 620 tests pass. Remaining before results: the 4B target, then the grid. |
 | 2026-10-01 | **The real numbers for the real pair, and they say the kernel is the problem.** Acceptance of the off-the-shelf Qwen3-0.6B against Qwen3-4B, both 4-bit, greedy, scored offline over 1,318 response positions from 24 Spec-Bench prompts: **alpha = 0.711**, by category 0.80 math_reasoning, 0.73 multiturn, 0.72 rag, 0.72 translation, 0.69 summarization, 0.61 qa. That is a healthy baseline before any distillation. With the measured v(k), c = 0.220 and o = 0.080 it predicts **0.98x at gamma = 1** -- speculation loses by 2%. Break-even needs alpha >= 0.75, which distillation can reach; 1.2x would need alpha >= 0.93, which it cannot. At the bandwidth floor the *same* alpha gives 1.92x at gamma = 3, so the missing factor of two is entirely the k-token kernel, which a microbenchmark shows running at 8-11% of AVX-VNNI peak **with every weight in L1** -- instruction-bound, not memory-starved. See §3 and §10.1. Also fixed a bug in my own harness: the per-stage breakdown counted a 128-token prefill among its tokens, which made the output projection look like 2.9% of a step against 9.7% of the bytes, i.e. 104 GB/s on a machine that measures 39. It is 7.5% once the prefill is excluded. 656 tests pass. |
@@ -880,18 +881,28 @@ where each result is:
 > and the kernel against a float64 reference at 1, 2, 8, 9, 80 and 304 blocks -- the paired region, the
 > tail and the single-block case.
 >
-> **Not settled: whether it is faster.** The run meant to show it put the split kernel at 1.34x, 1.84x,
-> 1.72x and 1.47x the interleaved baseline for k = 1, 2, 4, 8, against 1.13x, 1.40x, 1.35x and 1.86x
-> before pair-packing -- better at three of four, worse at k=8. But the baseline *itself* fell from
-> 51.7/71.1/108.1/90.6 to 36.3/42.0/54.7/61.4 GMAC/s in that run, and nothing about the interleaved
-> kernel changed, so the machine was a different instrument. Inside the run the split numbers were also
-> non-monotonic (90.3 at k=8 against 94.1 at k=4), which is a noise signature rather than a result.
+> **Settled, by stopping the cross-run comparisons.** Three attempts to time pair-packing gave three
+> answers, each comparing runs minutes apart on a machine where the *unchanged* interleaved baseline
+> drifted from 51.7 to 36.3 GMAC/s between them. So `dot_q4_soa_flat_multi` keeps the split-layout
+> kernel as it stood before pair-packing, and `bench_kernel.py` times all three in one process with the
+> variants alternating. Over 192 MB on six threads, pair-packing is **1.09x at k=1, 1.12x at k=2, 1.28x
+> at k=4 and 1.28x at k=8** -- less than the instruction count's 1.49x, since a pass is partly waiting
+> on memory, but real and growing with k.
 >
-> Settling it needs an in-process A/B of the two split variants, which means keeping the pre-pair-pack
-> kernel as a benchmark-only path with the benchmark building both activation layouts -- the lesson
-> already learned twice here, that on this machine only comparisons taken inside one process mean
-> anything. Until then the defensible claim is the instruction count: 43 per eight blocks per row
-> against 64, with 18.6% of them multiply-accumulates rather than 12.5%.
+> The two changes are clearest in the kernel's own v(k) at a cache-resident size, where nothing waits for
+> memory:
+>
+> | kernel | GMAC/s at k=1 | at k=2 | % peak at k=2 | its own v(2) |
+> |---|---|---|---|---|
+> | interleaved blocks | 22.4 | 22.3 | 9.9% | 2.02 |
+> | split, one block a load | 24.6 | 37.8 | 16.9% | 1.30 |
+> | split, two blocks a load | 29.7 | 52.8 | 23.6% | **1.12** |
+>
+> v(2) = 1.12 is verification costing almost nothing per extra token, which is exactly what the speedup
+> model wants -- and it is now true of the kernel in isolation, even though the engine around it is still
+> memory-bound at k=1 and so does not yet show it. A test pins the two split kernels as *bit-identical*
+> rather than close, since both reduce a block to the same integer and apply the same scales the same
+> way; that makes the slower one a cross-check as well as a baseline.
 
 > Change 3, register blocking over output rows, is **not** done; it is what the §3 table says is needed to
 > reach a useful speedup.
