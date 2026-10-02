@@ -60,6 +60,18 @@ ModelDrafter::ModelDrafter(Model& model, const SamplingConfig& sampling, float c
     }
 }
 
+double total_stage_seconds(const Model& model) {
+    double total = 0.0;
+    for (int stage = 0; stage < Model::kStageCount; ++stage) {
+        total += model.stage_seconds(static_cast<Model::Stage>(stage));
+    }
+    return total;
+}
+
+double ModelDrafter::model_seconds() const {
+    return total_stage_seconds(model_);
+}
+
 void ModelDrafter::reset() {
     model_.reset();
 }
@@ -257,6 +269,10 @@ std::vector<int32_t> generate_with_drafter(Model& target, Drafter& drafter,
     if (seq.size() > 1) {  // after this, every round has the same shapes
         target.forward(seq.data(), static_cast<int>(seq.size()) - 1, nullptr, false);
         drafter.prefill(seq);
+        local.prefill_seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        // Read the models' own timers here so the caller can tell the prefill's compute apart from
+        // the rounds'. Zero unless the caller enabled timing, which is exactly when it matters.
+        local.prefill_model_seconds = total_stage_seconds(target) + drafter.model_seconds();
     }
 
     bool finished = false;

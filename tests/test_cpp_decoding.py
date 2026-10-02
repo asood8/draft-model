@@ -348,3 +348,38 @@ def test_invalid_threshold_is_rejected(paths):
     target, draft = open_pair(paths)
     with pytest.raises(Exception):
         cpp.generate_speculative(target, draft, [1, 2], max_new_tokens=4, confidence_threshold=1.5)
+
+
+def test_stats_separate_the_prompt_pass_from_the_rounds(paths):
+    """The per-round overhead term o is wall time the models did not spend computing, over rounds.
+
+    A prompt pass is neither a round nor free, so it has to come out of both sides or it inflates o.
+    Measured on the 4B it happens not to -- a prefill's wall time equals its model time to the
+    microsecond, so the two corrections cancel -- but that is a fact about this engine rather than an
+    identity, and the arithmetic below is what notices if it stops holding.
+    """
+    target, draft = open_pair(paths, gamma=3)
+    for one in (target, draft):
+        one.set_timing(True)
+        one.reset_timings()
+
+    _, stats = cpp.generate_speculative(target, draft, [3, 4, 5, 6, 7], max_new_tokens=8, gamma=3)
+
+    assert stats["prefill_seconds"] > 0.0  # a five-token prompt does prefill
+    assert stats["prefill_model_seconds"] > 0.0  # and timing was on, so it is attributed
+    assert stats["prefill_model_seconds"] <= stats["prefill_seconds"] + 1e-9
+    assert stats["rounds_seconds"] == pytest.approx(stats["seconds"] - stats["prefill_seconds"],
+                                                    rel=1e-12)
+    # What is left for the rounds must be positive, or o comes out negative and nonsensical.
+    model_total = target.timings()["total"] + draft.timings()["total"]
+    assert model_total - stats["prefill_model_seconds"] > 0.0
+    assert stats["rounds_seconds"] > 0.0
+
+
+def test_a_prompt_of_one_token_has_no_prefill(paths):
+    """With nothing to prefill the fields stay zero rather than picking up the first round."""
+    target, draft = open_pair(paths, gamma=2)
+    _, stats = cpp.generate_speculative(target, draft, [3], max_new_tokens=4, gamma=2)
+    assert stats["prefill_seconds"] == 0.0
+    assert stats["prefill_model_seconds"] == 0.0
+    assert stats["rounds_seconds"] == stats["seconds"]

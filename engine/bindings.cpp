@@ -133,6 +133,9 @@ py::dict stats_as_dict(const DecodeStats& stats) {
     out["target_forwards"] = stats.target_forwards;
     out["draft_forwards"] = stats.draft_forwards;
     out["seconds"] = stats.seconds;
+    out["prefill_seconds"] = stats.prefill_seconds;
+    out["prefill_model_seconds"] = stats.prefill_model_seconds;
+    out["rounds_seconds"] = stats.rounds_seconds();
     out["accepted_lengths"] = stats.accepted_lengths;
     out["tokens_per_target_forward"] = stats.tokens_per_target_forward();
     out["alpha"] = stats.alpha();

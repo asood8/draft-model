@@ -1019,6 +1019,30 @@ def accept_or_resample(p, q, draft_tokens, greedy=False):
 **Done when** you have a plot of predicted versus measured speedup across γ, and know the best γ for this CPU,
 overall and per category.
 
+> **Measured, 2026-10-02: what the per-round overhead o is not.** o = 0.088 target steps, 8.71 ms a
+> round for the 4B/0.6B pair at gamma=4, and the two obvious explanations are both wrong.
+>
+> *Not the prompt pass.* The timed region used to start before the prefill, so its non-model time was
+> being divided across the rounds. `DecodeStats` now reports `prefill_seconds` and
+> `prefill_model_seconds` and the term is computed over the round loop alone -- and the correction turns
+> out to change nothing at all, because a prefill's wall time equals its model time to the microsecond
+> (12620.2 ms against 12620.2 ms). That is worth knowing in the negative: the engine's prefill carries
+> no measurable overhead, and the formula is now the right one regardless.
+>
+> *Not the softmax.* §10.4 and this script both said sampling over the vocabulary was most of it. The
+> default temperature is 0, `greedy()` tests exactly that, and the greedy path never calls
+> `warp_to_probs` -- so the run that produced 0.088 did not compute a single softmax. For *sampling* the
+> guess would have been right: (2γ+1) softmaxes over 151,669 entries at roughly 0.9 ms each is about
+> 8 ms a round, which is o-sized by coincidence.
+>
+> What is left is the round loop between forward calls: γ argmaxes in `propose`, about (accepted+1) in
+> `accept_or_resample`, the cache rollback and the sequence bookkeeping. Counting instructions puts that
+> under a millisecond -- roughly 940k float comparisons and 3.8 MB read from L3 -- against 8.71 ms
+> measured, which is 1.7 ms for each of the five forward calls in a round. **So most of o is still
+> unexplained**, and the next step is to instrument the round loop rather than guess a fourth time. A
+> vectorized argmax is worth having either way (the current one is a scalar loop reloading
+> `values[best]` each iteration), but on this evidence it would recover a tenth of the term at most.
+
 ### 10.5 Stretch goals
 
 - **Vocabulary trimming.** The draft's output layer covers all ~152k tokens and makes up about a quarter of its

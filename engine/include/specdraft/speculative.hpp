@@ -31,6 +31,11 @@ struct DecodeStats {
     int target_forwards = 0;  // verification passes, prefill excluded
     int draft_forwards = 0;
     double seconds = 0.0;
+    // The prompt pass, separated out because the per-round overhead term o is measured as whatever
+    // wall time the models did not spend computing, divided by rounds -- and a prefill is neither a
+    // round nor free. Charging its share to the rounds inflated o by most of its value.
+    double prefill_seconds = 0.0;
+    double prefill_model_seconds = 0.0;  // what the models' own timers attributed to that pass
     std::vector<int> accepted_lengths;
 
     // τ: the number this project is trying to raise.
@@ -44,6 +49,8 @@ struct DecodeStats {
         return trials > 0 ? static_cast<double>(accepted) / trials : 0.0;
     }
     double tokens_per_second() const { return seconds > 0.0 ? emitted / seconds : 0.0; }
+    // Wall time spent in the round loop, which is what o should be derived from.
+    double rounds_seconds() const { return seconds - prefill_seconds; }
 };
 
 struct GenerateOptions {
@@ -71,7 +78,14 @@ public:
     virtual void rewind(int kept) = 0;
     virtual void reset() = 0;
     virtual void prefill(const std::vector<int32_t>& prompt) = 0;
+    // What this drafter's model has spent computing so far, by its own stage timers. Zero for a
+    // drafter without a model, and zero unless timing is on; it exists so the per-round overhead can
+    // be measured with the prompt pass taken out of both sides.
+    virtual double model_seconds() const { return 0.0; }
 };
+
+// Sum of a model's stage timers: the compute it accounts for, against which anything else is overhead.
+double total_stage_seconds(const Model& model);
 
 // Guesses from a small model: the usual arrangement.
 class ModelDrafter : public Drafter {
@@ -83,6 +97,7 @@ public:
     void rewind(int kept) override;
     void reset() override;
     void prefill(const std::vector<int32_t>& prompt) override;
+    double model_seconds() const override;
 
 private:
     Model& model_;

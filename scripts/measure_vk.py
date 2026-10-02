@@ -188,9 +188,15 @@ def main() -> None:
         _, stats = cpp.generate_speculative(
             target, draft, [7] * args.context, max_new_tokens=args.overhead_tokens, gamma=gamma
         )
+        # The prompt pass is taken out of both sides. It is neither a round nor free, so charging its
+        # share to the rounds would inflate o -- measured, it happens not to, because a prefill's wall
+        # time equals its model time to the microsecond and the two corrections cancel exactly. The
+        # formula is still the right one, and it stays right if that ever stops being true.
         model_seconds = target.timings()["total"] + draft.timings()["total"]
         rounds = max(1, stats["rounds"])
-        per_round = (stats["seconds"] - model_seconds) / rounds
+        round_wall = stats["rounds_seconds"]
+        round_model = model_seconds - stats["prefill_model_seconds"]
+        per_round = (round_wall - round_model) / rounds
         o = per_round / single
 
         record["overhead"] = {
@@ -206,12 +212,21 @@ def main() -> None:
         print()
         print(f"per-round overhead at gamma={gamma}: {per_round * 1e3:.2f} ms, "
               f"o = {o:.3f} target steps")
-        print(f"  ({stats['seconds'] * 1e3:.0f} ms of generation, of which "
-              f"{model_seconds * 1e3:.0f} ms was the models computing, over {rounds} rounds)")
+        print(f"  ({round_wall * 1e3:.0f} ms in the rounds, of which "
+              f"{round_model * 1e3:.0f} ms was the models computing, over {rounds} rounds)")
+        print(f"  (the prompt pass, excluded from both: {stats['prefill_seconds'] * 1e3:.0f} ms wall, "
+              f"{stats['prefill_model_seconds'] * 1e3:.0f} ms of it computing)")
         print(f"  that run: tau {stats['tokens_per_target_forward']:.2f}, "
               f"alpha {stats['alpha']:.3f}")
-        print(f"  sampling over the vocabulary is most of this; it scales with gamma, "
-              f"not with model size")
+        # Worth stating what this is and is not, because the obvious guesses are both wrong.
+        # It is not the prompt pass: that is excluded above, and in any case a prefill's wall time
+        # equals its model time. It is not the softmax either, at the default temperature of 0 --
+        # greedy decoding never calls one. What is left is the round loop between forward calls:
+        # argmaxes over the vocabulary, the acceptance rule, and the cache rollback. Those account
+        # for under a millisecond by instruction count against the 8.7 ms measured on the 4B pair,
+        # so most of it is still unexplained and wants the round loop instrumented.
+        print(f"  this is the round loop between forward calls, not the prompt pass and not the")
+        print(f"  softmax, which greedy decoding never calls; see PLAN.md section 10.4")
         del target, draft
 
     args.out.mkdir(parents=True, exist_ok=True)
