@@ -77,7 +77,9 @@ It also measures o, the per-round overhead, and breaks it into the four sections
 for itself: dispatch (the forward calls minus what the models' own stage timers claim), the draft's
 sampling, the acceptance test, and bookkeeping. They sum to the round loop exactly, so **read the
 breakdown rather than the single number** -- o was guessed at four times before the loop was asked,
-and the guesses were wrong in both directions.
+and the guesses were wrong in both directions. Measured on the 4B pair it is now 0.57 ms a round,
+essentially all of it the argmaxes, with thread dispatch at 2 microseconds; anything much larger than
+that means something regressed.
 
 ## 3b. Why v(k) has the slope it has (≈3 minutes)
 

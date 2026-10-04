@@ -1055,11 +1055,33 @@ overall and per category.
 > one was off by 12x because it assumed throughput where the loop had a dependent load and a
 > mispredicted branch. Measure the thing.
 >
-> The remaining ~4.4 ms is still 0.9 ms per forward call, and `DecodeStats` now carries the four sections
-> of the round loop -- `propose_seconds`, `draft_forward_seconds`, `verify_seconds`, `accept_seconds`,
-> plus the leftover -- which sum to `rounds_seconds` exactly. `measure_vk.py` prints them as dispatch,
-> draft sampling, accept and bookkeeping, so the next quiet-machine run attributes the rest instead of
-> arguing about it. Thread dispatch is the suspect: ~180 barriers a forward, five forwards a round.
+> `DecodeStats` now carries the four sections of the round loop -- `propose_seconds`,
+> `draft_forward_seconds`, `verify_seconds`, `accept_seconds`, plus the leftover -- which sum to
+> `rounds_seconds` exactly, and `measure_vk.py` prints them as dispatch, draft sampling, accept and
+> bookkeeping.
+>
+> **Measured, 2026-10-03, and o is settled: 8.71 ms -> 0.57 ms, and it was argmax all the way down.**
+> The 4B/0.6B pair at gamma=4, context 128, 14 rounds:
+>
+> | section | per round | share |
+> |---|---|---|
+> | draft sampling (gamma argmaxes) | 0.332 ms | 58.0% |
+> | accept (accepted+2 argmaxes) | 0.236 ms | 41.3% |
+> | dispatch | 0.002 ms | 0.4% |
+> | bookkeeping | 0.002 ms | 0.3% |
+>
+> So **o = 0.006 target steps, down from 0.088**, and the two terms that remain are both the vectorized
+> argmax doing its 6.7 scans a round at about 85 us each -- a little above the 59.7 us benchmark, the
+> logits row being cold rather than reused. Thread dispatch, the suspect I had named, is 2 us a round:
+> every forward call is accounted for by the model's own stage timers, with ~180 barriers in each one
+> costing nothing measurable. The recovery is larger than the 3.9 ms predicted from the benchmark,
+> which says the scalar scan was costing more like 1.2 ms on a freshly written 608 KB row than the
+> 538 us it costs on a warm one -- the prediction was right about the cause and low on the size.
+>
+> The practical consequence: **the third term of the speedup formula is negligible on this engine**, so
+> `gamma*c + v(gamma+1)` is the denominator that matters, and what is left to win is the kernel and the
+> acceptance rate. (That run also reported 200.6 ms per verification pass against the ~130 ms this pair
+> should take, so its absolute speeds are drift, not data -- the shares are what it was for. Section 13.)
 
 ### 10.5 Stretch goals
 
