@@ -73,6 +73,12 @@ rates. **This is the first real test of the project's premise:** on the 0.6B, v(
 the weights per token, so its curve should be much flatter — if it is not, the honest finding is
 that CPU verification is expensive and small γ wins.
 
+It also measures o, the per-round overhead, and breaks it into the four sections the round loop times
+for itself: dispatch (the forward calls minus what the models' own stage timers claim), the draft's
+sampling, the acceptance test, and bookkeeping. They sum to the round loop exactly, so **read the
+breakdown rather than the single number** -- o was guessed at four times before the loop was asked,
+and the guesses were wrong in both directions.
+
 ## 3b. Why v(k) has the slope it has (≈3 minutes)
 
 Step 3 gives the curve; this says what is behind it. The same kernel is timed with no model around

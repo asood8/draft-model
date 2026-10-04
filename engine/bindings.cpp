@@ -136,6 +136,12 @@ py::dict stats_as_dict(const DecodeStats& stats) {
     out["prefill_seconds"] = stats.prefill_seconds;
     out["prefill_model_seconds"] = stats.prefill_model_seconds;
     out["rounds_seconds"] = stats.rounds_seconds();
+    out["propose_seconds"] = stats.propose_seconds;
+    out["draft_forward_seconds"] = stats.draft_forward_seconds;
+    out["verify_seconds"] = stats.verify_seconds;
+    out["accept_seconds"] = stats.accept_seconds;
+    out["draft_sampling_seconds"] = stats.draft_sampling_seconds();
+    out["bookkeeping_seconds"] = stats.bookkeeping_seconds();
     out["accepted_lengths"] = stats.accepted_lengths;
     out["tokens_per_target_forward"] = stats.tokens_per_target_forward();
     out["alpha"] = stats.alpha();
@@ -600,6 +606,57 @@ PYBIND11_MODULE(_engine, m) {
         py::arg("p"), py::arg("q"), py::arg("guesses"), py::arg("greedy") = false,
         py::arg("seed") = uint64_t{0},
         "The engine's acceptance rule, for testing against the Python oracle.");
+
+    m.def(
+        "argmax",
+        [](FloatArray values) { return argmax(values.data(), static_cast<int>(values.size())); },
+        py::arg("values"), "First index of the largest value: the engine's vectorized scan.");
+
+    m.def(
+        "argmax_scalar",
+        [](FloatArray values) {
+            return argmax_scalar(values.data(), static_cast<int>(values.size()));
+        },
+        py::arg("values"), "The scalar scan it replaced, kept so a test can pin them together.");
+
+    // Both variants timed by one piece of code in one process, which is the only comparison this
+    // machine supports: an unchanged baseline drifts by a third between runs.
+    m.def(
+        "bench_argmax",
+        [](int n, int iters, const std::string& variant) {
+            if (n <= 0 || iters <= 0) {
+                throw std::invalid_argument("n and iters must be positive");
+            }
+            // A deterministic spread whose largest value sits near the end, so a scan that gave up
+            // early would be caught by the index this returns rather than merely look fast.
+            std::vector<float> values(static_cast<size_t>(n));
+            uint32_t state = 12345u;
+            for (int i = 0; i < n; ++i) {
+                state = state * 1664525u + 1013904223u;
+                values[static_cast<size_t>(i)] = static_cast<float>(state >> 8) * (1.0f / 16777216.0f);
+            }
+            const int planted = n - 1 - n / 8;
+            values[static_cast<size_t>(planted)] = 2.0f;
+            if (variant != "scalar" && variant != "vector") {
+                throw std::invalid_argument("variant must be \"vector\" or \"scalar\"");
+            }
+            int (*scan)(const float*, int) = variant == "scalar" ? &argmax_scalar : &argmax;
+            long long found = 0;
+            const auto started = std::chrono::steady_clock::now();
+            for (int it = 0; it < iters; ++it) {
+                found += scan(values.data(), n);  // used, so the call cannot be hoisted away
+            }
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            py::dict out;
+            out["seconds"] = seconds;
+            out["elements_per_second"] = static_cast<double>(n) * iters / seconds;
+            out["best"] = static_cast<int>(found / iters);
+            out["planted"] = planted;
+            return out;
+        },
+        py::arg("n"), py::arg("iters") = 1, py::arg("variant") = "vector",
+        "Time one of the two argmax scans over a row of n floats.");
 
     m.def(
         "core_topology",

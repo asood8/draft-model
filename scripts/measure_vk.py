@@ -199,6 +199,22 @@ def main() -> None:
         per_round = (round_wall - round_model) / rounds
         o = per_round / single
 
+        # Where that overhead actually sits. The round loop times its own sections, so o can be
+        # attributed rather than guessed at -- which it was, wrongly, three times. Everything here is
+        # per round.
+        #   dispatch:    forward calls minus what the models' stage timers claim, so thread wake-ups,
+        #                barriers, and anything between stages
+        #   draft work:  the draft's sampling: argmaxes over the vocabulary, one per guess
+        #   accept:      the acceptance test, which is another argmax per guess when greedy
+        #   bookkeeping: appending tokens, the stop check, rewinding both caches
+        forwards = stats["draft_forward_seconds"] + stats["verify_seconds"]
+        parts = {
+            "dispatch": (forwards - round_model) / rounds,
+            "draft sampling": stats["draft_sampling_seconds"] / rounds,
+            "accept": stats["accept_seconds"] / rounds,
+            "bookkeeping": stats["bookkeeping_seconds"] / rounds,
+        }
+
         record["overhead"] = {
             "gamma": gamma,
             "rounds": stats["rounds"],
@@ -206,6 +222,7 @@ def main() -> None:
             "model_seconds": model_seconds,
             "seconds_per_round": per_round,
             "o_per_round": o,
+            "parts_seconds_per_round": parts,
             "tokens_per_target_forward": stats["tokens_per_target_forward"],
             "alpha": stats["alpha"],
         }
@@ -218,15 +235,14 @@ def main() -> None:
               f"{stats['prefill_model_seconds'] * 1e3:.0f} ms of it computing)")
         print(f"  that run: tau {stats['tokens_per_target_forward']:.2f}, "
               f"alpha {stats['alpha']:.3f}")
-        # Worth stating what this is and is not, because the obvious guesses are both wrong.
-        # It is not the prompt pass: that is excluded above, and in any case a prefill's wall time
-        # equals its model time. It is not the softmax either, at the default temperature of 0 --
-        # greedy decoding never calls one. What is left is the round loop between forward calls:
-        # argmaxes over the vocabulary, the acceptance rule, and the cache rollback. Those account
-        # for under a millisecond by instruction count against the 8.7 ms measured on the 4B pair,
-        # so most of it is still unexplained and wants the round loop instrumented.
-        print(f"  this is the round loop between forward calls, not the prompt pass and not the")
-        print(f"  softmax, which greedy decoding never calls; see PLAN.md section 10.4")
+        # The four sections cover the round loop exactly, so this is a decomposition of o rather
+        # than a list of suspects. It is not the prompt pass, which is excluded above, and not the
+        # softmax, which greedy decoding never calls; see PLAN.md section 10.4.
+        print("  where it goes, per round:")
+        for name, seconds in sorted(parts.items(), key=lambda kv: -kv[1]):
+            share = seconds / per_round if per_round > 0 else 0.0
+            print(f"    {name:<15} {seconds * 1e3:>7.3f} ms  {100 * share:>5.1f}%  "
+                  f"o = {seconds / single:.3f}")
         del target, draft
 
     args.out.mkdir(parents=True, exist_ok=True)

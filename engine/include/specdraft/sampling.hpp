@@ -33,7 +33,12 @@ private:
     uint64_t state_[4];
 };
 
+// First index of the largest value. Vectorized, because greedy decoding spends real time
+// here: two scans of a 152k-element row per guess.
 int argmax(const float* values, int n);
+// The scalar scan it replaced, kept so the two can be compared in one process -- the only
+// kind of comparison this machine supports -- and so a test can pin them to the same answer.
+int argmax_scalar(const float* values, int n);
 
 // Logits in, probabilities out, in the same buffer. `scratch` is reused across calls so the
 // nucleus search does not allocate per token.

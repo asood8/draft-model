@@ -1,5 +1,7 @@
 #include "specdraft/sampling.hpp"
 
+#include <immintrin.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -127,10 +129,69 @@ float Rng::next_float() {
     return static_cast<float>(next_u64() >> 40) * (1.0f / 16777216.0f);
 }
 
-int argmax(const float* values, int n) {
+int argmax_scalar(const float* values, int n) {
     int best = 0;
     for (int i = 1; i < n; ++i) {
         if (values[i] > values[best]) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+// Eight lanes at a time, each keeping its own running best and the index it came from.
+//
+// Worth vectorizing because greedy speculative decoding runs this twice per guess -- once in the
+// draft's own sampling and once in the acceptance test -- over a 152k vocabulary, which is 600 KB a
+// call, and the scalar loop above reloads `values[best]` every iteration.
+//
+// The tie-break has to stay "first index of the largest value", because that is what the Python
+// reference does and what the bit-exactness tests compare: a version that returned the last of a
+// tie would show up as a decoding difference rather than as a speed change. Lane j only ever sees
+// indices j, j+8, j+16 ..., so taking the smallest index among the lanes that tie reproduces the
+// scalar scan exactly on any row of real numbers.
+//
+// A row containing a NaN is the one case where the two differ, and deliberately. The lanes start at
+// -inf, so a NaN never wins a lane and the scan looks past it; the scalar version skipped NaNs
+// everywhere except at index 0, where its `best` started and nothing could ever beat it, so a single
+// NaN in the first position used to swallow the whole row. Neither matches numpy, which treats NaN as
+// the maximum. A NaN logit is a bug upstream either way; what is promised here is that a NaN is never
+// chosen unless every value is one, in which case this returns 0 as before.
+int argmax(const float* values, int n) {
+    int best = 0;
+    float best_value = -std::numeric_limits<float>::infinity();
+    int i = 0;
+    if (n >= 8) {
+        __m256 best_values = _mm256_set1_ps(best_value);
+        __m256i best_indices = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        __m256i indices = best_indices;
+        const __m256i eight = _mm256_set1_epi32(8);
+        for (; i + 8 <= n; i += 8) {
+            const __m256 candidate = _mm256_loadu_ps(values + i);
+            const __m256 better = _mm256_cmp_ps(candidate, best_values, _CMP_GT_OQ);
+            best_values = _mm256_blendv_ps(best_values, candidate, better);
+            best_indices = _mm256_castps_si256(_mm256_blendv_ps(
+                _mm256_castsi256_ps(best_indices), _mm256_castsi256_ps(indices), better));
+            indices = _mm256_add_epi32(indices, eight);
+        }
+        alignas(32) float lane_values[8];
+        alignas(32) int32_t lane_indices[8];
+        _mm256_store_ps(lane_values, best_values);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(lane_indices), best_indices);
+        best_value = lane_values[0];
+        best = lane_indices[0];
+        for (int lane = 1; lane < 8; ++lane) {
+            const bool wins = lane_values[lane] > best_value ||
+                              (lane_values[lane] == best_value && lane_indices[lane] < best);
+            if (wins) {
+                best_value = lane_values[lane];
+                best = lane_indices[lane];
+            }
+        }
+    }
+    for (; i < n; ++i) {
+        if (values[i] > best_value) {
+            best_value = values[i];
             best = i;
         }
     }

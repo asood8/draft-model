@@ -1039,9 +1039,27 @@ overall and per category.
 > `accept_or_resample`, the cache rollback and the sequence bookkeeping. Counting instructions puts that
 > under a millisecond -- roughly 940k float comparisons and 3.8 MB read from L3 -- against 8.71 ms
 > measured, which is 1.7 ms for each of the five forward calls in a round. **So most of o is still
-> unexplained**, and the next step is to instrument the round loop rather than guess a fourth time. A
-> vectorized argmax is worth having either way (the current one is a scalar loop reloading
-> `values[best]` each iteration), but on this evidence it would recover a tenth of the term at most.
+> unexplained**, and the next step is to instrument the round loop rather than guess a fourth time.
+>
+> **Measured, 2026-10-03: the argmax, and why counting instructions got it wrong.** The paragraph above
+> is the fourth wrong guess, and it is wrong in the other direction. Timed in one process against the
+> vectorized replacement (`bench_argmax`, both variants alternating), the scalar scan over a 151,936-entry
+> row takes **538 µs**, not the ~90 µs a comparison per cycle would predict: 12 cycles an element, because
+> `values[best]` is reloaded every iteration and the branch that updates it is unpredictable on random
+> logits. Eight lanes with their own running best and index bring it to **59.7 µs, 9.0x**, and the same
+> ratio holds at 32k entries, so it is instruction cost rather than memory.
+>
+> A greedy round at γ=4 makes about 7.3 of those scans -- four in `propose`, and accepted+2 in the
+> acceptance test, which at τ=2.4 averages 3.3 -- so **3.9 ms of the 8.71 ms was argmax**, now 0.4 ms.
+> The lesson is about the method rather than the kernel: an instruction count is a lower bound, and this
+> one was off by 12x because it assumed throughput where the loop had a dependent load and a
+> mispredicted branch. Measure the thing.
+>
+> The remaining ~4.4 ms is still 0.9 ms per forward call, and `DecodeStats` now carries the four sections
+> of the round loop -- `propose_seconds`, `draft_forward_seconds`, `verify_seconds`, `accept_seconds`,
+> plus the leftover -- which sum to `rounds_seconds` exactly. `measure_vk.py` prints them as dispatch,
+> draft sampling, accept and bookkeeping, so the next quiet-machine run attributes the rest instead of
+> arguing about it. Thread dispatch is the suspect: ~180 barriers a forward, five forwards a round.
 
 ### 10.5 Stretch goals
 

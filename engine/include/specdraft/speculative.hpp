@@ -36,6 +36,18 @@ struct DecodeStats {
     // round nor free. Charging its share to the rounds inflated o by most of its value.
     double prefill_seconds = 0.0;
     double prefill_model_seconds = 0.0;  // what the models' own timers attributed to that pass
+    // Where the round loop's wall time actually goes. o was measured as one lump -- wall time the
+    // models' stage timers did not account for -- and three guesses at what it contained were wrong
+    // (plan §10.4), so the loop now reports its own sections instead. These four plus the models'
+    // compute cover every nanosecond between the prompt pass and the end, which is what makes the
+    // residual meaningful rather than a place for mistakes to hide.
+    //
+    // Always on: a clock read is tens of nanoseconds against a round of milliseconds, and an
+    // overhead term measured only when someone asks for it is an overhead term nobody measures.
+    double propose_seconds = 0.0;        // all of Drafter::propose, forwards included
+    double draft_forward_seconds = 0.0;  // the draft model's forward calls within that
+    double verify_seconds = 0.0;         // the target's one pass per round
+    double accept_seconds = 0.0;         // warping, the acceptance test, resampling
     std::vector<int> accepted_lengths;
 
     // τ: the number this project is trying to raise.
@@ -51,6 +63,14 @@ struct DecodeStats {
     double tokens_per_second() const { return seconds > 0.0 ? emitted / seconds : 0.0; }
     // Wall time spent in the round loop, which is what o should be derived from.
     double rounds_seconds() const { return seconds - prefill_seconds; }
+    // What the loop spent outside its three timed sections: appending tokens, the stop check, and
+    // rewinding both caches. Small by construction, and a figure that stops being small is a bug.
+    double bookkeeping_seconds() const {
+        return rounds_seconds() - propose_seconds - verify_seconds - accept_seconds;
+    }
+    // The draft's sampling: argmaxes, softmaxes when they are enabled, and the scatter a trimmed
+    // draft does. Whatever propose spent not computing.
+    double draft_sampling_seconds() const { return propose_seconds - draft_forward_seconds; }
 };
 
 struct GenerateOptions {

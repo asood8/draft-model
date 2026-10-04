@@ -37,6 +37,20 @@ std::vector<int32_t> pending_for(const Model& model, const std::vector<int32_t>&
     return std::vector<int32_t>(seq.begin() + have, seq.end());
 }
 
+// Adds its own lifetime to a running total, so a section of the loop can be timed without an
+// early-return or a throw losing the measurement.
+class Stopwatch {
+public:
+    explicit Stopwatch(double& total) : total_(total), started_(Clock::now()) {}
+    ~Stopwatch() { total_ += std::chrono::duration<double>(Clock::now() - started_).count(); }
+    Stopwatch(const Stopwatch&) = delete;
+    Stopwatch& operator=(const Stopwatch&) = delete;
+
+private:
+    double& total_;
+    Clock::time_point started_;
+};
+
 float max_probability(const float* probs, int n) {
     float best = 0.0f;
     for (int i = 0; i < n; ++i) {
@@ -102,7 +116,10 @@ int ModelDrafter::propose(const std::vector<int32_t>& seq, int gamma, int32_t* g
 
     // Feed whatever the draft's cache is missing, then walk forward one token at a time.
     const std::vector<int32_t> pending = pending_for(model_, seq);
-    model_.forward(pending.data(), static_cast<int>(pending.size()), destination(0), false);
+    {
+        Stopwatch watch(stats.draft_forward_seconds);
+        model_.forward(pending.data(), static_cast<int>(pending.size()), destination(0), false);
+    }
     ++stats.draft_forwards;
 
     int produced = 0;
@@ -140,7 +157,10 @@ int ModelDrafter::propose(const std::vector<int32_t>& seq, int gamma, int32_t* g
         ++produced;
 
         if (j + 1 < gamma) {
-            model_.forward(&guesses[j], 1, destination(j + 1), false);
+            {
+                Stopwatch watch(stats.draft_forward_seconds);
+                model_.forward(&guesses[j], 1, destination(j + 1), false);
+            }
             ++stats.draft_forwards;
         }
     }
@@ -277,8 +297,12 @@ std::vector<int32_t> generate_with_drafter(Model& target, Drafter& drafter,
 
     bool finished = false;
     while (local.emitted < options.max_new_tokens && !finished) {
-        const int proposed =
-            drafter.propose(seq, gamma, guesses.data(), draft_rows.data(), vocab, local, rng);
+        int proposed = 0;
+        {
+            Stopwatch watch(local.propose_seconds);
+            proposed = drafter.propose(seq, gamma, guesses.data(), draft_rows.data(), vocab, local,
+                                       rng);
+        }
         if (proposed < 0 || proposed > gamma) {
             throw std::runtime_error("a drafter proposed an impossible number of tokens");
         }
@@ -287,18 +311,24 @@ std::vector<int32_t> generate_with_drafter(Model& target, Drafter& drafter,
         // an ordinary decoding step, which is what a drafter with nothing to say should cost.
         verify[0] = seq.back();
         std::copy(guesses.begin(), guesses.begin() + proposed, verify.begin() + 1);
-        target.forward(verify.data(), proposed + 1, target_rows.data(), true);
-        ++local.target_forwards;
-        if (!greedy) {
-            for (int j = 0; j <= proposed; ++j) {
-                warp_to_probs(target_rows.data() + static_cast<size_t>(j) * vocab, vocab,
-                              options.sampling, scratch);
-            }
+        {
+            Stopwatch watch(local.verify_seconds);
+            target.forward(verify.data(), proposed + 1, target_rows.data(), true);
         }
+        ++local.target_forwards;
 
-        const Verdict verdict =
-            accept_or_resample(target_rows.data(), vocab, draft_rows.data(), vocab, guesses.data(),
-                               proposed, vocab, greedy, rng, residual);
+        Verdict verdict;
+        {
+            Stopwatch watch(local.accept_seconds);
+            if (!greedy) {
+                for (int j = 0; j <= proposed; ++j) {
+                    warp_to_probs(target_rows.data() + static_cast<size_t>(j) * vocab, vocab,
+                                  options.sampling, scratch);
+                }
+            }
+            verdict = accept_or_resample(target_rows.data(), vocab, draft_rows.data(), vocab,
+                                         guesses.data(), proposed, vocab, greedy, rng, residual);
+        }
         ++local.rounds;
         local.accepted += verdict.accepted;
         local.accepted_lengths[static_cast<size_t>(verdict.accepted)] += 1;

@@ -114,6 +114,64 @@ def test_first_emitted_token_follows_the_target():
     assert pvalue > 1e-3, f"emitted token does not follow p (p={pvalue:.2e})"
 
 
+# ------------------------------------------------------------------------------ argmax
+
+
+@pytest.mark.parametrize("n", [1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1023, 151936])
+def test_the_two_argmax_scans_agree(n):
+    """The vectorized scan has to choose the same index as the scalar one it replaced.
+
+    This is not a numerical approximation anywhere: the index is a token id, so a disagreement is a
+    different word, and the tie-break decides it whenever two logits land on the same float -- which
+    they do, a quantized output projection producing plenty of exact ties. Lengths either side of a
+    multiple of eight are where a vectorized scan gets its tail wrong, so all of them are covered.
+    """
+    rng = np.random.default_rng(n)
+    rows = [
+        rng.standard_normal(n).astype(np.float32),
+        np.zeros(n, dtype=np.float32),  # every value tied, so the first index must win
+        rng.integers(0, 3, size=n).astype(np.float32),  # ties in bulk
+        np.full(n, -np.inf, dtype=np.float32),
+    ]
+    tail = rng.standard_normal(n).astype(np.float32)
+    tail[n - 1] = np.inf  # the largest value in the last lane the tail loop touches
+    rows.append(tail)
+    for row in rows:
+        assert cpp.argmax(row) == cpp.argmax_scalar(row) == int(np.argmax(row))
+
+
+def test_a_nan_logit_is_skipped_rather_than_latched():
+    """The one place the vectorized scan differs from the scalar one, deliberately.
+
+    ``x > NaN`` is false for every x, so the scalar scan's running best could never move off index 0
+    once a NaN sat there: one NaN in the first position swallowed the whole row, while a NaN anywhere
+    else was ignored. The vectorized lanes start at -inf, so a NaN never wins a lane and the scan
+    looks past it wherever it is. Neither matches numpy, which calls NaN the maximum. A NaN logit is a
+    bug upstream either way; what is pinned here is that the engine ignores one unless there is
+    nothing else to choose.
+    """
+    row = np.arange(32, dtype=np.float32)
+    row[0] = np.nan
+    assert cpp.argmax(row) == 31
+    assert cpp.argmax_scalar(row) == 0  # what it used to answer
+    every = np.full(16, np.nan, dtype=np.float32)
+    assert cpp.argmax(every) == cpp.argmax_scalar(every) == 0
+
+
+@pytest.mark.parametrize("variant", ["vector", "scalar"])
+def test_the_argmax_benchmark_finds_what_it_planted(variant):
+    """A benchmark whose answer nobody checks can happily time a scan that stops early."""
+    result = cpp.bench_argmax(n=4096, iters=2, variant=variant)
+    assert result["best"] == result["planted"]
+    assert result["seconds"] > 0.0
+    assert result["elements_per_second"] > 0.0
+
+
+def test_the_argmax_benchmark_rejects_an_unknown_variant():
+    with pytest.raises(ValueError):
+        cpp.bench_argmax(n=64, iters=1, variant="sideways")
+
+
 # --------------------------------------------------------------- the loop, end to end
 
 
@@ -383,3 +441,48 @@ def test_a_prompt_of_one_token_has_no_prefill(paths):
     assert stats["prefill_seconds"] == 0.0
     assert stats["prefill_model_seconds"] == 0.0
     assert stats["rounds_seconds"] == stats["seconds"]
+
+
+def test_the_round_loop_accounts_for_every_section_of_its_own_time(paths):
+    """o used to be one lump of wall time the models could not explain, and guesses at what was in it
+    were wrong three times over (plan section 10.4), so the loop reports its own sections instead.
+
+    The four add up to the round loop exactly, by construction: three timed sections plus whatever is
+    left. That is what makes the leftover worth reading -- a residual that is merely small has nowhere
+    for a mistake to hide, while a lump measured as a subtraction has room for all of them.
+    """
+    target, draft = open_pair(paths, gamma=3)
+    for one in (target, draft):
+        one.set_timing(True)
+        one.reset_timings()
+
+    _, stats = cpp.generate_speculative(target, draft, [3, 4, 5, 6, 7], max_new_tokens=12, gamma=3)
+
+    for key in ("propose_seconds", "draft_forward_seconds", "verify_seconds", "accept_seconds"):
+        assert stats[key] > 0.0, key
+    # The draft's forward calls happen inside propose, so one bounds the other and the difference is
+    # the draft's own sampling.
+    assert stats["draft_forward_seconds"] <= stats["propose_seconds"]
+    assert stats["draft_sampling_seconds"] == pytest.approx(
+        stats["propose_seconds"] - stats["draft_forward_seconds"], rel=1e-12
+    )
+    # The sections and the leftover are the whole round loop, to the nanosecond.
+    parts = (stats["propose_seconds"] + stats["verify_seconds"] + stats["accept_seconds"]
+             + stats["bookkeeping_seconds"])
+    assert parts == pytest.approx(stats["rounds_seconds"], rel=1e-12)
+    # Appending tokens, the stop check and rewinding two caches, against two models' forward passes:
+    # a leftover that stops being small means something untimed grew.
+    assert 0.0 <= stats["bookkeeping_seconds"] < 0.5 * stats["rounds_seconds"]
+    # And the models' compute has to fit inside the forward calls that were timed around it.
+    model_total = target.timings()["total"] + draft.timings()["total"]
+    inside_rounds = model_total - stats["prefill_model_seconds"]
+    assert inside_rounds <= stats["draft_forward_seconds"] + stats["verify_seconds"] + 1e-9
+
+
+def test_a_drafter_that_runs_no_model_reports_no_forward_time(paths):
+    """Prompt lookup copies tokens, so all of propose is sampling and none of it is a forward pass."""
+    target, _ = open_pair(paths, gamma=3)
+    _, stats = cpp.generate_prompt_lookup(target, [3, 4, 5, 3, 4, 5], max_new_tokens=8, gamma=3)
+    assert stats["draft_forward_seconds"] == 0.0
+    assert stats["draft_sampling_seconds"] == stats["propose_seconds"]
+    assert stats["verify_seconds"] > 0.0
