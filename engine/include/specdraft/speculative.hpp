@@ -134,7 +134,9 @@ private:
 // makes it hard to beat where text repeats, such as summarization (plan §10.4).
 class PromptLookupDrafter : public Drafter {
 public:
-    PromptLookupDrafter(int vocab, int max_ngram = 3, int min_ngram = 1);
+    // `greedy` only decides whether q is built: the acceptance rule does not read it when
+    // greedy, and a row of it is 608 KB on the real vocabulary.
+    PromptLookupDrafter(int vocab, bool greedy, int max_ngram = 3, int min_ngram = 1);
     const char* name() const override { return "prompt_lookup"; }
     int propose(const std::vector<int32_t>& seq, int gamma, int32_t* guesses, float* q,
                 int q_stride, DecodeStats& stats, Rng& rng) override;
@@ -144,6 +146,7 @@ public:
 
 private:
     int vocab_;
+    bool greedy_;
     int max_ngram_;
     int min_ngram_;
 };

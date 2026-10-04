@@ -126,7 +126,8 @@ int ModelDrafter::propose(const std::vector<int32_t>& seq, int gamma, int32_t* g
     for (int j = 0; j < gamma; ++j) {
         float* row = q + static_cast<size_t>(j) * q_stride;
         float* values = trimmed ? trimmed_.data() : row;
-        if (!trimmed && vocab_ < q_stride) {
+        if (!trimmed && !greedy && vocab_ < q_stride) {
+            // The tokens this draft cannot produce get probability zero. Only when q is read at all.
             std::fill(row + vocab_, row + q_stride, 0.0f);
         }
 
@@ -144,14 +145,17 @@ int ModelDrafter::propose(const std::vector<int32_t>& seq, int gamma, int32_t* g
 
         const int chosen = greedy ? argmax(values, width_) : sample_from_probs(values, width_, rng);
         guesses[j] = model_.token_for_logit(static_cast<uint32_t>(chosen));
-        if (trimmed) {
+        if (trimmed && !greedy) {
             // The acceptance rule reads q over the target's vocabulary, so place each kept
             // token's probability at its own id and leave the dropped tokens at zero.
+            //
+            // Not built when greedy, which never reads q: on the real vocabulary this row is
+            // 608 KB, so writing it was a 2.4 MB memset a round to be ignored. What the previous
+            // round left in it stays there.
             std::fill(row, row + q_stride, 0.0f);
-            if (!greedy) {
-                for (int i = 0; i < width_; ++i) {
-                    row[model_.token_for_logit(static_cast<uint32_t>(i))] = trimmed_[static_cast<size_t>(i)];
-                }
+            for (int i = 0; i < width_; ++i) {
+                row[model_.token_for_logit(static_cast<uint32_t>(i))] =
+                    trimmed_[static_cast<size_t>(i)];
             }
         }
         ++produced;
@@ -170,8 +174,11 @@ int ModelDrafter::propose(const std::vector<int32_t>& seq, int gamma, int32_t* g
 
 // ----------------------------------------------------------------- prompt lookup drafter
 
-PromptLookupDrafter::PromptLookupDrafter(int vocab, int max_ngram, int min_ngram)
-    : vocab_(vocab), max_ngram_(std::max(1, max_ngram)), min_ngram_(std::max(1, min_ngram)) {
+PromptLookupDrafter::PromptLookupDrafter(int vocab, bool greedy, int max_ngram, int min_ngram)
+    : vocab_(vocab),
+      greedy_(greedy),
+      max_ngram_(std::max(1, max_ngram)),
+      min_ngram_(std::max(1, min_ngram)) {
     if (min_ngram_ > max_ngram_) {
         throw std::invalid_argument("min_ngram must not exceed max_ngram");
     }
@@ -194,6 +201,9 @@ int PromptLookupDrafter::propose(const std::vector<int32_t>& seq, int gamma, int
             }
             for (int j = 0; j < take; ++j) {
                 guesses[j] = seq[static_cast<size_t>(start + size + j)];
+                if (greedy_) {
+                    continue;  // q is never read, and a row of it is 608 KB to zero
+                }
                 // A copied token carries no distribution, so treat it as drawn from a point
                 // mass. The acceptance rule then takes it with probability p(token) and
                 // otherwise resamples from p with that token removed, which still leaves the
@@ -379,7 +389,8 @@ std::vector<int32_t> generate_speculative(Model& target, Model& draft,
 std::vector<int32_t> generate_prompt_lookup(Model& target, const std::vector<int32_t>& prompt,
                                             const GenerateOptions& options, int max_ngram,
                                             DecodeStats* stats) {
-    PromptLookupDrafter drafter(static_cast<int>(target.config().vocab_limit), max_ngram);
+    PromptLookupDrafter drafter(static_cast<int>(target.config().vocab_limit),
+                               options.sampling.greedy(), max_ngram);
     return generate_with_drafter(target, drafter, prompt, options, stats);
 }
 
