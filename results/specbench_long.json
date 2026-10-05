@@ -1,0 +1,245 @@
+{
+  "summary": {
+    "target": {
+      "rag": {
+        "turns": 1,
+        "tokens": 64,
+        "tokens_per_target_forward": 1.0,
+        "tokens_per_second": 1.393245996648586,
+        "mean_accepted_per_round": 0.0,
+        "mean_proposed_per_round": 0.0,
+        "alpha": 0.0
+      },
+      "all": {
+        "turns": 2,
+        "tokens": 128,
+        "tokens_per_target_forward": 1.0,
+        "tokens_per_second": 1.0695668065811823,
+        "mean_accepted_per_round": 0.0,
+        "mean_proposed_per_round": 0.0,
+        "alpha": 0.0
+      },
+      "summarization": {
+        "turns": 1,
+        "tokens": 64,
+        "tokens_per_target_forward": 1.0,
+        "tokens_per_second": 0.7458876165137789,
+        "mean_accepted_per_round": 0.0,
+        "mean_proposed_per_round": 0.0,
+        "alpha": 0.0
+      }
+    },
+    "speculative": {
+      "rag": {
+        "turns": 1,
+        "tokens": 64,
+        "tokens_per_target_forward": 1.4222222222222223,
+        "tokens_per_second": 1.2486684731062418,
+        "mean_accepted_per_round": 0.4444444444444444,
+        "mean_proposed_per_round": 1.0,
+        "alpha": 0.4444444444444444
+      },
+      "all": {
+        "turns": 2,
+        "tokens": 128,
+        "tokens_per_target_forward": 1.5058823529411764,
+        "tokens_per_second": 0.961011801819774,
+        "mean_accepted_per_round": 0.5176470588235295,
+        "mean_proposed_per_round": 1.0,
+        "alpha": 0.5176470588235295
+      },
+      "summarization": {
+        "turns": 1,
+        "tokens": 64,
+        "tokens_per_target_forward": 1.6,
+        "tokens_per_second": 0.6733551305333062,
+        "mean_accepted_per_round": 0.6,
+        "mean_proposed_per_round": 1.0,
+        "alpha": 0.6
+      }
+    },
+    "lookup": {
+      "rag": {
+        "turns": 1,
+        "tokens": 64,
+        "tokens_per_target_forward": 1.103448275862069,
+        "tokens_per_second": 1.487187904091029,
+        "mean_accepted_per_round": 0.1206896551724138,
+        "mean_proposed_per_round": 0.5344827586206896,
+        "alpha": 0.22580645161290322
+      },
+      "all": {
+        "turns": 2,
+        "tokens": 128,
+        "tokens_per_target_forward": 1.1428571428571428,
+        "tokens_per_second": 1.1542220154447524,
+        "mean_accepted_per_round": 0.16071428571428573,
+        "mean_proposed_per_round": 0.6785714285714286,
+        "alpha": 0.23684210526315788
+      },
+      "summarization": {
+        "turns": 1,
+        "tokens": 64,
+        "tokens_per_target_forward": 1.1851851851851851,
+        "tokens_per_second": 0.8212561267984761,
+        "mean_accepted_per_round": 0.2037037037037037,
+        "mean_proposed_per_round": 0.8333333333333334,
+        "alpha": 0.24444444444444444
+      }
+    }
+  },
+  "turns": [
+    {
+      "method": "target",
+      "category": "rag",
+      "question_id": 537,
+      "turn": 0,
+      "tokens": 64,
+      "seconds": 45.9358937,
+      "target_forwards": 64,
+      "proposed": 0,
+      "accepted": 0,
+      "rejections": 0,
+      "rounds": 0,
+      "tokens_per_target_forward": 1.0,
+      "tokens_per_second": 1.393245996648586,
+      "alpha": 0.0,
+      "accepted_lengths": [],
+      "text": ""
+    },
+    {
+      "method": "speculative",
+      "category": "rag",
+      "question_id": 537,
+      "turn": 0,
+      "tokens": 64,
+      "seconds": 51.2545975,
+      "target_forwards": 45,
+      "proposed": 45,
+      "accepted": 20,
+      "rejections": 25,
+      "rounds": 45,
+      "tokens_per_target_forward": 1.4222222222222223,
+      "tokens_per_second": 1.2486684731062418,
+      "alpha": 0.4444444444444444,
+      "accepted_lengths": [
+        25,
+        20
+      ],
+      "text": ""
+    },
+    {
+      "method": "lookup",
+      "category": "rag",
+      "question_id": 537,
+      "turn": 0,
+      "tokens": 64,
+      "seconds": 43.0342392,
+      "target_forwards": 58,
+      "proposed": 31,
+      "accepted": 7,
+      "rejections": 24,
+      "rounds": 58,
+      "tokens_per_target_forward": 1.103448275862069,
+      "tokens_per_second": 1.487187904091029,
+      "alpha": 0.22580645161290322,
+      "accepted_lengths": [
+        51,
+        7
+      ],
+      "text": ""
+    },
+    {
+      "method": "target",
+      "category": "summarization",
+      "question_id": 297,
+      "turn": 0,
+      "tokens": 64,
+      "seconds": 85.8038109,
+      "target_forwards": 64,
+      "proposed": 0,
+      "accepted": 0,
+      "rejections": 0,
+      "rounds": 0,
+      "tokens_per_target_forward": 1.0,
+      "tokens_per_second": 0.7458876165137789,
+      "alpha": 0.0,
+      "accepted_lengths": [],
+      "text": ""
+    },
+    {
+      "method": "speculative",
+      "category": "summarization",
+      "question_id": 297,
+      "turn": 0,
+      "tokens": 64,
+      "seconds": 95.0464281,
+      "target_forwards": 40,
+      "proposed": 40,
+      "accepted": 24,
+      "rejections": 16,
+      "rounds": 40,
+      "tokens_per_target_forward": 1.6,
+      "tokens_per_second": 0.6733551305333062,
+      "alpha": 0.6,
+      "accepted_lengths": [
+        16,
+        24
+      ],
+      "text": ""
+    },
+    {
+      "method": "lookup",
+      "category": "summarization",
+      "question_id": 297,
+      "turn": 0,
+      "tokens": 64,
+      "seconds": 77.9294034,
+      "target_forwards": 54,
+      "proposed": 45,
+      "accepted": 11,
+      "rejections": 34,
+      "rounds": 54,
+      "tokens_per_target_forward": 1.1851851851851851,
+      "tokens_per_second": 0.8212561267984761,
+      "alpha": 0.24444444444444444,
+      "accepted_lengths": [
+        43,
+        11
+      ],
+      "text": ""
+    }
+  ],
+  "target": "models\\Qwen3-4B-q4.sdm",
+  "draft": "models\\Qwen3-0.6B-q4.sdm",
+  "gamma": 1,
+  "sampling": {
+    "temperature": 0.0,
+    "top_k": 0,
+    "top_p": 1.0,
+    "max_new_tokens": 64
+  },
+  "confidence_threshold": 0.4,
+  "speedups": {
+    "target": {
+      "rag": 1.0,
+      "all": 1.0,
+      "summarization": 1.0
+    },
+    "speculative": {
+      "rag": 0.8962297226117131,
+      "all": 0.8985056341563188,
+      "summarization": 0.9027568170128847
+    },
+    "lookup": {
+      "rag": 1.0674266480351766,
+      "all": 1.0791490614168986,
+      "summarization": 1.1010453969419198
+    }
+  },
+  "threads": 6,
+  "cores": "performance",
+  "cpu": "Intel64 Family 6 Model 186 Stepping 2, GenuineIntel",
+  "questions": 2,
+  "when": "2026-10-05T00:03:15+00:00"
+}

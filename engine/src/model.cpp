@@ -148,7 +148,15 @@ Model::Model(ModelFile file, EngineOptions options) : file_(std::move(file)), op
     act_qs_.resize(batch * blocks_stride_ * QK);
     act_offsets_.resize(batch * blocks_stride_);
     kv_scratch_.resize(static_cast<size_t>(pool_->size()) * 2 * c.head_dim);
-    row_scratch_.resize(static_cast<size_t>(pool_->size()) * batch);
+    // One cache line per worker, not max_batch floats. Each worker writes its own slice once per
+    // weight row, so a stride below 64 bytes puts several workers in one line and every row write
+    // invalidates it for the others: at max_batch=2, which is what gamma=1 asks for, all six
+    // workers shared a single line. The same mistake in the benchmark harness made one layout look
+    // 8x slower than another (plan section 13).
+    constexpr size_t kLineFloats = 16;  // 64 bytes
+    row_scratch_stride_ = static_cast<uint32_t>(((batch + kLineFloats - 1) / kLineFloats) *
+                                               kLineFloats);
+    row_scratch_.resize(static_cast<size_t>(pool_->size()) * row_scratch_stride_);
 
     const size_t cache_values = static_cast<size_t>(c.num_hidden_layers) * c.num_key_value_heads *
                                 options_.max_positions * c.head_dim;
@@ -308,7 +316,7 @@ void Model::matmul(const Tensor& weight, const float* in, uint32_t in_stride, ui
     const float* x_scales = act_scales_.data();
     const int8_t* x_qs = act_qs_.data();
     const int32_t* x_offsets = act_offsets_.data();
-    const int batch_width = options_.max_batch;
+    const size_t batch_width = row_scratch_stride_;
 
     const auto body = [&](int begin, int end, int worker) {
         // One pass over each weight row serves every token in the batch, which is what makes

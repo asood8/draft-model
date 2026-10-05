@@ -115,6 +115,9 @@ private:
     // All sized for max_batch tokens; strides are the per-token widths below.
     std::vector<float> x_, xb_, xb2_, qkv_, att_, scores_, mlp_, kv_scratch_, row_scratch_;
     uint32_t qkv_stride_ = 0, mlp_stride_ = 0, blocks_stride_ = 0;
+    // row_scratch_ holds one worker's results for the row it is on, and its stride is padded to a
+    // whole cache line: workers writing inside one line bounce it between cores on every row.
+    uint32_t row_scratch_stride_ = 0;
     // Quantized activations in the split layout the kernels read: one scale a block, the bytes, and
     // one offset a block carrying the weight format's zero point times that block's activation sum.
     std::vector<float> act_scales_;

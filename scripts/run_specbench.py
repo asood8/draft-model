@@ -51,6 +51,8 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--confidence-threshold", type=float, default=0.4)
     parser.add_argument("--context", type=int, default=4096, help="cache size per model")
+    parser.add_argument("--prefill-batch", type=int, default=16,
+                        help="tokens per prompt pass; 16 is measured best on this machine")
     parser.add_argument("--cores", default="performance")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--max-ngram", type=int, default=3)
@@ -76,7 +78,17 @@ def main() -> None:
             max_positions=args.context,
             cores=args.cores,
             threads=args.threads,
-            max_batch=args.gamma + 1,
+            # max_batch is both the widest verification pass and the chunk a long prompt is fed
+            # in, since model.cpp splits a forward call into max_batch-sized passes. At gamma+1 a
+            # prompt went through in two-token passes, which costs: measured on the 4B, prefilling
+            # 1024 tokens takes 40.6 ms a token at max_batch=2 against 27.4 at 16.
+            #
+            # Bigger is not better, which is worth knowing before anyone raises it: 37.8 ms a token
+            # at 64, 42.6 at 128, 49.1 at 256. The kernel passes over the weights once per 8 tokens,
+            # so above 8 the weight traffic per token is already flat and what grows instead is the
+            # activation working set -- 256 tokens of the 4B's intermediate width is 20 MB, which
+            # fits nowhere useful. Two tiles is the sweet spot.
+            max_batch=max(args.gamma + 1, args.prefill_batch),
         )
 
     target = open_model(args.target)
@@ -128,14 +140,23 @@ def main() -> None:
 
     summary = aggregate(results)
     speedups = speedup_table(summary, baseline="target")
+    decode_speedups = speedup_table(summary, baseline="target",
+                                    metric="decode_tokens_per_second")
 
-    print(f"\n{'method':<20} {'category':<14} {'tau':>6} {'tok/s':>8} {'speedup':>8} {'alpha':>6}")
+    # Two speeds a row. Decoding is what speculative decoding changes and what gamma*c + v(gamma+1)
+    # predicts; the whole-call figure also carries the prompt pass, which no term of the model
+    # describes and which on a long prompt is most of the clock -- 93% of it on summarization here.
+    # Reporting only the second has already made this benchmark answer the wrong question once.
+    print(f"\n{'method':<20} {'category':<14} {'tau':>6} {'decode':>9} {'vs':>7} "
+          f"{'wall':>8} {'vs':>7} {'prefill':>8} {'alpha':>6}")
     for method in summary:
         for category in sorted(summary[method]):
             row = summary[method][category]
             print(f"{method:<20} {category:<14} {row['tokens_per_target_forward']:>6.2f} "
-                  f"{row['tokens_per_second']:>8.1f} {speedups[method][category]:>7.2f}x "
-                  f"{row['alpha']:>6.3f}")
+                  f"{row['decode_tokens_per_second']:>7.1f}/s "
+                  f"{decode_speedups[method][category]:>6.2f}x "
+                  f"{row['tokens_per_second']:>6.1f}/s {speedups[method][category]:>6.2f}x "
+                  f"{100 * row['prefill_share']:>7.0f}% {row['alpha']:>6.3f}")
 
     path = save_results(
         args.out,
@@ -147,6 +168,8 @@ def main() -> None:
             "sampling": {k: v for k, v in sampling.items() if k != "stop"},
             "confidence_threshold": args.confidence_threshold,
             "speedups": speedups,
+            "decode_speedups": decode_speedups,
+            "prefill_batch": args.prefill_batch,
             "threads": target.threads,
             "cores": args.cores,
             "cpu": platform.processor(),

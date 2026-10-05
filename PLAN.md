@@ -273,6 +273,51 @@ measurements get checked against.
 > currently 8, so a tile of 6 would be the better choice — it would keep k = 7…12 at two cheap passes
 > instead of one spilling pass plus one cheap one.
 
+> **Measured, 2026-10-04, on a quiet machine: the slope is 0.29, and the engine is at 88.7% of the
+> bandwidth ceiling.** The same measurement as above, after the three kernel changes of §10.1 and the
+> argmax of §10.4, taken cool with nothing else running (`scripts/measure_vk.py`, context 128, five
+> interleaved samples):
+>
+> | | 2026-10-01 (hot) | 2026-10-04 (quiet) |
+> |---|---|---|
+> | one target step | 70.6 ms, later 98.8 | **64.10 ms (15.6 tok/s)** |
+> | fitted pass(k) | 32 + 34k ms | **34.5 + 18.7k ms** |
+> | v(k) | 0.46 + 0.48k | **0.54 + 0.29k** |
+> | v(2), v(5) | 1.44, 3.16 | **1.12, 1.87** |
+> | c | 0.220 | **0.186** |
+> | o | 0.080 | **0.007** |
+> | predicted best at alpha = 0.711 | 0.98x (gamma=1) | **1.31x (gamma=1)** |
+>
+> **The per-token slope fell from 34 ms to 18.7 ms while the intercept stayed put**, which is the shape a
+> kernel change should have: the slope is the arithmetic k tokens cannot share, the intercept is the
+> streaming that fails to hide behind it. That is 1.82x on the slope against the 1.65-1.77x the kernel
+> sweep measures at six threads over a 192 MB working set -- two independent measurements of one thing,
+> agreeing.
+>
+> Three things follow, and they change what is left to do.
+>
+> *The kernel is finished.* Section 10.1 projected that at the bandwidth floor v(2) would reach 1.13. It is
+> 1.12. A step of 64.10 ms against 2262.1 MB at the measured 39.8 GB/s, which is 56.8 ms of streaming, is
+> **88.7% of the ceiling** -- 7.3 ms a step above a floor that assumes free arithmetic. The kernel sweep
+> now reports 95-105% of the assumed AVX-VNNI issue peak for k >= 4 at six threads, 0.030 issue slots per
+> multiply-accumulate where a pure `dpbusd` stream is 0.031. The 8-11% of peak that this section called the
+> binding constraint is gone, and there is no second factor of two hiding in this kernel.
+>
+> *Speculation now pays, which it did not on 2026-10-01.* 0.98x became 1.31x at the same alpha = 0.711,
+> from the kernel alone. Predicted at the measured v(k) and c:
+>
+> | alpha | gamma=1 | gamma=2 | gamma=3 | gamma=4 | best |
+> |---|---|---|---|---|---|
+> | 0.60 | **1.22** | 1.14 | 0.99 | 0.88 | 1.22x (gamma=1) |
+> | 0.711 | **1.31** | 1.29 | 1.17 | 1.08 | 1.31x (gamma=1) |
+> | 0.80 | 1.38 | **1.42** | 1.35 | 1.29 | 1.42x (gamma=2) |
+> | 0.90 | 1.45 | **1.58** | 1.57 | 1.57 | 1.58x (gamma=2) |
+>
+> *What is left is alpha and c.* The ceiling this section used to quote, 1.33x at alpha = 1, is passed at
+> alpha = 0.8. Distillation to alpha 0.8-0.85 is now worth 1.42-1.5x where against the old kernel it would
+> have been worth 1.03x, and vocabulary trimming moves c, which at gamma=1 is a fifth of the denominator.
+> Best gamma stays small, 1 or 2, because the slope is 0.29 and not 0.
+
 **Back-of-envelope for this laptop.** The bandwidth figure is an assumption until Milestone 0 measures it.
 
 | | Qwen3-0.6B | Qwen3-4B |

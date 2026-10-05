@@ -140,7 +140,15 @@ class TurnResult:
     rounds: int
     tokens_per_target_forward: float
     tokens_per_second: float
-    alpha: float
+    # Speculative decoding changes decoding, not the prompt pass, and on this machine the prompt
+    # pass is most of the wall clock: a 1450-token summarization prompt costs about as much as 400
+    # generated tokens. A speedup computed over the whole call therefore measures mostly prefill,
+    # and buries what the method did. Both are kept: the wall figure is what a user feels, the
+    # decode figure is what the speedup model predicts.
+    prefill_seconds: float = 0.0
+    decode_seconds: float = 0.0
+    decode_tokens_per_second: float = 0.0
+    alpha: float = 0.0
     accepted_lengths: list[int] = field(default_factory=list)
     text: str = ""
 
@@ -171,6 +179,10 @@ def run_question(
         text = tokenizer.decode(tokens, skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": text})
 
+        seconds = float(stats.get("seconds", 0.0))
+        prefill_seconds = float(stats.get("prefill_seconds", 0.0))
+        decode_seconds = max(seconds - prefill_seconds, 0.0)
+
         results.append(
             TurnResult(
                 method=method_name,
@@ -178,7 +190,7 @@ def run_question(
                 question_id=question.question_id,
                 turn=index,
                 tokens=len(tokens),
-                seconds=float(stats.get("seconds", 0.0)),
+                seconds=seconds,
                 target_forwards=int(stats.get("target_forwards", 0)),
                 proposed=int(stats.get("proposed", 0)),
                 accepted=int(stats.get("accepted", 0)),
@@ -186,6 +198,9 @@ def run_question(
                 rounds=int(stats.get("rounds", 0)),
                 tokens_per_target_forward=float(stats.get("tokens_per_target_forward", 0.0)),
                 tokens_per_second=float(stats.get("tokens_per_second", 0.0)),
+                prefill_seconds=prefill_seconds,
+                decode_seconds=decode_seconds,
+                decode_tokens_per_second=len(tokens) / decode_seconds if decode_seconds else 0.0,
                 alpha=float(stats.get("alpha", 0.0)),
                 accepted_lengths=list(stats.get("accepted_lengths", [])),
                 text=text if keep_text else "",
@@ -248,6 +263,14 @@ def aggregate(results: Sequence[TurnResult]) -> dict[str, dict[str, dict[str, fl
             "tokens": tokens,
             "tokens_per_target_forward": tokens / forwards if forwards else 0.0,
             "tokens_per_second": statistics.median([row.tokens_per_second for row in rows]),
+            "decode_tokens_per_second": statistics.median(
+                [row.decode_tokens_per_second for row in rows]
+            ),
+            "prefill_seconds": sum(row.prefill_seconds for row in rows),
+            "decode_seconds": sum(row.decode_seconds for row in rows),
+            "prefill_share": (sum(row.prefill_seconds for row in rows)
+                              / sum(row.seconds for row in rows)
+                              if sum(row.seconds for row in rows) else 0.0),
             "mean_accepted_per_round": accepted / rounds if rounds else 0.0,
             "mean_proposed_per_round": proposed / rounds if rounds else 0.0,
             "alpha": accepted / (accepted + rejections) if (accepted + rejections) else 0.0,
@@ -255,17 +278,23 @@ def aggregate(results: Sequence[TurnResult]) -> dict[str, dict[str, dict[str, fl
     return dict(out)
 
 
-def speedup_table(summary: dict[str, dict[str, dict[str, float]]], baseline: str) -> dict:
-    """Each method's speed as a multiple of the baseline's, per category."""
+def speedup_table(summary: dict[str, dict[str, dict[str, float]]], baseline: str,
+                  metric: str = "tokens_per_second") -> dict:
+    """Each method's speed as a multiple of the baseline's, per category.
+
+    `metric` picks which speed: "tokens_per_second" is the whole call, prompt pass included, and
+    "decode_tokens_per_second" is generation alone, which is the one to compare against a prediction
+    from v(k) and c, since neither term says anything about prefill.
+    """
     if baseline not in summary:
         raise ValueError(f"no results for the baseline method {baseline!r}")
     table: dict[str, dict[str, float]] = {}
     for method, categories in summary.items():
         table[method] = {}
         for category, numbers in categories.items():
-            reference = summary[baseline].get(category, {}).get("tokens_per_second", 0.0)
+            reference = summary[baseline].get(category, {}).get(metric, 0.0)
             table[method][category] = (
-                numbers["tokens_per_second"] / reference if reference else float("nan")
+                numbers[metric] / reference if reference else float("nan")
             )
     return table
 

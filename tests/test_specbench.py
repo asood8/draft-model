@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import types
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from specdraft.specbench import (  # noqa: E402
     load_questions,
     normalize_category,
     run_benchmark,
+    run_question,
     save_results,
     speedup_table,
 )
@@ -98,6 +100,9 @@ def make_result(method: str, category: str, **kwargs) -> TurnResult:
         rounds=50,
         tokens_per_target_forward=2.0,
         tokens_per_second=100.0,
+        prefill_seconds=0.4,
+        decode_seconds=0.6,
+        decode_tokens_per_second=166.0,
         alpha=0.75,
     )
     defaults.update(kwargs)
@@ -118,6 +123,52 @@ def test_aggregation_pools_tokens_and_takes_median_speeds():
     assert math["tokens_per_second"] == pytest.approx(20.0)  # median of 10 and 30
     assert summary["spec"]["all"]["turns"] == 3
     assert summary["spec"]["all"]["tokens"] == 450
+
+
+def test_decode_speed_is_reported_separately_from_the_whole_call():
+    """Speculative decoding changes decoding, so the speedup that matters excludes the prompt pass.
+
+    On a long prompt the prompt pass is most of the wall clock -- 93% of it on a summarization
+    question here -- and a method that prefills a second model pays for it twice, so a whole-call
+    speedup reports mostly prefill and hides what the method did to generation.
+    """
+    results = [
+        make_result("target", "rag", tokens=100, seconds=10.0, prefill_seconds=9.0,
+                    decode_seconds=1.0, decode_tokens_per_second=100.0, tokens_per_second=10.0),
+        make_result("spec", "rag", tokens=100, seconds=10.5, prefill_seconds=10.0,
+                    decode_seconds=0.5, decode_tokens_per_second=200.0, tokens_per_second=9.5),
+    ]
+    summary = aggregate(results)
+    assert summary["target"]["rag"]["prefill_share"] == pytest.approx(0.9)
+
+    wall = speedup_table(summary, baseline="target")
+    decode = speedup_table(summary, baseline="target", metric="decode_tokens_per_second")
+    assert wall["spec"]["rag"] == pytest.approx(0.95)  # looks like a loss
+    assert decode["spec"]["rag"] == pytest.approx(2.0)  # was twice as fast at the thing it changes
+
+
+def test_a_turn_records_what_the_prompt_pass_cost(monkeypatch):
+    """run_question has to carry the engine's prefill split through, not recompute it."""
+    stats = {"seconds": 4.0, "prefill_seconds": 3.0, "tokens_per_second": 2.0,
+             "tokens_per_target_forward": 1.0, "alpha": 0.5}
+
+    class Tokenizer:
+        def apply_chat_template(self, conversation, **kwargs):
+            return "prompt"
+
+        def __call__(self, text, **kwargs):
+            return types.SimpleNamespace(input_ids=[1, 2, 3])
+
+        def decode(self, tokens, **kwargs):
+            return "answer"
+
+    question = Question(question_id=0, category="qa", turns=["hello"])
+    rows = run_question(question, lambda prompt: ([7, 8], stats), "spec", Tokenizer(),
+                        keep_text=False)
+    row = rows[0]
+    assert row.prefill_seconds == pytest.approx(3.0)
+    assert row.decode_seconds == pytest.approx(1.0)
+    assert row.decode_tokens_per_second == pytest.approx(2.0)  # two tokens in one second
 
 
 def test_alpha_comes_from_the_engines_counts():
