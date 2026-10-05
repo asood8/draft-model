@@ -158,8 +158,19 @@ two-turn questions are MT-Bench's and get grouped into the multi-turn category, 
 benchmark's six categories are recovered from the finer labels in the file.
 
 Runs target-alone, the draft, prompt lookup and early stopping, interleaved per question. Compare
-the measured speedup against step 4's prediction — the gap between them is the interesting part, and
-is what `o`, the per-round overhead, is for.
+the measured speedup against step 4's prediction — the gap between them is the interesting part.
+
+**Read the decode column, not the wall column, when comparing against a prediction.** The table prints
+both: decoding alone, and the whole call including the prompt pass. Nothing in `γ·c + v(γ+1) + o`
+describes a prompt pass, and on this machine the prompt pass is 45% of the clock on the short-prompt
+categories and 87–92% on summarization and rag — so a whole-call figure mostly reports prefill, and it
+charges speculative decoding for prefilling a second model. Both columns are honest about different
+questions: the wall figure is what a user feels, and at 64 generated tokens on a 1,450-token prompt no
+decoding speedup rescues it. Measured 2026-10-04: 1.20× decoding, 1.07× wall, on the short set.
+
+`--prefill-batch` defaults to 16, measured best on this machine: prefilling 1024 tokens of the 4B costs
+40.6 ms a token at 2, 27.4 at 16, 37.8 at 64 and 49.1 at 256. It is set apart from γ because
+`max_batch` is both the widest verification pass and the chunk a long prompt is fed in.
 
 ## 6. Sanity checks worth keeping
 

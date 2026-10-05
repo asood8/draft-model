@@ -12,6 +12,7 @@ their own. Section 17 tracks decisions and open questions.
 
 | Date | Where things stand |
 |---|---|
+| 2026-10-04 | **The kernel is done, and speculation pays: 1.20x on decoding, measured end to end.** A quiet-machine sweep says the 4B runs at **64.10 ms a step (15.6 tok/s), 88.7% of the measured bandwidth ceiling**, and the k-token kernel reaches **95-105% of the AVX-VNNI issue peak** for k >= 4 at six threads -- 0.030 issue slots per multiply-accumulate where a pure dpbusd stream is 0.031. The fitted pass is now **34.5 + 18.7k ms** against 32 + 34k on 2026-10-01: the per-token slope fell 1.82x while the intercept stayed put, which is the shape a kernel change should have, and it agrees with the 1.65-1.77x the kernel sweep measures independently. v(2) = 1.12 against the 1.13 that §10.1 projected for the bandwidth floor, so there is no second factor of two left in this kernel. c = 0.186, o = 0.007. Predicted speedup at the measured α = 0.711 went **0.98x to 1.31x**, and Spec-Bench measures **1.20x on decoding** (math 1.29x, τ = 1.72, α = 0.736) -- 92% of prediction, with the gap explained by c rising with context. On long prompts it is 0.95x, where α falls to 0.44-0.60. Wall-clock is 1.07-1.11x short and 0.82x long, because the prompt pass is 45-92% of the clock. Also: the argmax was 9x slower than it needed to be and was the whole of o (8.71 ms a round to 0.57); two reporting bugs in my own benchmark produced 0.82x and 9.91x before the baseline was measured like everything else; and the prefill chunk size wants to be 16, not gamma+1 and not 128. 838 tests pass. Next: distillation, which is now worth 1.42-1.5x. |
 | 2026-10-02 | **Three kernel changes, and the kernel's own v(2) falls from 2.02 to 1.12.** The scales now apply eight blocks at a time instead of one; the sign trick is gone, replaced by sum((q-z)x) = sum(qx) - z sum(x) with one precomputed integer a block subtracted after the reduction; and one 32-byte load covers two blocks, whose nibbles are already adjacent, landing them in separate halves of a single accumulator so that eight blocks need four accumulators and the reduction is three hadds and a vpermd. 43 instructions per eight blocks per row against 64, and the share doing multiply-accumulates goes 9.9% to 23.6%. Measured in one process with the variants alternating -- the only comparison this machine supports -- pair-packing alone is 1.09x at k=1 rising to 1.28x at k=8. Activation quantization, the last serial piece of a forward pass at 5.1 ms a token, now spreads over the workers. Also retired change 3: register blocking over output rows needs 16 accumulators at G=8 and costs more than it saves at G=4, which is what counting instructions is for. The projection in §10.1 says the remaining distance is the bandwidth floor: past it v(2) reaches 1.13 and, with distillation, 1.33-1.41x. 814 tests pass. |
 | 2026-10-02 | **The engine's kernel is rewritten and the file format is at version 4.** Quantized tensors are stored as a scales region then a bytes region, so eight fp16 scales convert in one instruction and the sign trick gives way to the offset identity; `dot_q4_soa_multi` and `dot_q8_soa_multi` are the engine's kernels, with the interleaved ones kept as the measured baseline. Measured back to back at six pinned cores over a 192 MB working set, the new layout wins at every k: 1.13x at k=1, 1.32x at k=2, 1.16x at k=4, 1.42x at k=8, reaching 32.8 GB/s of a 35-39 GB/s ceiling at k=1. Per-tensor and per-row splitting proved indistinguishable, so no second format change. Getting there needed two corrections to my own instruments: the threaded comparison gave every worker its own cache line (without it, six workers wrote inside one line and the table read as eightfold layout differences that reversed with k), and measure_vk now interleaves the k values instead of taking all samples of one before the next (without it a sweep came out non-monotonic, k=4 cheaper than k=3). The broader lesson is in §13: **v(k) is not drift-resistant**, since throttling cuts the clock and so the arithmetic but not the bandwidth, making a hot machine report a steeper curve -- the same 4B read 70.6 and 99.0 ms a step hours apart. Kernel comparisons belong in `bench_kernel.py`, never in a before-and-after of the model. 691 tests pass. |
 | 2026-10-01 | **Milestone 5 built, and the evaluation harness with it.** Distillation exists end to end: five losses with a chunked form that keeps a 151,669-token vocabulary in memory, a trainable draft that reuses the verified reference forward pass, the training loop (teacher as a callable, so the full-precision target, the 4-bit twin or cached logits all fit), the data pipeline with 13-gram decontamination, and runnable scripts for both. An integration test trains a miniature Qwen3 carrying the real tokenizer, saves it, exports it and runs it in the engine. Spec-Bench harness runs target-alone, the draft, prompt lookup and early stopping, interleaved, into a per-category table. Layer pruning scores and cuts layers; see §11.7 for what that measured. 620 tests pass. Remaining before results: the 4B target, then the grid. |
@@ -1063,6 +1064,54 @@ def accept_or_resample(p, q, draft_tokens, greedy=False):
 
 **Done when** you have a plot of predicted versus measured speedup across γ, and know the best γ for this CPU,
 overall and per category.
+
+> **Measured, 2026-10-04: end to end on Spec-Bench, and speculation wins for the first time.** Greedy,
+> γ=1 (what §3's table predicts), 64 new tokens, four methods interleaved per question, on the quiet
+> machine. Decode speed excludes the prompt pass; wall speed is the whole call.
+>
+> | | τ | α | decode | vs target | wall | vs target |
+> |---|---|---|---|---|---|---|
+> | **short prompts** (translation, qa, math, multi-turn; 2 questions each) | | | | | | |
+> | target alone | 1.00 | -- | 14.2 tok/s | 1.00x | 8.1 tok/s | 1.00x |
+> | speculative | 1.72 | 0.736 | **17.1 tok/s** | **1.20x** | 8.7 tok/s | 1.07x |
+> | speculative + early stopping | 1.70 | 0.807 | **17.1 tok/s** | **1.20x** | 9.0 tok/s | 1.11x |
+> | prompt lookup | 1.14 | 0.340 | 14.5 tok/s | 1.02x | 9.0 tok/s | 1.12x |
+> | **long prompts** (summarization, rag; 1 question each) | | | | | | |
+> | target alone | 1.00 | -- | 11.3 tok/s | 1.00x | 1.6 tok/s | 1.00x |
+> | speculative | 1.51 | 0.518 | 10.7 tok/s | 0.95x | 1.3 tok/s | 0.82x |
+> | prompt lookup | 1.14 | 0.237 | 11.0 tok/s | 0.97x | 1.5 tok/s | 0.97x |
+>
+> **1.20x measured against 1.31x predicted**, which is 92% of the prediction, and per category the match
+> is closer than that: math 1.29x against 1.30x predicted from its own τ, translation 1.20x against 1.37x,
+> qa 1.04x against 1.19x. The ordering tracks α (translation 0.833, math 0.720, qa 0.585), which is what
+> the model says should happen. The residual is context: v(k) and c were measured at context 128, and
+> §3's own table has c rising from 0.16 to 0.22 between 256 and 2k tokens of context, which takes the
+> prediction to 1.28x on its own.
+>
+> **On long prompts speculation does not pay: 0.95x.** Acceptance collapses there -- 0.444 on rag, 0.600
+> on summarization against 0.736 on the short set -- and c rises with context, because the draft carries
+> almost as much KV cache per token as the target (28x8x128 against 36x8x128) while reading a seventh of
+> the weights. That is two separate findings and worth keeping separate: the draft is worse at these
+> prompts *and* the economics are worse at long context.
+>
+> Early stopping is free here and slightly better: the same 1.20x with α raised to 0.807, since declining
+> to guess when unsure removes the guesses that were going to be rejected. At γ=1 there is little room
+> for it to show; it is worth re-measuring if distillation makes a larger γ optimal.
+>
+> **Two bugs in the measurement, both mine, both in reporting rather than in the engine.** The first pass
+> of this benchmark reported 0.82x for speculative decoding, and the second reported 9.91x on
+> summarization. Neither was true. `tokens_per_second` covered the whole call, and the prompt pass is
+> 45% of the clock on short prompts and 87-92% on long ones -- no method affects it, and speculative
+> decoding prefills a second model, so a whole-call figure charges it for work it does not do. Splitting
+> the prompt pass out fixed that, and then compared one method's decoding against the baseline's whole
+> call, because `generate_plain` was not recording its prefill. Both are now recorded the same way and the
+> benchmark prints both columns side by side. The wall column is kept because it is what a user feels: at
+> 64 generated tokens on a 1450-token prompt, prefill *is* the experience, and no decoding speedup
+> rescues it.
+>
+> The honest reading of the wall column: speculative decoding is worth 1.07-1.11x on this machine for
+> short prompts and loses on long ones, while *decoding* is 1.20x faster. Which number belongs in the
+> write-up depends on the claim being made, so §12 should quote both.
 
 > **Measured, 2026-10-02: what the per-round overhead o is not.** o = 0.088 target steps, 8.71 ms a
 > round for the 4B/0.6B pair at gamma=4, and the two obvious explanations are both wrong.
