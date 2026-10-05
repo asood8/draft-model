@@ -95,8 +95,13 @@ def main() -> None:
     capacity = args.context + max(args.max_k, 2 * args.overhead_tokens + args.overhead_gamma) + 8
 
     def open_model(path: Path):
+        # max_batch has to cover the widest pass being timed, and it is also the chunk the context
+        # prefill is fed in, which wants at least 16: a prompt pushed through in max_k-token passes
+        # costs 40.6 ms a token at 2 against 27.4 at 16 on this machine. It cannot change what is
+        # measured here, since a k-token pass is one chunk either way.
         return cpp.Model(
-            str(path), max_positions=capacity, cores=args.cores, max_batch=args.max_k
+            str(path), max_positions=capacity, cores=args.cores,
+            max_batch=max(args.max_k, 16)
         )
 
     target = open_model(args.target)

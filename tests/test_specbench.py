@@ -293,3 +293,61 @@ def test_the_real_question_file_has_the_six_categories():
     assert len(questions) == 480
     assert set(counts) == set(CATEGORIES)
     assert set(counts.values()) == {80}
+
+
+# --------------------------------------------------- the figures built from these results
+
+
+def load_make_plots():
+    """make_plots is a script, so it is imported by path, the way test_train_script does it."""
+    import sys
+
+    scripts = str(Path(__file__).resolve().parent.parent / "scripts")
+    sys.path.insert(0, scripts)
+    try:
+        import make_plots
+
+        return make_plots
+    finally:
+        sys.path.remove(scripts)
+
+
+def write_run(path: Path, gamma: int, speedup: float, tau: float, decode: bool) -> None:
+    blob = {
+        "gamma": gamma,
+        "target": "models/Qwen3-4B-q4.sdm",
+        "speedups": {"speculative": {"all": 0.8}},  # the whole-call figure, deliberately different
+        "summary": {"speculative": {"all": {"tokens_per_target_forward": tau, "alpha": 0.74}}},
+    }
+    if decode:
+        blob["decode_speedups"] = {"speculative": {"all": speedup}}
+    path.write_text(json.dumps(blob), encoding="utf-8")
+
+
+def test_the_gamma_figure_reads_decode_speedups_and_falls_back(tmp_path):
+    """A figure comparing against the cost model has to read the decode column.
+
+    The model says nothing about a prompt pass, so comparing it against a whole-call speedup compares
+    it against something it never claimed. Older result files have only the whole-call number, and are
+    read rather than skipped, but flagged.
+    """
+    plots = load_make_plots()
+    write_run(tmp_path / "specbench_gamma1.json", 1, 1.20, 1.72, decode=True)
+    write_run(tmp_path / "specbench_gamma3.json", 3, 1.05, 2.68, decode=False)
+    write_run(tmp_path / "specbench_short.json", 1, 9.9, 1.72, decode=True)  # another prompt set
+
+    runs = plots.measured_runs(tmp_path)
+    assert [run["gamma"] for run in runs] == [1, 3]  # sorted, and the short-prompt set left out
+    assert runs[0]["decode"] == pytest.approx(1.20)
+    assert runs[0]["decode_only"] is True
+    assert runs[1]["decode"] == pytest.approx(0.8)  # fell back to the whole call
+    assert runs[1]["decode_only"] is False
+
+
+def test_the_prediction_uses_v_at_gamma_plus_one():
+    """One pass verifies gamma guesses plus the token before them, so the cost is v(gamma+1)."""
+    plots = load_make_plots()
+    blob = {"v": {"2": 1.12, "3": 1.34}, "c": 0.186, "overhead": {"o_per_round": 0.007}}
+    assert plots.predict(blob, 1, 1.72) == pytest.approx(1.72 / (0.186 + 1.12 + 0.007))
+    assert plots.predict(blob, 2, 2.28) == pytest.approx(2.28 / (2 * 0.186 + 1.34 + 0.007))
+    assert plots.predict({"c": 0.2}, 1, 1.7) is None  # no v(k) measured, no prediction

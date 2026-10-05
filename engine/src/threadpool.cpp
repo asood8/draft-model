@@ -107,7 +107,11 @@ std::vector<uint32_t> cores_for(CoreSelection selection) {
 ThreadPool::ThreadPool(int threads, CoreSelection selection) : selection_(selection) {
     const std::vector<uint32_t> cores = cores_for(selection);
     int count = threads > 0 ? threads : static_cast<int>(cores.size());
-    count = std::max(1, count);
+    // Never more threads than cores to put them on. These workers wait at a spin barrier, so two of
+    // them pinned to one core do not share it, they fight over it: asking for 8 threads on the 6
+    // performance cores measured 513 ms a decode step against 92 for 6 threads, a 5.6x collapse. A
+    // caller asking for more gets the cores, and `threads` reports what it actually got.
+    count = std::min(std::max(1, count), static_cast<int>(cores.size()));
 
     if (selection != CoreSelection::any) {
         pin_to_core(cores[0]);  // the calling thread is worker 0

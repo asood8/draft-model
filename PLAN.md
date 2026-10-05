@@ -12,6 +12,7 @@ their own. Section 17 tracks decisions and open questions.
 
 | Date | Where things stand |
 |---|---|
+| 2026-10-04 | **v(k) decides γ, measured: the original formula would have picked γ=3 and lost 21%.** A γ sweep on Spec-Bench, each run re-measuring its own baseline: γ=1 gives **1.20x on decoding**, then 1.01x, 0.95x, 0.88x. Assuming v = 1 predicts 1.69x at γ=3, where this engine measures 0.95x -- slower than not speculating. Best γ is 1, which is where v(k) says it is, so the term this project adds is not a correction but the thing that chooses the configuration. The cost model predicts the engine **to within 2-7%** once v(k) and c are measured at the context being run at: v(2) goes 1.12 to 1.46 and c goes 0.186 to 0.268 between context 128 and 2048, which is a rule worth more than the numbers -- **v(k) is a function of context**. By 2k context speculation stops paying at all (1.01x predicted), which is the quantitative form of the 0.95x measured on rag and summarization. The cause is attention: flat matmuls but attention going 1.50 to 26.88 ms a token between context 128 and 2048, **27% of the step**, reading the KV cache at 11.3 GB/s where the machine streams 39.8. That is the next thing to fix, after a micro-benchmark says why -- two guesses today were wrong when measured. Also found by accident: asking for more threads than the selection has cores collapses decoding 5.6x, since spinning workers fight over a core rather than share it; the pool now clamps. 841 tests pass. |
 | 2026-10-04 | **The kernel is done, and speculation pays: 1.20x on decoding, measured end to end.** A quiet-machine sweep says the 4B runs at **64.10 ms a step (15.6 tok/s), 88.7% of the measured bandwidth ceiling**, and the k-token kernel reaches **95-105% of the AVX-VNNI issue peak** for k >= 4 at six threads -- 0.030 issue slots per multiply-accumulate where a pure dpbusd stream is 0.031. The fitted pass is now **34.5 + 18.7k ms** against 32 + 34k on 2026-10-01: the per-token slope fell 1.82x while the intercept stayed put, which is the shape a kernel change should have, and it agrees with the 1.65-1.77x the kernel sweep measures independently. v(2) = 1.12 against the 1.13 that §10.1 projected for the bandwidth floor, so there is no second factor of two left in this kernel. c = 0.186, o = 0.007. Predicted speedup at the measured α = 0.711 went **0.98x to 1.31x**, and Spec-Bench measures **1.20x on decoding** (math 1.29x, τ = 1.72, α = 0.736) -- 92% of prediction, with the gap explained by c rising with context. On long prompts it is 0.95x, where α falls to 0.44-0.60. Wall-clock is 1.07-1.11x short and 0.82x long, because the prompt pass is 45-92% of the clock. Also: the argmax was 9x slower than it needed to be and was the whole of o (8.71 ms a round to 0.57); two reporting bugs in my own benchmark produced 0.82x and 9.91x before the baseline was measured like everything else; and the prefill chunk size wants to be 16, not gamma+1 and not 128. 838 tests pass. Next: distillation, which is now worth 1.42-1.5x. |
 | 2026-10-02 | **Three kernel changes, and the kernel's own v(2) falls from 2.02 to 1.12.** The scales now apply eight blocks at a time instead of one; the sign trick is gone, replaced by sum((q-z)x) = sum(qx) - z sum(x) with one precomputed integer a block subtracted after the reduction; and one 32-byte load covers two blocks, whose nibbles are already adjacent, landing them in separate halves of a single accumulator so that eight blocks need four accumulators and the reduction is three hadds and a vpermd. 43 instructions per eight blocks per row against 64, and the share doing multiply-accumulates goes 9.9% to 23.6%. Measured in one process with the variants alternating -- the only comparison this machine supports -- pair-packing alone is 1.09x at k=1 rising to 1.28x at k=8. Activation quantization, the last serial piece of a forward pass at 5.1 ms a token, now spreads over the workers. Also retired change 3: register blocking over output rows needs 16 accumulators at G=8 and costs more than it saves at G=4, which is what counting instructions is for. The projection in §10.1 says the remaining distance is the bandwidth floor: past it v(2) reaches 1.13 and, with distillation, 1.33-1.41x. 814 tests pass. |
 | 2026-10-02 | **The engine's kernel is rewritten and the file format is at version 4.** Quantized tensors are stored as a scales region then a bytes region, so eight fp16 scales convert in one instruction and the sign trick gives way to the offset identity; `dot_q4_soa_multi` and `dot_q8_soa_multi` are the engine's kernels, with the interleaved ones kept as the measured baseline. Measured back to back at six pinned cores over a 192 MB working set, the new layout wins at every k: 1.13x at k=1, 1.32x at k=2, 1.16x at k=4, 1.42x at k=8, reaching 32.8 GB/s of a 35-39 GB/s ceiling at k=1. Per-tensor and per-row splitting proved indistinguishable, so no second format change. Getting there needed two corrections to my own instruments: the threaded comparison gave every worker its own cache line (without it, six workers wrote inside one line and the table read as eightfold layout differences that reversed with k), and measure_vk now interleaves the k values instead of taking all samples of one before the next (without it a sweep came out non-monotonic, k=4 cheaper than k=3). The broader lesson is in §13: **v(k) is not drift-resistant**, since throttling cuts the clock and so the arithmetic but not the bandwidth, making a hot machine report a steeper curve -- the same 4B read 70.6 and 99.0 ms a step hours apart. Kernel comparisons belong in `bench_kernel.py`, never in a before-and-after of the model. 691 tests pass. |
@@ -1112,6 +1113,98 @@ overall and per category.
 > The honest reading of the wall column: speculative decoding is worth 1.07-1.11x on this machine for
 > short prompts and loses on long ones, while *decoding* is 1.20x faster. Which number belongs in the
 > write-up depends on the claim being made, so §12 should quote both.
+
+> **Measured, 2026-10-04: predicted against measured across γ, which is this section's done-when --
+> and the case for the whole project.** Same prompt set, same methods, γ = 1, 2, 3, 4, each run
+> re-measuring its own baseline because absolute speeds drifted 7.7 to 8.0 tok/s across the four.
+>
+> | γ | τ | α | measured (decoding) | this model | the original formula (v=1, o=0) |
+> |---|---|---|---|---|---|
+> | **1** | 1.72 | 0.736 | **1.20x** | 1.31x | 1.45x |
+> | 2 | 2.23 | 0.751 | 1.01x | 1.30x | 1.63x |
+> | 3 | 2.64 | 0.749 | 0.95x | 1.20x | **1.69x** |
+> | 4 | 2.88 | 0.748 | 0.88x | 1.10x | 1.65x |
+>
+> Both predictions use the *measured* τ of each run, so α is not in question and the only difference
+> between the columns is the denominator. **The original formula picks γ = 3 and promises 1.69x. At γ = 3
+> this engine delivers 0.95x, slower than not speculating at all.** Measured best is γ = 1 at 1.20x,
+> which is where v(k) says it should be. That is the argument for measuring v(k) instead of assuming it,
+> and it is now a measurement rather than an argument: assuming v = 1 would have cost 21% by choosing the
+> wrong γ, on top of promising a speedup 78% larger than the machine gives.
+>
+> What the model does *not* get right is the level, and it misses by more as γ grows: 92% of prediction at
+> γ=1, then 78%, 79%, 80%. A term that scales with γ is missing, and the suspect is context. Both v(k) and
+> c were measured at context 128 while these prompts run 100-1200 tokens, and the KV cache is read once
+> *per token* rather than once per pass -- 147.5 KB per token of context for the 4B, which is 19 MB at
+> context 128 and negligible beside 2.26 GB of weights, but 147 MB at context 1000, multiplied by k. If
+> that is the mechanism, v(k) is steeper at long context and c is larger, both of which punish large γ.
+> Measured next rather than assumed (`results/vk_context*`).
+
+> **Measured, 2026-10-04: it was the context, and the model is right to within 2-7% once v(k) is
+> measured where it will be used.** Same script at four contexts, max-k 5, three samples:
+>
+> | context | one step | v(2) | v(3) | v(4) | v(5) | c | predicted best |
+> |---|---|---|---|---|---|---|---|
+> | 128 | 64.10 ms | 1.12 | 1.34 | 1.64 | 1.87 | 0.186 | 1.31x (γ=1) |
+> | 512 | 79.93 ms | 1.28 | 1.67 | 2.14 | 2.52 | 0.205 | 1.17x (γ=1) |
+> | 1024 | 86.14 ms | 1.35 | 1.78 | 2.36 | 2.74 | 0.244 | 1.09x (γ=1) |
+> | 2048 | 98.36 ms | 1.46 | 1.97 | 2.49 | 3.00 | 0.268 | **1.01x (γ=1)** |
+>
+> Against the γ sweep, whose prompts average a few hundred tokens, the context-512 numbers predict:
+>
+> | γ | predicted at context 512 | measured | |
+> |---|---|---|---|
+> | 1 | 1.17x | **1.20x** | 103% |
+> | 2 | 1.09x | 1.01x | 93% |
+> | 3 | 0.97x | 0.95x | 98% |
+> | 4 | 0.89x | 0.88x | 99% |
+>
+> **So the cost model predicts this engine to within 2-7%**, and the 8-21% error earlier in this section
+> was mine for quoting v(k) from context 128 against prompts four times longer. The rule that follows is
+> worth more than the numbers: **v(k) and c are functions of context, and have to be measured at the
+> context they will be used at.** The write-up should say which context every v(k) came from.
+>
+> **And speculation stops paying at 2k context: 1.01x predicted at the best γ.** Both terms move against
+> it -- v(2) goes 1.12 to 1.46, c goes 0.186 to 0.268 -- which is the quantitative version of the
+> long-prompt result above (0.95x on rag and summarization). c rises faster than §3's bandwidth
+> arithmetic predicted (0.244 at 1k against a predicted 0.19), so something in the per-position work
+> costs more than its bytes.
+>
+> It is attention, and it is not a mystery. Per-stage timers at context 128, 512 and 1024 (ms a token):
+>
+> | context | step | qkv | attention | attn_out | gate_up | ffn_down | output |
+> |---|---|---|---|---|---|---|---|
+> | 128 | 70.32 | 11.84 | **1.50** | 6.25 | 29.39 | 15.64 | 5.70 |
+> | 512 | 78.38 | 13.74 | **7.17** | 6.49 | 30.14 | 15.08 | 5.76 |
+> | 1024 | 83.31 | 13.35 | **13.32** | 6.57 | 29.38 | 14.73 | 5.97 |
+> | 2048 | 98.97 | 13.76 | **26.88** | 6.97 | 29.91 | 14.79 | 6.67 |
+>
+> Attention is the only stage that grows, as it must -- every matmul is flat to within a millisecond --
+> but it grows too fast, and by 2048 it is **27% of the step**. At context 1024 it reads 151 MB of KV
+> cache in 13.32 ms and at 2048 it reads 302 MB in 26.88, which is **11.2-11.3 GB/s on a machine that
+> streams 39.8**. The cache layout
+> is contiguous per (layer, kv head) and each cached row is already shared across its group of query
+> heads, so neither is the problem. The split is: one parallel job per KV head, and there are 8 of them
+> for 6 workers, so two workers take two heads and the makespan is two heads' work no matter how many
+> cores idle. But that is a hypothesis, and the obvious test of it came out ambiguous: ten physical
+> cores, where eight jobs balance perfectly, made attention *worse* (19.2 ms against 16.8 on six), which
+> an E-core taking a whole head could explain as easily as imbalance could. The other candidates are the
+> one-position-at-a-time inner loop, which may not keep enough loads in flight to hide DRAM latency --
+> 11 GB/s over six cores is about 470 cycles a position, and the work in one is nearer 30 -- and the
+> write pattern into `scores_`, which touches four heads 4 KB apart per position and so keeps dozens of
+> streams open at once.
+>
+> **Attention is the next thing worth fixing**: about 10 ms a token at context 1024 and 17 at 2048, which
+> is 12-17% of the step, and more than that of v(k), since it is per-token work a k-token pass cannot
+> share. What it is *not* is a thing to rewrite on a theory. Two guesses today were wrong when measured
+> (false sharing in `row_scratch_`, worth under 5%; a bigger prefill chunk, actually slower), so the next
+> step is a micro-benchmark of the cache scan on its own, which separates bandwidth from the score-write
+> pattern, in the way `bench_kernel.py` separated the matmul from the memory system.
+>
+> One thing the attempt did settle, by accident. **Asking for more threads than the selection has cores
+> is catastrophic, not merely wasteful**: 8 threads on the 6 performance cores decoded at 513 ms a step
+> against 92 ms with 6, because the workers wait at a spin barrier and two pinned to one core fight over
+> it rather than share it. The pool now clamps the count to the cores available and reports what it got.
 
 > **Measured, 2026-10-02: what the per-round overhead o is not.** o = 0.088 target steps, 8.71 ms a
 > round for the 4B/0.6B pair at gamma=4, and the two obvious explanations are both wrong.

@@ -107,6 +107,18 @@ def test_thread_count_is_reported(weights_file):
 # ----------------------------------------------------------------------- timings
 
 
+def test_more_threads_than_cores_is_clamped(weights_file):
+    """Workers wait at a spin barrier, so two pinned to one core fight over it rather than share it.
+
+    Measured: 8 threads on the 6 performance cores decoded the 4B at 513 ms a step against 92 ms with
+    6, a 5.6x collapse. There is no reading of "threads" that wants that, so a request for more than
+    the selection offers gets the selection, and `threads` reports what it got.
+    """
+    available = len(cpp.cores_for("performance"))
+    model = cpp.Model(weights_file, max_positions=8, threads=available + 4, cores="performance")
+    assert model.threads == available
+
+
 def test_timings_are_off_until_asked_for(weights_file):
     model = cpp.Model(weights_file, max_positions=16)
     model.forward(tokens(3, seed=3))

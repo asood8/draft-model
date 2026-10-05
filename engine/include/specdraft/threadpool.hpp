@@ -33,7 +33,8 @@ std::vector<uint32_t> cores_for(CoreSelection selection);
 
 class ThreadPool {
 public:
-    // threads <= 0 means "as many as the selection offers".
+    // threads <= 0 means "as many as the selection offers", and more than the selection offers is
+    // clamped to that: spinning workers sharing a core fight over it rather than sharing it.
     ThreadPool(int threads, CoreSelection selection);
     ~ThreadPool();
     ThreadPool(const ThreadPool&) = delete;
