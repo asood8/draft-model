@@ -434,6 +434,24 @@ def test_stats_separate_the_prompt_pass_from_the_rounds(paths):
     assert stats["rounds_seconds"] > 0.0
 
 
+def test_plain_decoding_reports_its_prompt_pass_too(paths):
+    """The baseline has to be measured the same way as the thing it is a baseline for.
+
+    Without this, a benchmark comparing decode-only speed against the baseline's whole-call speed
+    reported speculative decoding at 9.91x on a summarization prompt, where the honest figure is near
+    1: the baseline's prefill was being counted as decoding and the other method's was not.
+    """
+    target, _ = open_pair(paths, gamma=2)
+    target.set_timing(True)
+    target.reset_timings()
+    _, stats = cpp.generate_plain(target, [3, 4, 5, 6, 7], max_new_tokens=6)
+    assert stats["prefill_seconds"] > 0.0
+    assert stats["prefill_model_seconds"] > 0.0
+    assert stats["prefill_seconds"] < stats["seconds"]
+    assert stats["rounds_seconds"] == pytest.approx(stats["seconds"] - stats["prefill_seconds"],
+                                                    rel=1e-12)
+
+
 def test_a_prompt_of_one_token_has_no_prefill(paths):
     """With nothing to prefill the fields stay zero rather than picking up the first round."""
     target, draft = open_pair(paths, gamma=2)

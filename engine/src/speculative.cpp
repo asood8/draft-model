@@ -240,6 +240,13 @@ std::vector<int32_t> generate_plain(Model& model, const std::vector<int32_t>& pr
     const Clock::time_point started = Clock::now();
     if (seq.size() > 1) {  // prefill everything but the newest token
         model.forward(seq.data(), static_cast<int>(seq.size()) - 1, nullptr, false);
+        // Recorded here as well as in the speculative loop, because the baseline has to be measured
+        // the same way as the thing it is a baseline for: comparing one method's decoding against
+        // another's whole call reported a 9.91x speedup on a summarization prompt, where the honest
+        // figure is near 1. A prompt pass is most of the clock on a long prompt and no method
+        // affects it.
+        local.prefill_seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        local.prefill_model_seconds = total_stage_seconds(model);
     }
 
     while (local.emitted < options.max_new_tokens) {
