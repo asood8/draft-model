@@ -1206,6 +1206,45 @@ overall and per category.
 > against 92 ms with 6, because the workers wait at a spin barrier and two pinned to one core fight over
 > it rather than share it. The pool now clamps the count to the cores available and reports what it got.
 
+> **Measured, 2026-10-04, with `scripts/bench_attention.py`: attention was not memory-bound, and the
+> guess about imbalance was half right.** The same KV cache, four inner loops, timed back to back in one
+> process at context 1024 on the 4B's shape (36 layers, 8 kv heads, 4 query heads each, 151 MB a token):
+>
+> | shape | jobs | ms a token | GB/s | of the floor |
+> |---|---|---|---|---|
+> | scan -- convert the rows and sum them, nothing else | 48 | 4.53 | 35.5 | 1.00 |
+> | **engine** -- a buffer per position, a dot per head | **8** | **9.55** | 15.8 | 0.46 |
+> | fused -- converted in registers, no buffer | 48 | 6.70 | 22.5 | 0.68 |
+> | **grouped** -- converted once for the whole group | **48** | **5.67** | 26.6 | **0.80** |
+>
+> The first row kills the memory explanation: **this access pattern reaches 35 GB/s**, near the machine's
+> 39.8, so the cache layout was never the problem and the 11 GB/s the engine achieved was the inner
+> loop's own doing. Two things cost:
+>
+> *The scratch buffer.* Converting a cached row into a buffer and reading it back is a store and a load
+> an element, and worse, it makes each position's conversion wait on the previous position's reads of the
+> same buffer. Converting in registers as the row is multiplied: 9.55 to 7.66 ms at the engine's own job
+> split, **1.25x**, and bit-for-bit the same answer, since the accumulator structure is unchanged.
+>
+> *Per-head conversion.* A key row belongs to a kv head and is read by all 4 query heads in its group, so
+> converting it per head is four times the work for one row's worth of data. Converting once for the
+> group is what the `grouped` row does. This one is worth recording for how it failed first: with a
+> runtime `group` it was no faster than the engine (8.61 ms against 8.43) despite a quarter of the
+> conversions, because an accumulator array indexed by a runtime bound cannot live in registers.
+> Templating the group size and dispatching to a fixed one made it the fastest shape. **The arithmetic
+> was never the problem; where the accumulators lived was.**
+>
+> *And the split, which was the other half.* 8 jobs over 6 workers against 48: 9.55 to 7.84 ms for the
+> engine shape, 7.66 to 5.67 for grouped. So imbalance is real and worth about 1.35x, but it is not what
+> made attention slow, and the ten-physical-core test that looked like it refuted imbalance was measuring
+> E-cores, not balance.
+>
+> **Landed: the grouped math, 1.25x on attention, bit-exact, 845 tests pass.** Not landed: the position
+> split, worth another 1.35x, which needs the value accumulation to keep per-chunk partial sums and
+> combine them in a fixed order -- fixed by position rather than by batch, so that a k-token pass still
+> matches k single-token passes. Together they would take attention at context 2048 from 26.9 ms a token
+> to about 16, which is 11% of a step there, and flatten v(k) with it.
+
 > **Measured, 2026-10-02: what the per-round overhead o is not.** o = 0.088 target steps, 8.71 ms a
 > round for the 4B/0.6B pair at gamma=4, and the two obvious explanations are both wrong.
 >

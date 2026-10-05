@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -18,6 +19,7 @@
 #include "specdraft/model.hpp"
 #include "specdraft/model_file.hpp"
 #include "specdraft/quant.hpp"
+#include "specdraft/simd.hpp"
 #include "specdraft/sampling.hpp"
 #include "specdraft/speculative.hpp"
 #include "specdraft/threadpool.hpp"
@@ -121,6 +123,254 @@ py::array_t<float> dot_multi_py(const py::bytes& weights, const py::bytes& activ
     py::array_t<float> out(tokens);
     Dot(w.data(), x.data(), static_cast<int>(w.size()), tokens, out.mutable_data());
     return out;
+}
+
+// What attention's bandwidth goes on, separated from the rest of a forward pass.
+//
+// At context 2048 attention is 27% of a decode step and reads the KV cache at about 11 GB/s on a
+// machine that streams 39.8. The layout is contiguous per (layer, kv head) and each cached row is
+// already shared across its group of query heads, so neither of those is the cause. What is left is
+// how the work is cut up and how the inner loop reads it, and those are what this measures.
+//
+//   scan     convert the cached rows and sum them, nothing else: the floor this access pattern
+//            allows, and the number to compare the rest against
+//   engine   what Model::attention does: one position at a time, convert K, a dot per query head
+//            into a per-head scores row, then a second pass converting V and accumulating
+//   blocked  the same work with positions taken in blocks, so several cache rows are in flight at
+//            once instead of one
+//
+// `jobs_per_head` cuts each kv head's positions into that many jobs. The engine uses 1, which gives
+// 8 jobs for 6 workers and cannot balance; this says what that costs.
+enum class AttnShape { scan, engine, blocked, fused, grouped };
+
+py::dict bench_attention(int positions, int layers, int kv_heads, int group, int head_dim,
+                         int jobs_per_head, int block, int iters, int threads,
+                         const std::string& cores, const std::string& shape) {
+    if (positions < 1 || layers < 1 || kv_heads < 1 || group < 1 || head_dim < 1 ||
+        jobs_per_head < 1 || block < 1 || iters < 1 || threads < 1) {
+        throw std::invalid_argument("every size must be positive");
+    }
+    if (head_dim % 8 != 0) {
+        throw std::invalid_argument("head_dim must be a multiple of 8");
+    }
+    AttnShape kind = AttnShape::engine;
+    if (shape == "scan") {
+        kind = AttnShape::scan;
+    } else if (shape == "blocked") {
+        kind = AttnShape::blocked;
+    } else if (shape == "fused") {
+        kind = AttnShape::fused;
+    } else if (shape == "grouped") {
+        kind = AttnShape::grouped;
+    } else if (shape != "engine") {
+        throw std::invalid_argument(
+            "shape must be \"scan\", \"engine\", \"blocked\", \"fused\" or \"grouped\"");
+    }
+    CoreSelection selection = CoreSelection::performance;
+    if (!parse_core_selection(cores.c_str(), &selection)) {
+        throw std::invalid_argument("unknown core selection " + cores);
+    }
+
+    const int heads = kv_heads * group;
+    const size_t per_layer = static_cast<size_t>(kv_heads) * positions * head_dim;
+    const double cache_bytes = 2.0 * layers * per_layer * sizeof(uint16_t);  // keys and values
+
+    // One buffer per cache, laid out exactly as the engine lays its own out: layer, then kv head,
+    // then position. Sized for every layer so the sweep streams from memory rather than from L3,
+    // which is the condition a real decode step runs in.
+    std::vector<uint16_t> keys(static_cast<size_t>(layers) * per_layer);
+    std::vector<uint16_t> values(keys.size());
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keys[i] = fp32_to_fp16(uniform(rng));
+        values[i] = fp32_to_fp16(uniform(rng));
+    }
+    std::vector<float> queries(static_cast<size_t>(heads) * head_dim);
+    for (float& value : queries) {
+        value = uniform(rng);
+    }
+    std::vector<float> scores(static_cast<size_t>(heads) * positions, 0.0f);
+
+    // Per-worker scratch and output, each padded to its own cache line.
+    constexpr size_t kLine = 16;  // floats
+    const size_t scratch_stride = static_cast<size_t>(block) * head_dim * 2 + kLine;
+    std::vector<float> scratch(static_cast<size_t>(threads) * scratch_stride);
+    const size_t out_stride = ((static_cast<size_t>(heads) * head_dim + kLine - 1) / kLine) * kLine;
+    std::vector<float> out(static_cast<size_t>(threads) * out_stride, 0.0f);
+    std::vector<double> checksums(static_cast<size_t>(threads) * kLine, 0.0);
+
+    const int jobs = kv_heads * jobs_per_head;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    double seconds = 0.0;
+    {
+        py::gil_scoped_release unlocked;
+        ThreadPool pool(threads, selection);
+
+        int layer = 0;
+        const auto body = [&](int begin, int end, int worker) {
+            float* keys_buffer = scratch.data() + static_cast<size_t>(worker) * scratch_stride;
+            float* values_buffer = keys_buffer + static_cast<size_t>(block) * head_dim;
+            float* output = out.data() + static_cast<size_t>(worker) * out_stride;
+            double sum = 0.0;
+
+            for (int job = begin; job < end; ++job) {
+                const int kv = job / jobs_per_head;
+                const int slice = job % jobs_per_head;
+                const int lo = static_cast<int>(static_cast<int64_t>(positions) * slice / jobs_per_head);
+                const int hi = static_cast<int>(static_cast<int64_t>(positions) * (slice + 1) / jobs_per_head);
+                const size_t base = static_cast<size_t>(layer) * per_layer +
+                                    static_cast<size_t>(kv) * positions * head_dim;
+                const int first_head = kv * group;
+
+                if (kind == AttnShape::scan) {
+                    for (int t = lo; t < hi; ++t) {
+                        const size_t at = base + static_cast<size_t>(t) * head_dim;
+                        fp16_to_fp32_many(keys.data() + at, keys_buffer, head_dim);
+                        fp16_to_fp32_many(values.data() + at, values_buffer, head_dim);
+                        sum += keys_buffer[0] + values_buffer[0];
+                    }
+                } else if (kind == AttnShape::engine) {
+                    for (int t = lo; t < hi; ++t) {
+                        const size_t at = base + static_cast<size_t>(t) * head_dim;
+                        fp16_to_fp32_many(keys.data() + at, keys_buffer, head_dim);
+                        for (int g = 0; g < group; ++g) {
+                            const int h = first_head + g;
+                            scores[static_cast<size_t>(h) * positions + t] =
+                                dot_f32(queries.data() + static_cast<size_t>(h) * head_dim,
+                                        keys_buffer, head_dim) * scale;
+                        }
+                    }
+                    for (int t = lo; t < hi; ++t) {
+                        const size_t at = base + static_cast<size_t>(t) * head_dim;
+                        fp16_to_fp32_many(values.data() + at, values_buffer, head_dim);
+                        for (int g = 0; g < group; ++g) {
+                            const int h = first_head + g;
+                            accumulate_scaled(output + static_cast<size_t>(h) * head_dim,
+                                              values_buffer,
+                                              scores[static_cast<size_t>(h) * positions + t],
+                                              head_dim);
+                        }
+                    }
+                } else if (kind == AttnShape::grouped) {
+                    // One conversion of each cached row, shared by the group of query heads that
+                    // read it. The queries for a group are contiguous, so one stride reaches them.
+                    float* row_scores = keys_buffer;  // group values, not a converted row
+                    for (int t = lo; t < hi; ++t) {
+                        const size_t at = base + static_cast<size_t>(t) * head_dim;
+                        dot_f16_f32_group(keys.data() + at,
+                                          queries.data() + static_cast<size_t>(first_head) * head_dim,
+                                          head_dim, group, head_dim, row_scores);
+                        for (int g = 0; g < group; ++g) {
+                            scores[static_cast<size_t>(first_head + g) * positions + t] =
+                                row_scores[g] * scale;
+                        }
+                    }
+                    for (int t = lo; t < hi; ++t) {
+                        const size_t at = base + static_cast<size_t>(t) * head_dim;
+                        for (int g = 0; g < group; ++g) {
+                            row_scores[g] =
+                                scores[static_cast<size_t>(first_head + g) * positions + t];
+                        }
+                        accumulate_scaled_f16_group(
+                            output + static_cast<size_t>(first_head) * head_dim, head_dim,
+                            values.data() + at, row_scores, group, head_dim);
+                    }
+                } else if (kind == AttnShape::fused) {
+                    // No scratch buffer at all: the cached row is converted in registers as it is
+                    // multiplied. Same accumulator structure as the engine shape, so the same
+                    // answer to the last bit; what goes away is a store and a load per element, and
+                    // the dependency that made each position wait on the one before it.
+                    for (int t = lo; t < hi; ++t) {
+                        const size_t at = base + static_cast<size_t>(t) * head_dim;
+                        for (int g = 0; g < group; ++g) {
+                            const int h = first_head + g;
+                            scores[static_cast<size_t>(h) * positions + t] =
+                                dot_f16_f32(keys.data() + at,
+                                            queries.data() + static_cast<size_t>(h) * head_dim,
+                                            head_dim) * scale;
+                        }
+                    }
+                    for (int t = lo; t < hi; ++t) {
+                        const size_t at = base + static_cast<size_t>(t) * head_dim;
+                        for (int g = 0; g < group; ++g) {
+                            const int h = first_head + g;
+                            accumulate_scaled_f16(output + static_cast<size_t>(h) * head_dim,
+                                                  values.data() + at,
+                                                  scores[static_cast<size_t>(h) * positions + t],
+                                                  head_dim);
+                        }
+                    }
+                } else {
+                    // The same arithmetic, with `block` positions converted before any of them is
+                    // used, so the loads for several cache rows are outstanding at once.
+                    for (int t = lo; t < hi; t += block) {
+                        const int span = std::min(block, hi - t);
+                        for (int b = 0; b < span; ++b) {
+                            fp16_to_fp32_many(keys.data() + base + static_cast<size_t>(t + b) * head_dim,
+                                              keys_buffer + static_cast<size_t>(b) * head_dim, head_dim);
+                        }
+                        for (int g = 0; g < group; ++g) {
+                            const int h = first_head + g;
+                            const float* q = queries.data() + static_cast<size_t>(h) * head_dim;
+                            float* row = scores.data() + static_cast<size_t>(h) * positions + t;
+                            for (int b = 0; b < span; ++b) {
+                                row[b] = dot_f32(q, keys_buffer + static_cast<size_t>(b) * head_dim,
+                                                 head_dim) * scale;
+                            }
+                        }
+                        for (int b = 0; b < span; ++b) {
+                            fp16_to_fp32_many(values.data() + base + static_cast<size_t>(t + b) * head_dim,
+                                              values_buffer + static_cast<size_t>(b) * head_dim, head_dim);
+                        }
+                        for (int g = 0; g < group; ++g) {
+                            const int h = first_head + g;
+                            float* accumulator = output + static_cast<size_t>(h) * head_dim;
+                            const float* row = scores.data() + static_cast<size_t>(h) * positions + t;
+                            for (int b = 0; b < span; ++b) {
+                                accumulate_scaled(accumulator,
+                                                  values_buffer + static_cast<size_t>(b) * head_dim,
+                                                  row[b], head_dim);
+                            }
+                        }
+                    }
+                }
+            }
+            checksums[static_cast<size_t>(worker) * kLine] += sum + output[0];
+        };
+
+        // A barrier per layer, as the engine has: attention is one parallel region per layer.
+        const auto sweep = [&] {
+            for (layer = 0; layer < layers; ++layer) {
+                if (threads == 1) {
+                    body(0, jobs, 0);
+                } else {
+                    pool.run(jobs, body);
+                }
+            }
+        };
+        sweep();  // untimed, so the measurement is not paying for a cold cache
+        const auto started = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            sweep();
+        }
+        seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    }
+
+    double checksum = 0.0;
+    for (double value : checksums) {
+        checksum += value;
+    }
+    py::dict result;
+    result["seconds"] = seconds;
+    result["cache_bytes"] = cache_bytes;
+    result["cache_bytes_read"] = cache_bytes * iters;
+    result["gb_per_second"] = cache_bytes * iters / seconds / 1e9;
+    result["jobs"] = jobs;
+    result["threads"] = threads;
+    result["checksum"] = checksum;
+    return result;
 }
 
 py::dict stats_as_dict(const DecodeStats& stats) {
@@ -922,6 +1172,19 @@ PYBIND11_MODULE(_engine, m) {
     // Both benchmarks go through one implementation, so the only difference between them is the
     // layout being measured. `threads` defaults to one for a pure throughput figure; pass six to ask
     // the question the engine cares about, where the memory system is the constraint.
+    m.def(
+        "bench_attention",
+        [](int positions, int layers, int kv_heads, int group, int head_dim, int jobs_per_head,
+           int block, int iters, int threads, const std::string& cores, const std::string& shape) {
+            return bench_attention(positions, layers, kv_heads, group, head_dim, jobs_per_head,
+                                   block, iters, threads, cores, shape);
+        },
+        py::arg("positions") = 1024, py::arg("layers") = 36, py::arg("kv_heads") = 8,
+        py::arg("group") = 4, py::arg("head_dim") = 128, py::arg("jobs_per_head") = 1,
+        py::arg("block") = 8, py::arg("iters") = 1, py::arg("threads") = 6,
+        py::arg("cores") = "performance", py::arg("shape") = "engine",
+        "The KV cache scan on its own: what attention's bandwidth goes on.");
+
     m.def(
         "bench_dot",
         [](int rows, int n_in, int tokens, int iters, const std::string& format, int threads,
