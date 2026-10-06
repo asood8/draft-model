@@ -318,6 +318,9 @@ measurements get checked against.
 > *What is left is alpha and c.* The ceiling this section used to quote, 1.33x at alpha = 1, is passed at
 > alpha = 0.8. Distillation to alpha 0.8-0.85 is now worth 1.42-1.5x where against the old kernel it would
 > have been worth 1.03x, and vocabulary trimming moves c, which at gamma=1 is a fifth of the denominator.
+> **Every number in this paragraph is a context-128 number**, including that 1.42-1.5x, and the prompts
+> this engine is evaluated on are four times longer. Recomputed where it will be used, distillation is
+> worth 1.21-1.25x; see the note at the head of section 11, which is the one to quote.
 > Best gamma stays small, 1 or 2, because the slope is 0.29 and not 0.
 
 **Back-of-envelope for this laptop.** The bandwidth figure is an assumption until Milestone 0 measures it.
@@ -1381,6 +1384,39 @@ overall and per category.
 
 *Estimated time: 2–3 weeks. The GPU jobs can start around week 3, in parallel with Milestones 2–4.*
 
+> **Recomputed, 2026-10-05: at the context this engine is evaluated at, distillation is worth about
+> +0.06x, not +0.25x -- and it does not change gamma.** Section 3's 1.42-1.5x used v(2) = 1.12 and
+> c = 0.186, which are context-128 numbers. Spec-Bench prompts average a few hundred tokens, so the
+> figures to use are the context-512 ones: v(2) = 1.28, v(3) = 1.67, v(4) = 2.14, v(5) = 2.52, c = 0.205
+> (o dropped, as in section 10.3's table, which these rows reproduce at alpha = 0.736).
+>
+> | alpha | gamma=1 | gamma=2 | gamma=3 | gamma=4 | best |
+> |---|---|---|---|---|---|
+> | 0.736 (measured, off the shelf) | **1.17** | 1.09 | 0.97 | 0.89 | 1.17x (gamma=1), measured **1.20x** |
+> | 0.80 | **1.21** | 1.17 | 1.07 | 1.01 | 1.21x (gamma=1) |
+> | 0.85 | **1.25** | 1.24 | 1.16 | 1.11 | 1.25x (gamma=1) |
+> | 0.87 | 1.26 | **1.26** | 1.19 | 1.14 | 1.26x (gamma=2), the first row where two guesses win |
+> | 0.90 | 1.28 | **1.30** | 1.25 | 1.23 | 1.30x (gamma=2) |
+>
+> Three things follow, and they set the scope in section 11.7.
+>
+> *The realistic prize is 1.20x to about 1.27x.* A successful run reaching alpha = 0.85 predicts 1.25x
+> against 1.17x predicted today, and the model has been running 2-7% low, so measured would be about
+> 1.27x. Worth having, and worth about a sixth of what the kernel work was worth.
+>
+> *Distillation almost certainly will not move gamma.* Two guesses only overtake one at **alpha = 0.864**,
+> past where distillation of a 0.6B against a 4B plausibly lands. So the configuration this project is
+> about is chosen by v(k), not by alpha, and that stays true after distillation -- which is itself a
+> result worth stating rather than a disappointment. What *would* move the crossover is v(k) falling
+> again, which is why the attention re-measurement comes first.
+>
+> *The gain is in the ceiling, not the floor, and the floor is where speculation loses.* At context 2048
+> (v(2) = 1.46, c = 0.268) break-even needs alpha >= 0.73 and even alpha = 0.80 reaches only 1.04x. The
+> categories measured at 0.95x are rag and summarization, at alpha 0.44-0.60 and long contexts; the mix
+> in 11.2 is chat, code and math, none of it longer than about 1k tokens. Training this recipe harder
+> improves alpha where it is already good. See the long-context slice in 11.2 for the one change that
+> addresses it.
+
 ### 11.1 What's specific to this project
 
 - **Two teachers.** The engine runs a *4-bit* target, and the output follows *that* model's distribution. So
@@ -1399,6 +1435,13 @@ overall and per category.
 
   Summarization and translation prompts from train splits would target Spec-Bench categories directly, so use
   them only as a labeled ablation.
+- **A long-context slice (~3k prompts, contexts of 1k tokens and up).** Not a category: a length. Every prompt
+  in the mix above is short, so the draft is never trained at a length where v(k) and c are large -- which is
+  exactly where speculation currently loses (0.95x on rag and summarization, alpha 0.44-0.60). Take long
+  documents with questions over them from a source that is *not* a Spec-Bench category and not its corpora:
+  not CNN/DailyMail, not the rag corpus, not XSum. This is the only part of the recipe with a chance at the
+  categories that lose, and it is also the part most open to the objection that it targets the evaluation, so
+  the write-up names the source, the length distribution and what it is not.
 - **Decontamination.** Normalize text and drop any training prompt that shares a 13-gram with a Spec-Bench
   prompt. Also exact-match against GSM8K test questions and CNN/DM test articles.
 - **Splits:**
@@ -1418,6 +1461,11 @@ overall and per category.
 
 In every case, run both models over the same text (teacher forcing) and compute the loss only at positions whose
 next token is part of the response.
+
+Generation is the expensive half of the budget and the half whose cost is least known, so it is measured before
+it is sized: stage 0 of 11.7 times 200 prompts and the corpus is sized from that rate under a 6-hour cap. The
+difference between vLLM starting on a T4 and falling back to batched HF `generate` is about 4x, which is the
+difference between a 30k-prompt corpus and a 60k one.
 
 ### 11.4 Losses
 
@@ -1534,14 +1582,36 @@ numbers that get published. So:
 
 ### 11.7 Grid (budget-aware)
 
-| Stage | Runs | Purpose |
-|---|---|---|
-| A. Pilot | 1 × ~2M tokens | lr sanity, NaN check, throughput |
-| B. Losses | `sft`, `fkl`, `rkl`, `tvd` on target-generated data, 4-bit teacher, ~10M tokens each | Which loss for which decoding mode |
-| C. Teachers | Best loss with the full-precision teacher vs the 4-bit teacher | Does matching the engine's target pay off? |
-| D. Data | Best loss on fixed text and on draft-generated data | Which data source |
-| E. Scale-up | Best recipe to ~50M tokens, with checkpoints evaluated along the way | Final draft, plus a curve of acceptance against training tokens |
-| *Stretch* | Quantization-aware training; on-policy distillation; **layer pruning** (fewer layers means fewer bytes *and* fewer thread barriers, which directly lowers c on a CPU) | |
+Sized against **one week of Kaggle's free quota, 30 GPU-hours**, and against a prize of about +0.06x
+(the note at the head of this section). The budget is spent on one corpus, a ranking stage that is
+deliberately short, and one curve.
+
+| Stage | Runs | GPU-h | Purpose |
+|---|---|---|---|
+| 0. Rate probe | 200 prompts through the 4B on one T4 | 0.3 | **Measure generation tokens/second before sizing anything.** Batched HF `generate` and vLLM differ by about 4x on a T4, and that number alone decides whether the corpus is 30k prompts or 60k. Nothing else gates it. |
+| 1. Corpus | 30k prompts (the `generate_data.py` default mix) + the long-context slice, target-generated, `--max-new-tokens 512`, T=1.0 | 3–6 | About 10M response positions at a ~320-token mean. Generated once; every run below reuses it. 60k only if the probe says >= 1200 tok/s. |
+| A. Pilot | 1 × ~2M tokens | 0.5 | lr sanity, NaN check (fp16 on a bfloat16-trained model), throughput |
+| B. Losses | `sft`, `fkl`, `rkl`, `tvd` on target-generated data, 4-bit teacher, **~8M tokens each** | 5–6.5 | Which loss for which decoding mode. 8M, not 10M: ranking four recipes needs less data than training the final one, and this is the stage that multiplies. Expect the answer to split by decoding mode -- greedy alpha is argmax agreement, which should favour mode-seeking `rkl`, while sampling alpha is exactly 1 − TVD. **Keep `sft` whatever else is cut:** if cross-entropy on target-written text ties the logit losses, the two-GPU teacher-logit pipeline is unnecessary, which is a finding and makes everything after it cheaper. |
+| C. Teachers | Winner's loss with the full-precision teacher vs the 4-bit teacher | 1.5 | Does matching the engine's target pay off? One run, same text so nothing is regenerated, and one of only two things (11.1) that make this distillation specific to this project rather than a DistillSpec replication. |
+| E. Scale-up | Winner to ~20M tokens seen, checkpointing every 4M | 3–4 | The final draft, and **the curve of acceptance against training tokens**, which is the actual deliverable: it says where the returns died. It costs nothing beyond the run already being done. |
+| | | **14–19** | Leaves room inside 30 GPU-h for one session to time out and be redone. |
+
+**Cut, and why.** *Stage D (data source)* -- the question is which of three corpora to train on, and the
+answer does not change the engine's numbers; drop it unless quota is left over. *`jsd`* -- bounded and
+symmetric, but nothing here needs that property. *The 50M scale-up* -- at the measured curve the last 30M
+tokens buy a fraction of 0.06x. *Quantization-aware training and on-policy distillation* -- both are
+stretch goals against a prize this size.
+
+**Budgeted separately, not from this 30 hours.** Layer pruning and vocabulary trimming. The 2026-10-01
+measurement is the reason: a pruned draft emits gibberish and its acceptance collapses to 4%, so every
+pruned variant is pruning *plus* a training run, and the pair of them (0.63x bytes a token) is a change to
+c rather than to alpha. That is its own project with its own budget.
+
+**The stop rule, fixed before anything is spent: target alpha = 0.85 at context 512.** If stage B's best
+checkpoints do not extrapolate there, stop and publish the curve plus the arithmetic -- "distillation buys
++0.05x at the context this runs at, and here is the term that says why". Given the v(k) result that is a
+finding, not a failed milestone, and it is a far better use of the remaining time than a 50M-token run
+chasing a hundredth of a factor.
 
 > **Measured, 2026-10-01: a pruning run is pruning *plus* training, never pruning alone.** Block influence on
 > Qwen3-0.6B ranks layers 23–26 as the least useful and layer 0 as far the most important (0.95 against about 0.10
@@ -1745,7 +1815,10 @@ If you'd rather do one thing at a time, run Milestone 5 after Milestone 4 and ad
    about 13% more draft bytes. What remains is whether that quality loss shows up as lost *acceptance*, which
    needs the Milestone 4 measurements of c and α to settle.
 3. **Primary compiler:** MSVC or clang-cl? Try both in Milestone 3 and keep the faster.
-4. **Distillation track:** in parallel with the engine (default), or after Milestone 4?
+4. **Distillation track:** in parallel with the engine (default), or after Milestone 4? *Answered by events:
+   it runs after, because the engine work landed first. Scope settled 2026-10-05 -- see 11.7, sized to one
+   week of quota against a recomputed prize of +0.06x. What is still open is only the long-context slice's
+   source.*
 5. **Stretch goals in scope:** vocabulary trimming, quantization-aware training, layer pruning, 8-bit draft KV
    cache, prompt lookup?
 6. **Weekly time budget:** adjust the milestones once Milestone 0 shows the real pace.
