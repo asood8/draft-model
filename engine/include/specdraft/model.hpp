@@ -114,6 +114,8 @@ private:
 
     // All sized for max_batch tokens; strides are the per-token widths below.
     std::vector<float> x_, xb_, xb2_, qkv_, att_, scores_, mlp_, kv_scratch_, row_scratch_;
+    // Attention's per-chunk partial sums; see Model::attention for why the chunking is fixed.
+    std::vector<float> partials_;
     uint32_t qkv_stride_ = 0, mlp_stride_ = 0, blocks_stride_ = 0;
     // row_scratch_ holds one worker's results for the row it is on, and its stride is padded to a
     // whole cache line: workers writing inside one line bounce it between cores on every row.

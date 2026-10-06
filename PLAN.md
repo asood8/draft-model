@@ -1239,11 +1239,35 @@ overall and per category.
 > made attention slow, and the ten-physical-core test that looked like it refuted imbalance was measuring
 > E-cores, not balance.
 >
-> **Landed: the grouped math, 1.25x on attention, bit-exact, 845 tests pass.** Not landed: the position
-> split, worth another 1.35x, which needs the value accumulation to keep per-chunk partial sums and
-> combine them in a fixed order -- fixed by position rather than by batch, so that a k-token pass still
-> matches k single-token passes. Together they would take attention at context 2048 from 26.9 ms a token
-> to about 16, which is 11% of a step there, and flatten v(k) with it.
+> **Landed: the grouped math, 1.25x on attention, bit-exact, 845 tests pass.**
+>
+> **Then the position split, 2026-10-05.** Attention is now four parallel regions a layer -- scores,
+> softmaxes, values into per-chunk partial sums, and a combine -- cut over (key/value head, chunk of
+> 256 positions) instead of over 8 key/value heads. On a loaded machine, normalising against `gate_up`
+> since that cannot vary with context, attention goes 7.17 to about 5.5 ms a token at context 512,
+> 13.32 to 8.7 at 1024 and 26.88 to 19.4 at 2048: **1.3-1.5x**, on top of the 1.25x above.
+>
+> Two things the split had to get right.
+>
+> *The chunk size is a constant, not a function of the sequence length.* The values are summed chunk by
+> chunk, so the boundaries fix the order the additions happen in. Fixed boundaries mean a token at a
+> given position sums the same chunks in the same order whether it arrived in a one-token pass or a
+> k-token one, which is the invariant greedy speculative decoding rests on. Boundaries derived from
+> `total` would differ between the two and break it silently. Two tests now cross a boundary, one of
+> them with a batch straddling it, and both check bit-equality against single steps.
+>
+> *A chunk is still worth 256 positions.* Split at 128, decoding from position 128 puts one position in
+> the second chunk and pays three extra barriers a layer for it -- measured, attention went from 1.5 ms
+> a token to 2.9 at short context, a regression that only showed up because the stage timers were run
+> again at every context rather than only at the one being improved. Anything up to a chunk's worth of
+> context takes a single-region path instead, and that is the only threshold available: the two paths
+> agree exactly when every position lies in the first chunk, and not otherwise.
+>
+> What is left in attention is the gap to the floor, which the benchmark puts at 4.5 ms a token against
+> about 5.7 for the best shape measured -- the arithmetic, now that the memory is in hand. The next
+> thing worth measuring is not attention at all but **v(k) again**: attention is per-token work a
+> k-token pass cannot share, so making it cheaper should flatten the curve and may move the best gamma
+> from 1 to 2, which would be the first time this engine wanted more than one guess.
 
 > **Measured, 2026-10-02: what the per-round overhead o is not.** o = 0.088 target steps, 8.71 ms a
 > round for the 4B/0.6B pair at gamma=4, and the two obvious explanations are both wrong.

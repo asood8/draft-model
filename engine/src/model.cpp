@@ -148,6 +148,13 @@ Model::Model(ModelFile file, EngineOptions options) : file_(std::move(file)), op
     act_qs_.resize(batch * blocks_stride_ * QK);
     act_offsets_.resize(batch * blocks_stride_);
     kv_scratch_.resize(static_cast<size_t>(pool_->size()) * 2 * c.head_dim);
+    // One partial sum per chunk of positions, per token, per head: attention adds these up in chunk
+    // order so that the result does not depend on which worker ran which chunk. Sized for the
+    // longest sequence this model can be asked for, since that decides the chunk count.
+    constexpr int kChunkPositions = 256;  // must match kChunk in Model::attention
+    const size_t max_chunks =
+        (static_cast<size_t>(options_.max_positions) + kChunkPositions - 1) / kChunkPositions;
+    partials_.resize(max_chunks * batch * c.q_dim());
     // One cache line per worker, not max_batch floats. Each worker writes its own slice once per
     // weight row, so a stride below 64 bytes puts several workers in one line and every row write
     // invalidates it for the others: at max_batch=2, which is what gamma=1 asks for, all six
@@ -352,62 +359,146 @@ void Model::attention(int layer_index, int base, int batch) {
     const uint32_t head_dim = c.head_dim;
     const uint32_t group = c.group_size();
     const uint32_t q_dim = c.q_dim();
+    const int heads = static_cast<int>(c.num_attention_heads);
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int total = base + batch;  // every position now in the cache
+    const int kv_heads = static_cast<int>(c.num_key_value_heads);
 
-    // One job per key/value head: each cached K and V row is read once and shared by the group
-    // of query heads that use it *and* by every token in the batch.
-    pool_->run(static_cast<int>(c.num_key_value_heads), [&](int begin, int end, int worker) {
-        // Enough room for one score per query head in a group, which is all this needs now: the
-        // cached rows are read straight out of the cache in fp16 rather than converted into a
-        // buffer first. Measured on the 4B's shape at context 1024, converting a row into a buffer
-        // and reading it back cost 9.55 ms a token against 7.66 for converting it in registers as
-        // it is multiplied, because every position had to wait for the previous one's reads of the
-        // same buffer.
-        float* row_scores = kv_scratch_.data() + static_cast<size_t>(worker) * 2 * head_dim;
+    // Positions are cut into fixed-size chunks so that there is work for every worker. The natural
+    // unit is the key/value head, since its cached rows are read once and shared by the group of
+    // query heads that use them -- but there are 8 of those against 6 workers, which cannot
+    // balance: two workers take two heads and the makespan is two heads' work however many cores
+    // idle. Measured, splitting positions as well is worth about 1.35x (plan §10.1).
+    //
+    // The size is a constant rather than something derived from the sequence length, and that is
+    // the whole trick. The value accumulation sums chunk by chunk, so the chunk boundaries decide
+    // the order the additions happen in; fixed boundaries mean a token at a given position sums the
+    // same chunks in the same order whether it arrived in a one-token pass or a k-token one, which
+    // is the invariant greedy speculative decoding rests on (§10.3).
+    // 256 rather than something smaller because the split costs three extra barriers a layer, and
+    // just past a boundary it buys nothing: decoding from position 128 with a chunk of 128 puts one
+    // position in the second chunk and pays the barriers anyway, which measured as attention going
+    // from 1.5 ms a token to 2.9. Everything up to a chunk's worth of context takes the single-region
+    // path below instead, and that is the only threshold available -- the two paths agree exactly
+    // when every position lies in the first chunk, and not otherwise.
+    constexpr int kChunk = 256;
+    const int chunks = (total + kChunk - 1) / kChunk;
 
-        for (int kv = begin; kv < end; ++kv) {
-            const uint32_t first_head = static_cast<uint32_t>(kv) * group;
-
-            for (int t = 0; t < total; ++t) {
-                const uint16_t* key = key_cache_.data() + cache_index(layer_index, kv, t);
-                // Token j sits at position base + j, so it may attend to t only if t <= base + j.
-                const int first_token = std::max(0, t - base);
-                for (int j = first_token; j < batch; ++j) {
-                    // One pass over the cached row for the whole group of query heads that share
-                    // it. Their queries are adjacent, which is what makes one call enough.
-                    dot_f16_f32_group(key,
-                                      qkv_.data() + static_cast<size_t>(j) * qkv_stride_ +
-                                          first_head * head_dim,
-                                      head_dim, static_cast<int>(group), head_dim, row_scores);
-                    for (uint32_t g = 0; g < group; ++g) {
-                        scores_[score_index(j, first_head + g) + t] = row_scores[g] * scale;
-                    }
-                }
-            }
-
-            for (int j = 0; j < batch; ++j) {
+    // Scores for one key/value head over a stretch of positions. Nothing is shared: this writes its
+    // own stretch of its own heads' rows.
+    const auto score_range = [&](int kv, int lo, int hi, float* row_scores) {
+        const uint32_t first_head = static_cast<uint32_t>(kv) * group;
+        for (int t = lo; t < hi; ++t) {
+            const uint16_t* key = key_cache_.data() + cache_index(layer_index, kv, t);
+            // Token j sits at position base + j, so it may attend to t only if t <= base + j.
+            const int first_token = std::max(0, t - base);
+            for (int j = first_token; j < batch; ++j) {
+                // One pass over the cached row for the whole group of query heads that share it.
+                // Their queries are adjacent, which is what makes one call enough.
+                dot_f16_f32_group(key,
+                                  qkv_.data() + static_cast<size_t>(j) * qkv_stride_ +
+                                      first_head * head_dim,
+                                  head_dim, static_cast<int>(group), head_dim, row_scores);
                 for (uint32_t g = 0; g < group; ++g) {
-                    const uint32_t h = first_head + g;
-                    softmax(scores_.data() + score_index(j, h), base + j + 1);
-                    float* out = att_.data() + static_cast<size_t>(j) * q_dim + h * head_dim;
-                    std::fill(out, out + head_dim, 0.0f);
+                    scores_[score_index(j, first_head + g) + t] = row_scores[g] * scale;
                 }
             }
+        }
+    };
 
-            for (int t = 0; t < total; ++t) {
-                const uint16_t* value = value_cache_.data() + cache_index(layer_index, kv, t);
-                const int first_token = std::max(0, t - base);
-                for (int j = first_token; j < batch; ++j) {
-                    for (uint32_t g = 0; g < group; ++g) {
-                        row_scores[g] = scores_[score_index(j, first_head + g) + t];
-                    }
-                    // Element for element the same operation as before, so the same answer: the
-                    // cached row is converted once and accumulated into every head of the group.
-                    accumulate_scaled_f16_group(
-                        att_.data() + static_cast<size_t>(j) * q_dim + first_head * head_dim,
-                        head_dim, value, row_scores, static_cast<int>(group), head_dim);
+    // The weighted sum of values over a stretch of positions, into `dest`, which is laid out as
+    // batch tokens of q_dim each. Element for element the same operation as a scalar accumulate.
+    const auto value_range = [&](int kv, int lo, int hi, float* row_scores, float* dest) {
+        const uint32_t first_head = static_cast<uint32_t>(kv) * group;
+        for (int t = lo; t < hi; ++t) {
+            const uint16_t* value = value_cache_.data() + cache_index(layer_index, kv, t);
+            const int first_token = std::max(0, t - base);
+            for (int j = first_token; j < batch; ++j) {
+                for (uint32_t g = 0; g < group; ++g) {
+                    row_scores[g] = scores_[score_index(j, first_head + g) + t];
                 }
+                accumulate_scaled_f16_group(
+                    dest + static_cast<size_t>(j) * q_dim + first_head * head_dim, head_dim, value,
+                    row_scores, static_cast<int>(group), head_dim);
+            }
+        }
+    };
+
+    const auto softmax_rows = [&](int begin, int end) {
+        for (int job = begin; job < end; ++job) {
+            softmax(scores_.data() + score_index(job / heads, static_cast<uint32_t>(job % heads)),
+                    base + job / heads + 1);
+        }
+    };
+
+    if (chunks == 1) {
+        // Short context: one job per key/value head does the whole thing, and the pass costs one
+        // barrier rather than four. Worth keeping separate -- on a small model the barriers are the
+        // cost, and this is the shape every draft model runs in early in a sequence.
+        pool_->run(kv_heads, [&](int begin, int end, int worker) {
+            float* row_scores = kv_scratch_.data() + static_cast<size_t>(worker) * 2 * head_dim;
+            for (int kv = begin; kv < end; ++kv) {
+                const uint32_t first_head = static_cast<uint32_t>(kv) * group;
+                score_range(kv, 0, total, row_scores);
+                for (int j = 0; j < batch; ++j) {
+                    for (uint32_t g = 0; g < group; ++g) {
+                        softmax(scores_.data() + score_index(j, first_head + g), base + j + 1);
+                    }
+                    float* out = att_.data() + static_cast<size_t>(j) * q_dim + first_head * head_dim;
+                    std::fill(out, out + group * head_dim, 0.0f);
+                }
+                value_range(kv, 0, total, row_scores, att_.data());
+            }
+        });
+        return;
+    }
+
+    pool_->run(kv_heads * chunks, [&](int begin, int end, int worker) {
+        float* row_scores = kv_scratch_.data() + static_cast<size_t>(worker) * 2 * head_dim;
+        for (int job = begin; job < end; ++job) {
+            const int lo = (job % chunks) * kChunk;
+            score_range(job / chunks, lo, std::min(total, lo + kChunk), row_scores);
+        }
+    });
+
+    // One softmax per (token, head), which needs every chunk's scores and so cannot start earlier.
+    pool_->run(batch * heads, [&](int begin, int end, int) { softmax_rows(begin, end); });
+
+    // Values, into one partial sum per chunk. A chunk's partial is a sum from zero over its own
+    // positions, so which worker ran it does not enter the result -- only the chunk index does, and
+    // that is fixed.
+    const size_t partial_stride = static_cast<size_t>(batch) * q_dim;
+    pool_->run(kv_heads * chunks, [&](int begin, int end, int worker) {
+        float* row_scores = kv_scratch_.data() + static_cast<size_t>(worker) * 2 * head_dim;
+        for (int job = begin; job < end; ++job) {
+            const int kv = job / chunks;
+            const int chunk = job % chunks;
+            const int lo = chunk * kChunk;
+            const uint32_t first_head = static_cast<uint32_t>(kv) * group;
+            float* dest = partials_.data() + static_cast<size_t>(chunk) * partial_stride;
+
+            // Every (chunk, token) slot this job owns starts at zero, including the ones no position
+            // reaches: a token early in the batch does not see the later chunks, and adding their
+            // zeros back in costs nothing and keeps the sum the same shape for all of them.
+            for (int j = 0; j < batch; ++j) {
+                float* slot = dest + static_cast<size_t>(j) * q_dim + first_head * head_dim;
+                std::fill(slot, slot + group * head_dim, 0.0f);
+            }
+            value_range(kv, lo, std::min(total, lo + kChunk), row_scores, dest);
+        }
+    });
+
+    // Add the chunks up, in chunk order, which is what makes this deterministic.
+    pool_->run(batch * heads, [&](int begin, int end, int) {
+        for (int job = begin; job < end; ++job) {
+            const size_t offset = static_cast<size_t>(job / heads) * q_dim +
+                                  static_cast<size_t>(job % heads) * head_dim;
+            float* out = att_.data() + offset;
+            std::copy(partials_.data() + offset, partials_.data() + offset + head_dim, out);
+            for (int chunk = 1; chunk < chunks; ++chunk) {
+                add_in_place(
+                    out, partials_.data() + static_cast<size_t>(chunk) * partial_stride + offset,
+                    head_dim);
             }
         }
     });

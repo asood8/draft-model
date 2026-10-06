@@ -93,6 +93,51 @@ def test_k_tokens_stay_bit_exact_under_threading(weights_file, options):
     assert np.array_equal(together, np.stack(rows))
 
 
+@pytest.mark.parametrize("options", CONFIGURATIONS)
+def test_k_tokens_stay_bit_exact_across_an_attention_chunk(weights_file, options):
+    """The same invariant, at a context long enough to be split into chunks.
+
+    Attention sums the values chunk by chunk so that several workers can share one key/value head's
+    positions, and the sum it produces depends on where the chunk boundaries fall. They are fixed at
+    every 256 positions for exactly this reason: a token at a given position has to sum the same
+    chunks in the same order whether it arrived in a one-token pass or in a k-token one. Boundaries
+    derived from the sequence length would differ between the two and break greedy speculative
+    decoding, which rests on a k-token pass being k single-token passes.
+
+    The sequence here crosses two boundaries, and the batch is fed across one of them.
+    """
+    ids = tokens(600, seed=5)
+    positions = 640
+    together = cpp.Model(weights_file, max_positions=positions, **options).forward(
+        ids, all_logits=True
+    )
+
+    stepwise = cpp.Model(weights_file, max_positions=positions, **options)
+    rows = [stepwise.forward(ids[i : i + 1], all_logits=True)[0] for i in range(len(ids))]
+    assert np.array_equal(together, np.stack(rows))
+
+
+def test_a_batch_straddling_a_chunk_boundary_matches_single_steps(weights_file):
+    """The awkward case: a k-token pass whose tokens land either side of a chunk boundary.
+
+    Token j sees chunks up to its own position and no further, so the ones past it contribute zeros
+    that still have to be added in the same order. This is the case that fails if the chunk count is
+    taken from the batch rather than from the position.
+    """
+    ids = tokens(270, seed=6)
+    positions = 288
+    prefix, tail = ids[:252], ids[252:]  # the boundary at 256 falls inside the tail
+
+    together = cpp.Model(weights_file, max_positions=positions)
+    together.forward(prefix)
+    batched = together.forward(tail, all_logits=True)
+
+    stepwise = cpp.Model(weights_file, max_positions=positions)
+    stepwise.forward(prefix)
+    rows = [stepwise.forward(tail[i : i + 1], all_logits=True)[0] for i in range(len(tail))]
+    assert np.array_equal(batched, np.stack(rows))
+
+
 def test_thread_count_is_reported(weights_file):
     one = cpp.Model(weights_file, max_positions=8, threads=1)
     assert one.threads == 1
