@@ -337,14 +337,17 @@ std::vector<int32_t> generate_with_drafter(Model& target, Drafter& drafter,
         Verdict verdict;
         {
             Stopwatch watch(local.accept_seconds);
-            if (!greedy) {
-                for (int j = 0; j <= proposed; ++j) {
-                    warp_to_probs(target_rows.data() + static_cast<size_t>(j) * vocab, vocab,
-                                  options.sampling, scratch);
-                }
-            }
+            // Warped on demand rather than all at once: the rule stops at the first rejection, so at
+            // the measured acceptance it reads about 2.4 of 5 rows at gamma = 4, and the rest were
+            // being warped over a 152k vocabulary for nothing. Greedy passes raw logits and warps
+            // nothing at all.
+            const PrepareRow warp_row = [&](int j) {
+                warp_to_probs(target_rows.data() + static_cast<size_t>(j) * vocab, vocab,
+                              options.sampling, scratch);
+            };
             verdict = accept_or_resample(target_rows.data(), vocab, draft_rows.data(), vocab,
-                                         guesses.data(), proposed, vocab, greedy, rng, residual);
+                                         guesses.data(), proposed, vocab, greedy, rng, residual,
+                                         greedy ? nullptr : &warp_row);
         }
         ++local.rounds;
         local.accepted += verdict.accepted;

@@ -2,6 +2,8 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 
 // Small vectorized helpers for the float parts of the forward pass: attention over the fp16
@@ -20,6 +22,111 @@ inline float hsum256(__m256 v) {
     sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
     sum = _mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 1));
     return _mm_cvtss_f32(sum);
+}
+
+// e^x for eight floats at once.
+//
+// Range reduction to x = n*ln2 + r with |r| <= ln2/2, a degree-7 Taylor series for e^r, and 2^n
+// built by hand out of the exponent bits. The error is under 1e-8 relative, where the tolerances
+// this has to meet are 1e-6 against the Python sampling oracle and 1e-5 against the PyTorch twin.
+//
+// Worth having because both softmaxes in the engine are over large arrays: the vocabulary is 151,936
+// entries, and attention at context 2048 runs 32 heads over 2048 positions in each of 36 layers,
+// which is 2.4 million exponentials a token.
+//
+// Anything at or below -88 returns exactly zero, so a masked-out logit of -inf stays exactly zero
+// through the softmax and top-k still leaves exactly k entries carrying mass. Just above the clamp,
+// down to about -87.7, the result is zero too: 2^n is assembled from the exponent field, and n
+// rounds to -127 there, which that field cannot hold. Both are terms 1e-38 the size of the largest
+// in any softmax this is used for.
+inline __m256 exp256_ps(__m256 x) {
+    const __m256 lowest = _mm256_set1_ps(-88.0f);
+    const __m256 vanished = _mm256_cmp_ps(x, lowest, _CMP_LE_OQ);
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.0f));
+    x = _mm256_max_ps(x, lowest);
+
+    // n = round(x / ln2), r = x - n*ln2 with ln2 split in two so the product is exact.
+    const __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)),
+                                     _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693359375f), x);
+    r = _mm256_fnmadd_ps(n, _mm256_set1_ps(-2.12194440e-4f), r);
+
+    __m256 p = _mm256_set1_ps(1.0f / 5040.0f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 720.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 120.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 24.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 6.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+
+    // 2^n, assembled from the exponent field.
+    const __m256i exponent = _mm256_slli_epi32(
+        _mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    const __m256 scaled = _mm256_mul_ps(p, _mm256_castsi256_ps(exponent));
+    return _mm256_andnot_ps(vanished, scaled);
+}
+
+inline float hmax256(__m256 v) {
+    __m128 high = _mm256_extractf128_ps(v, 1);
+    __m128 best = _mm_max_ps(_mm256_castps256_ps128(v), high);
+    best = _mm_max_ps(best, _mm_movehl_ps(best, best));
+    best = _mm_max_ss(best, _mm_shuffle_ps(best, best, 1));
+    return _mm_cvtss_f32(best);
+}
+
+// Softmax in place: the largest value subtracted for stability, then exponentials, then one
+// reciprocal applied to all of them. Shared by attention and by the sampling warps, which had a
+// scalar copy each.
+inline void softmax_in_place(float* values, uint32_t n) {
+    if (n == 0) {
+        return;
+    }
+    uint32_t i = 0;
+    float largest = values[0];
+    if (n >= 8) {
+        __m256 best = _mm256_loadu_ps(values);
+        for (i = 8; i + 8 <= n; i += 8) {
+            best = _mm256_max_ps(best, _mm256_loadu_ps(values + i));
+        }
+        largest = hmax256(best);
+    }
+    for (; i < n; ++i) {
+        largest = std::max(largest, values[i]);
+    }
+
+    // The total is accumulated in double. Summing 151,936 float32 exponentials into float32 lanes
+    // left it at 1.00003 rather than 1, which is a 3e-5 bias on every probability in the row for the
+    // sake of an addition the exponentials dwarf. The scalar loop this replaced was worse: it summed
+    // all of them into one float.
+    const __m256 offset = _mm256_set1_ps(largest);
+    __m256d totals_low = _mm256_setzero_pd();
+    __m256d totals_high = _mm256_setzero_pd();
+    double total = 0.0;
+    for (i = 0; i + 8 <= n; i += 8) {
+        const __m256 e = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(values + i), offset));
+        _mm256_storeu_ps(values + i, e);
+        totals_low = _mm256_add_pd(totals_low, _mm256_cvtps_pd(_mm256_castps256_ps128(e)));
+        totals_high = _mm256_add_pd(totals_high, _mm256_cvtps_pd(_mm256_extractf128_ps(e, 1)));
+    }
+    if (n >= 8) {
+        alignas(32) double lanes[4];
+        _mm256_store_pd(lanes, _mm256_add_pd(totals_low, totals_high));
+        total = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    }
+    for (; i < n; ++i) {
+        values[i] = std::exp(values[i] - largest);
+        total += values[i];
+    }
+
+    const float inverse = static_cast<float>(1.0 / total);
+    const __m256 broadcast = _mm256_set1_ps(inverse);
+    for (i = 0; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(values + i, _mm256_mul_ps(_mm256_loadu_ps(values + i), broadcast));
+    }
+    for (; i < n; ++i) {
+        values[i] *= inverse;
+    }
 }
 
 // fp16 -> fp32, eight at a time. Converting the KV cache one element at a time was 16x
@@ -144,6 +251,17 @@ inline void dot_f16_f32_group_n(const uint16_t* keys, const float* queries, uint
             const float* q = queries + static_cast<size_t>(g) * q_stride + i;
             acc0[g] = _mm256_fmadd_ps(low, _mm256_loadu_ps(q), acc0[g]);
             acc1[g] = _mm256_fmadd_ps(high, _mm256_loadu_ps(q + 8), acc1[g]);
+        }
+    }
+    // The same eight-element step dot_f32 has, which is what makes the two agree exactly when n is
+    // not a multiple of sixteen. Attention's head_dim always is, so this was easy to leave out and
+    // the test for it was what noticed.
+    for (; i + 8 <= n; i += 8) {
+        const __m256 low =
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(keys + i)));
+        for (int g = 0; g < Group; ++g) {
+            acc0[g] = _mm256_fmadd_ps(
+                low, _mm256_loadu_ps(queries + static_cast<size_t>(g) * q_stride + i), acc0[g]);
         }
     }
     for (int g = 0; g < Group; ++g) {

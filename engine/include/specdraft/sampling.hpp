@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 // Sampling and the speculative acceptance rule, in C++.
@@ -51,12 +52,21 @@ struct Verdict {
     int next_token = 0;  // the target's token: a correction, or a bonus if all were accepted
 };
 
+// Called with a row index before that row of p is first read, so the caller can fill it in on
+// demand. Exactly once per row, in increasing order, which matters because warping a row twice would
+// warp probabilities rather than logits.
+using PrepareRow = std::function<void(int)>;
+
 // Verify gamma guesses at once.
 //   p: gamma + 1 rows of `vocab` values, `stride` apart. Warped probabilities, or raw logits
 //      when greedy.
 //   q: gamma rows, the distributions the draft actually sampled from (ignored when greedy).
+//   prepare: optional, see above. The rule stops at the first rejection and so reads only the rows
+//      up to it -- about 2.4 of 5 at gamma = 4 and the measured acceptance -- and a warp over a
+//      152k vocabulary is not free, so the speculative loop passes one rather than warping every row
+//      in advance.
 Verdict accept_or_resample(const float* p, int p_stride, const float* q, int q_stride,
                            const int32_t* guesses, int gamma, int vocab, bool greedy, Rng& rng,
-                           std::vector<float>& scratch);
+                           std::vector<float>& scratch, const PrepareRow* prepare = nullptr);
 
 }  // namespace specdraft

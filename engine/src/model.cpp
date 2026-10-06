@@ -37,20 +37,6 @@ void rope(float* vec, uint32_t head_dim, int position, float theta) {
     }
 }
 
-void softmax(float* values, int n) {
-    float largest = values[0];
-    for (int i = 1; i < n; ++i) {
-        largest = std::max(largest, values[i]);
-    }
-    float total = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        values[i] = std::exp(values[i] - largest);
-        total += values[i];
-    }
-    for (int i = 0; i < n; ++i) {
-        values[i] /= total;
-    }
-}
 
 const float* as_floats(const Tensor& tensor, const char* name) {
     if (tensor.format != Format::fp32) {
@@ -426,8 +412,9 @@ void Model::attention(int layer_index, int base, int batch) {
 
     const auto softmax_rows = [&](int begin, int end) {
         for (int job = begin; job < end; ++job) {
-            softmax(scores_.data() + score_index(job / heads, static_cast<uint32_t>(job % heads)),
-                    base + job / heads + 1);
+            softmax_in_place(
+                scores_.data() + score_index(job / heads, static_cast<uint32_t>(job % heads)),
+                static_cast<uint32_t>(base + job / heads + 1));
         }
     };
 
@@ -442,7 +429,8 @@ void Model::attention(int layer_index, int base, int batch) {
                 score_range(kv, 0, total, row_scores);
                 for (int j = 0; j < batch; ++j) {
                     for (uint32_t g = 0; g < group; ++g) {
-                        softmax(scores_.data() + score_index(j, first_head + g), base + j + 1);
+                        softmax_in_place(scores_.data() + score_index(j, first_head + g),
+                                         static_cast<uint32_t>(base + j + 1));
                     }
                     float* out = att_.data() + static_cast<size_t>(j) * q_dim + first_head * head_dim;
                     std::fill(out, out + group * head_dim, 0.0f);

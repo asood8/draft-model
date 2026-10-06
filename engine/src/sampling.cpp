@@ -2,6 +2,8 @@
 
 #include <immintrin.h>
 
+#include "specdraft/simd.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -22,22 +24,6 @@ uint64_t splitmix64(uint64_t& x) {
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31);
-}
-
-void softmax_in_place(float* values, int n) {
-    float largest = values[0];
-    for (int i = 1; i < n; ++i) {
-        largest = std::max(largest, values[i]);
-    }
-    float total = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        values[i] = std::exp(values[i] - largest);
-        total += values[i];
-    }
-    const float inverse = 1.0f / total;
-    for (int i = 0; i < n; ++i) {
-        values[i] *= inverse;
-    }
 }
 
 // The smallest set of most likely tokens whose mass reaches top_p, found without sorting the
@@ -224,7 +210,7 @@ void warp_to_probs(float* values, int n, const SamplingConfig& config, std::vect
         // strictly-better tokens, which is what a threshold comparison means.
     }
 
-    softmax_in_place(values, n);
+    softmax_in_place(values, static_cast<uint32_t>(n));
 
     if (config.top_p < 1.0f) {
         keep_nucleus(values, n, config.top_p, scratch);
@@ -252,10 +238,13 @@ int sample_from_probs(const float* probs, int n, Rng& rng) {
 
 Verdict accept_or_resample(const float* p, int p_stride, const float* q, int q_stride,
                            const int32_t* guesses, int gamma, int vocab, bool greedy, Rng& rng,
-                           std::vector<float>& scratch) {
+                           std::vector<float>& scratch, const PrepareRow* prepare) {
     Verdict verdict;
     int accepted = 0;
     for (; accepted < gamma; ++accepted) {
+        if (prepare != nullptr) {
+            (*prepare)(accepted);  // this row is about to be read, and no later one may be
+        }
         const int32_t guess = guesses[accepted];
         if (guess < 0 || guess >= vocab) {
             throw std::runtime_error("draft proposed a token outside the vocabulary");
@@ -274,6 +263,12 @@ Verdict accept_or_resample(const float* p, int p_stride, const float* q, int q_s
         }
     }
     verdict.accepted = accepted;
+
+    // Every guess survived, so the row after them is read for the bonus token and needs preparing
+    // too. A rejection leaves `accepted` pointing at the row the loop already prepared.
+    if (prepare != nullptr && accepted == gamma) {
+        (*prepare)(gamma);
+    }
 
     const float* p_row = p + static_cast<size_t>(accepted) * p_stride;
     if (greedy) {

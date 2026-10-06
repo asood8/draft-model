@@ -1269,6 +1269,37 @@ overall and per category.
 > k-token pass cannot share, so making it cheaper should flatten the curve and may move the best gamma
 > from 1 to 2, which would be the first time this engine wanted more than one guess.
 
+> **Built, 2026-10-05: the sampling path, which every temperature run in this section needs.** Three
+> changes, none of them measured yet on a quiet machine, all of them tested.
+>
+> *A vectorized exponential.* Both softmaxes ran on `std::exp` one value at a time, and they are over
+> large arrays: 151,936 entries for the vocabulary, and attention at context 2048 is 32 heads over 2048
+> positions in 36 layers, which is **2.4 million exponentials a token**. `exp256_ps` does eight at a
+> time by range reduction and a degree-7 series, measured accurate to **7.4e-8 relative**, inside a
+> float32 ulp and well inside the 1e-6 this has to meet against the Python oracle. Values that would
+> come back denormal return zero instead, which is what keeps a -inf logit from top-k at exactly zero
+> through the softmax, so "exactly k tokens carry mass" stays true.
+>
+> *One softmax instead of two.* Attention and the sampling warps had a scalar copy each; they now share
+> one, and its total is accumulated in double. That last part is a real fix rather than tidying: summed
+> in float32 the probabilities over a 151,936-entry vocabulary added up to **1.00003**, a 3e-5 bias on
+> every row, and the scalar loop it replaced was worse still, since it summed all of them into one
+> float. It is now 1.00000002, and the largest error in a probability is 8e-9 against 3e-6.
+>
+> *Rows warped on demand.* The loop warped all gamma+1 target rows before testing any of them, and the
+> rule stops at the first rejection -- about 2.4 of 5 rows at gamma = 4 and the measured acceptance. The
+> rule now takes a callback and asks for each row once, in order, as it reaches it. A test pins that
+> contract directly, because the failure modes are quiet: asking twice would warp probabilities rather
+> than logits, and skipping one would have the rule read raw logits as a distribution.
+>
+> Also tested directly for the first time: attention's grouped kernels are **bit-identical** to the
+> per-head ones they replaced, over four group sizes and five lengths. That test earned its keep
+> immediately -- it found that the grouped dot had dropped the eight-element step `dot_f32` has, so the
+> two diverged whenever the length was not a multiple of sixteen. Attention's head_dim always is, so
+> nothing was wrong in the engine, and nothing would have been until someone used it elsewhere.
+>
+> 877 tests pass.
+
 > **Measured, 2026-10-02: what the per-round overhead o is not.** o = 0.088 target steps, 8.71 ms a
 > round for the 4B/0.6B pair at gamma=4, and the two obvious explanations are both wrong.
 >

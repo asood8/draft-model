@@ -85,6 +85,33 @@ def test_warps_match_the_python_oracle(config):
     np.testing.assert_allclose(mine, theirs, atol=1e-6)
 
 
+def test_the_rule_asks_for_each_row_once_and_only_as_far_as_it_reads():
+    """The target's rows are warped on demand, so the rule's requests are the contract.
+
+    Each row has to be asked for exactly once and in order: a second request would warp probabilities
+    rather than logits, and a skipped one would leave the rule reading raw logits as if they were a
+    distribution. The rule stops at the first rejection, so it asks for rows 0 through `accepted`,
+    and for one more only when every guess survived and a bonus token is drawn.
+    """
+    vocab = 8
+    certain = np.full((3, vocab), 0.0, dtype=np.float32)
+    certain[:, 1] = 1.0  # the target is sure of token 1 everywhere
+    q = np.zeros((2, vocab), dtype=np.float32)
+    q[:, 1] = 1.0
+
+    accepted, _, rows = cpp.accept_or_resample_rows_read(certain, q, [1, 1], seed=4)
+    assert accepted == 2  # both guesses match what the target wanted
+    assert rows == [0, 1, 2]  # and the bonus row after them
+
+    accepted, _, rows = cpp.accept_or_resample_rows_read(certain, q, [1, 7], seed=4)
+    assert accepted == 1  # the second guess cannot be accepted: the target gives it no mass
+    assert rows == [0, 1]  # so the row after the rejection is never asked for
+
+    accepted, _, rows = cpp.accept_or_resample_rows_read(certain, q, [7, 1], seed=4)
+    assert accepted == 0
+    assert rows == [0]
+
+
 def test_acceptance_rule_greedy_matches_the_oracle():
     scores = np.array([[0.0, 5.0, 1.0], [3.0, 0.0, 0.0], [0.0, 0.0, 7.0]], dtype=np.float32)
     zeros = np.zeros((2, 3), dtype=np.float32)
@@ -112,6 +139,74 @@ def test_first_emitted_token_follows_the_target():
 
     pvalue = chi_square_pvalue(counts, p.astype(np.float64) * trials)
     assert pvalue > 1e-3, f"emitted token does not follow p (p={pvalue:.2e})"
+
+
+# ------------------------------------------------------- the float kernels underneath
+
+
+def test_the_vectorized_exp_is_accurate_to_under_one_ulp():
+    """Both softmaxes run on this, so its error lands in the probabilities and in the logits.
+
+    The tolerances it has to meet are 1e-6 against the Python sampling oracle and 1e-5 against the
+    PyTorch twin; a float32 ulp is 1.2e-7, and this stays inside that over the whole range.
+    """
+    rng = np.random.default_rng(0)
+    values = np.concatenate([rng.uniform(-87.0, 87.0, 50_000), rng.uniform(-1.0, 1.0, 10_000),
+                             [0.0, 1.0, -1.0]]).astype(np.float32)
+    mine = cpp.vector_exp(values).astype(np.float64)
+    reference = np.exp(values.astype(np.float64))
+    relative = np.abs(mine - reference) / reference
+    assert relative.max() < 1.2e-7, f"worst relative error {relative.max():.3e}"
+    assert cpp.vector_exp(np.array([0.0], dtype=np.float32))[0] == 1.0
+
+
+def test_the_vectorized_exp_returns_zero_rather_than_a_denormal():
+    """Top-k marks the tokens it drops with -inf, and they have to come out of the softmax as zero.
+
+    A denormal would do no numerical harm and would still be wrong: "exactly k tokens carry mass" is
+    what top-k means, and the test for it counts nonzero entries. The clamp is at -88, and just
+    above it the result is zero as well, because 2^n is assembled from the exponent field and n
+    rounds to -127 there. In a softmax both are terms 1e-38 the size of the largest.
+    """
+    values = np.array([-np.inf, -1000.0, -89.0, -88.0], dtype=np.float32)
+    assert list(cpp.vector_exp(values)) == [0.0, 0.0, 0.0, 0.0]
+
+    normal = np.array([-87.0, -80.0, -1.0], dtype=np.float32)  # all representable as normals
+    assert (cpp.vector_exp(normal) > 0.0).all()
+    np.testing.assert_allclose(cpp.vector_exp(normal), np.exp(normal.astype(np.float64)),
+                               rtol=1.2e-7)
+
+
+def test_the_vectorized_softmax_matches_a_float64_one_over_a_whole_vocabulary():
+    """Summed in float32 the total came to 1.00003 over 151,936 entries, a 3e-5 bias on every row."""
+    rng = np.random.default_rng(1)
+    logits = (rng.standard_normal(151_936) * 4.0).astype(np.float32)
+    mine = cpp.vector_softmax(logits).astype(np.float64)
+    exponentials = np.exp(logits.astype(np.float64) - logits.max())
+    reference = exponentials / exponentials.sum()
+    assert np.abs(mine - reference).max() < 1e-7
+    assert mine.sum() == pytest.approx(1.0, abs=1e-6)
+
+    masked = logits.copy()
+    masked[:-50] = -np.inf  # what top-k leaves behind
+    kept = cpp.vector_softmax(masked)
+    assert int((kept > 0).sum()) == 50
+    assert float(kept.sum()) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("group", [1, 2, 4, 8])
+@pytest.mark.parametrize("n", [8, 16, 128, 129, 136])
+def test_attentions_grouped_kernels_are_bit_identical_to_the_per_head_ones(group, n):
+    """A cached row is read by every query head in its group, so it is converted once for all of them.
+
+    That is a performance change and nothing else, and this is what says so: the same numbers to the
+    last bit as converting the row into a buffer and calling dot_f32 and accumulate_scaled per head,
+    which is what the engine did before. Two accumulators in sixteen-element steps in both, and
+    fp16 to fp32 is exact, so there is no tolerance to argue about.
+    """
+    out = cpp.check_group_kernels(n=n, group=group, seed=n * 31 + group)
+    assert np.array_equal(np.array(out["grouped_dots"]), np.array(out["reference_dots"]))
+    assert np.array_equal(np.array(out["grouped_sum"]), np.array(out["reference_sum"]))
 
 
 # ------------------------------------------------------------------------------ argmax

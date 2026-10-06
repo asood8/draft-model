@@ -909,6 +909,29 @@ PYBIND11_MODULE(_engine, m) {
         "Time one of the two argmax scans over a row of n floats.");
 
     m.def(
+        "accept_or_resample_rows_read",
+        [](py::array_t<float, py::array::c_style | py::array::forcecast> p,
+           py::array_t<float, py::array::c_style | py::array::forcecast> q,
+           const std::vector<int32_t>& guesses, bool greedy, uint64_t seed) {
+            const int gamma = static_cast<int>(guesses.size());
+            if (p.ndim() != 2 || q.ndim() != 2 || p.shape(0) != gamma + 1 || q.shape(0) != gamma) {
+                throw std::invalid_argument("expected p [gamma+1, V] and q [gamma, V]");
+            }
+            const int vocab = static_cast<int>(p.shape(1));
+            Rng rng(seed);
+            std::vector<float> scratch;
+            std::vector<int> rows;
+            const PrepareRow record = [&](int row) { rows.push_back(row); };
+            const Verdict verdict =
+                accept_or_resample(p.data(), vocab, q.data(), vocab, guesses.data(), gamma, vocab,
+                                   greedy, rng, scratch, &record);
+            return py::make_tuple(verdict.accepted, verdict.next_token, rows);
+        },
+        py::arg("p"), py::arg("q"), py::arg("guesses"), py::arg("greedy") = false,
+        py::arg("seed") = uint64_t{0},
+        "The acceptance rule, reporting which rows of p it asked for and in what order.");
+
+    m.def(
         "core_topology",
         [] {
             py::list out;
@@ -1172,6 +1195,94 @@ PYBIND11_MODULE(_engine, m) {
     // Both benchmarks go through one implementation, so the only difference between them is the
     // layout being measured. `threads` defaults to one for a pure throughput figure; pass six to ask
     // the question the engine cares about, where the memory system is the constraint.
+    // The float helpers attention and sampling are built from, exposed so their claims can be
+    // checked rather than believed: that the grouped kernels are bit-for-bit what the per-head ones
+    // were, and that the vectorized exponential is accurate enough for both oracles.
+    m.def(
+        "vector_exp",
+        [](FloatArray values) {
+            py::array_t<float> out(values.size());
+            const int n = static_cast<int>(values.size());
+            int i = 0;
+            for (; i + 8 <= n; i += 8) {
+                _mm256_storeu_ps(out.mutable_data() + i,
+                                 exp256_ps(_mm256_loadu_ps(values.data() + i)));
+            }
+            for (; i < n; ++i) {  // the tail, one lane of a vector call
+                alignas(32) float lane[8] = {values.data()[i]};
+                _mm256_storeu_ps(lane, exp256_ps(_mm256_loadu_ps(lane)));
+                out.mutable_data()[i] = lane[0];
+            }
+            return out;
+        },
+        py::arg("values"), "The engine's vectorized e^x, for checking against a known-good one.");
+
+    m.def(
+        "vector_softmax",
+        [](FloatArray values) {
+            py::array_t<float> out(values.size());
+            std::memcpy(out.mutable_data(), values.data(),
+                        static_cast<size_t>(values.size()) * sizeof(float));
+            softmax_in_place(out.mutable_data(), static_cast<uint32_t>(out.size()));
+            return out;
+        },
+        py::arg("values"), "The softmax attention and the sampling warps share.");
+
+    m.def(
+        "check_group_kernels",
+        [](int n, int group, uint64_t seed) {
+            if (n < 1 || group < 1 || group > 8) {
+                throw std::invalid_argument("n must be positive and group within 1..8");
+            }
+            std::mt19937_64 rng(seed);
+            std::uniform_real_distribution<float> uniform(-2.0f, 2.0f);
+            std::vector<uint16_t> cached(static_cast<size_t>(n));
+            std::vector<float> converted(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) {
+                cached[i] = fp32_to_fp16(uniform(rng));
+                converted[i] = fp16_to_fp32(cached[i]);
+            }
+            std::vector<float> queries(static_cast<size_t>(group) * n);
+            for (float& value : queries) {
+                value = uniform(rng);
+            }
+            std::vector<float> weights(static_cast<size_t>(group));
+            for (float& value : weights) {
+                value = uniform(rng);
+            }
+
+            // The grouped kernels, against the per-head ones they replaced: a conversion into a
+            // buffer followed by dot_f32 and accumulate_scaled.
+            std::vector<float> grouped_dots(static_cast<size_t>(group));
+            dot_f16_f32_group(cached.data(), queries.data(), static_cast<uint32_t>(n), group,
+                              static_cast<uint32_t>(n), grouped_dots.data());
+            std::vector<float> reference_dots(static_cast<size_t>(group));
+            for (int g = 0; g < group; ++g) {
+                reference_dots[static_cast<size_t>(g)] = dot_f32(
+                    queries.data() + static_cast<size_t>(g) * n, converted.data(),
+                    static_cast<uint32_t>(n));
+            }
+
+            std::vector<float> grouped_sum(static_cast<size_t>(group) * n, 0.0f);
+            accumulate_scaled_f16_group(grouped_sum.data(), static_cast<uint32_t>(n), cached.data(),
+                                        weights.data(), group, static_cast<uint32_t>(n));
+            std::vector<float> reference_sum(static_cast<size_t>(group) * n, 0.0f);
+            for (int g = 0; g < group; ++g) {
+                accumulate_scaled(reference_sum.data() + static_cast<size_t>(g) * n,
+                                  converted.data(), weights[static_cast<size_t>(g)],
+                                  static_cast<uint32_t>(n));
+            }
+
+            py::dict out;
+            out["grouped_dots"] = grouped_dots;
+            out["reference_dots"] = reference_dots;
+            out["grouped_sum"] = grouped_sum;
+            out["reference_sum"] = reference_sum;
+            return out;
+        },
+        py::arg("n"), py::arg("group") = 4, py::arg("seed") = uint64_t{1},
+        "Attention's grouped kernels beside the per-head ones they replaced.");
+
     m.def(
         "bench_attention",
         [](int positions, int layers, int kv_heads, int group, int head_dim, int jobs_per_head,
