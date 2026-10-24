@@ -1446,6 +1446,14 @@ overall and per category.
 > against 1.17x predicted today, and the model has been running 2-7% low, so measured would be about
 > 1.27x. Worth having, and worth about a sixth of what the kernel work was worth.
 >
+> *Attempted 2026-10-24 and still open:* the attention rewrite should have lowered v(k) and so moved
+> the alpha = 0.864 crossover below, which would change the recommendation here. The re-measurement
+> was inconclusive -- the machine was 1.05-1.25x slower than the run these numbers came from, and
+> v(k) is a ratio, so an inflated pass(1) flattens the curve whether or not the engine improved. The
+> figures in this table are still the 2026-10-05 ones and are still the ones to use. **Nothing in
+> section 11.7 should be started until the sweep has been retaken quiet**, since a lower crossover is
+> the one result that would argue for spending more on distillation rather than less.
+>
 > *Distillation almost certainly will not move gamma.* Two guesses only overtake one at **alpha = 0.864**,
 > past where distillation of a 0.6B against a 4B plausibly lands. So the configuration this project is
 > about is chosen by v(k), not by alpha, and that stays true after distillation -- which is itself a

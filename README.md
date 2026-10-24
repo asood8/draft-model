@@ -34,8 +34,13 @@ project measures it. See [PLAN.md](PLAN.md) for the full plan and the open quest
 
 Qwen3-4B at 4 bits as the target, Qwen3-0.6B at 4 bits as the draft, on an i7-13620H (6 performance
 cores, 4 efficiency cores, 16 GB DDR4-3200). The figures are from a quiet-machine run on
-2026-10-04; section 13 of the plan explains why measurement on this machine needs care. Attention
-has since been rewritten and has not yet been re-measured.
+2026-10-04; section 13 of the plan explains why measurement on this machine needs care, and
+`results/README.md` records which stored runs are comparable with which.
+
+Attention and the softmax were rewritten after that run. What has been re-measured since, by
+comparisons taken inside one process and so independent of the machine's state, is below under
+attention and the sampling path. The end-to-end figures -- the step time, the 1.20x and the v(k)
+table -- have not, and are still the 2026-10-04 ones.
 
 - Read bandwidth is 37–39 GB/s against a theoretical 51.2, which sets the ceiling on decoding speed.
 - Qwen3-4B decodes at 64.1 ms a token, or 15.6 tokens a second, which is 88.7% of that ceiling. The
@@ -55,6 +60,14 @@ has since been rewritten and has not yet been re-measured.
   8-bit is roughly free, and an 8-bit output layer recovers a fifth of the 4-bit loss.
 - The quantization twin agrees with the engine on 98.9% of top-1 tokens at 0.023 mean TVD, close
   enough to rank training recipes on a GPU.
+- Attention, after the rewrite, costs 9.91 ms a token at context 2048 against a floor of 8.88 ms for
+  the access pattern it needs, so 12% remains and the stage is finished. The shape it replaced costs
+  19.87 ms on the same measurement.
+- The vectorized softmax is 4.86x a scalar one at a 129-element row, 5.70x at 2049 and 6.00x over
+  the 151,936-entry vocabulary. Since a token holds 1152 attention rows and one vocabulary row, that
+  is 0.549 ms a token at context 128 and 8.894 ms at 2048. It is also the more accurate of the two:
+  the scalar row's probabilities sum to 1.00010138 where this one reaches 0.99999996.
+- The vectorized argmax is 9.16x the scalar scan over the vocabulary, 0.058 ms against 0.534 ms.
 
 ## Not done yet
 
