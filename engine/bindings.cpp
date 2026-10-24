@@ -909,6 +909,64 @@ PYBIND11_MODULE(_engine, m) {
         "Time one of the two argmax scans over a row of n floats.");
 
     m.def(
+        "bench_softmax",
+        [](int n, int iters, const std::string& variant) {
+            if (n <= 0 || iters <= 0) {
+                throw std::invalid_argument("n and iters must be positive");
+            }
+            if (variant != "scalar" && variant != "vector") {
+                throw std::invalid_argument("variant must be \"vector\" or \"scalar\"");
+            }
+            // Logits of a realistic spread: softmax normalizes, so a row of equal values would let
+            // the exponential run on one input and say nothing about the range reduction's branches.
+            std::vector<float> row(static_cast<size_t>(n));
+            uint32_t state = 777u;
+            for (int i = 0; i < n; ++i) {
+                state = state * 1664525u + 1013904223u;
+                row[static_cast<size_t>(i)] =
+                    (static_cast<float>(state >> 8) * (1.0f / 16777216.0f) - 0.5f) * 24.0f;
+            }
+            std::vector<float> values(row);
+            void (*warp)(float*, uint32_t) = variant == "scalar" ? &softmax_scalar : &softmax_in_place;
+
+            double checksum = 0.0;
+            const auto started = std::chrono::steady_clock::now();
+            for (int it = 0; it < iters; ++it) {
+                std::copy(row.begin(), row.end(), values.begin());
+                warp(values.data(), static_cast<uint32_t>(n));
+                checksum += values[0];  // used, so the call cannot be hoisted away
+            }
+            const double seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+
+            // The copy is inside the timed loop because softmax works in place and would otherwise
+            // be handed its own output; timing it separately is the only way to subtract it.
+            std::vector<float> sink(static_cast<size_t>(n));
+            const auto copy_started = std::chrono::steady_clock::now();
+            for (int it = 0; it < iters; ++it) {
+                std::copy(row.begin(), row.end(), sink.begin());
+                checksum += sink[0];
+            }
+            const double copy_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_started).count();
+
+            double total = 0.0;
+            for (int i = 0; i < n; ++i) {
+                total += values[static_cast<size_t>(i)];
+            }
+            py::dict out;
+            out["seconds"] = seconds;
+            out["copy_seconds"] = copy_seconds;
+            out["net_seconds"] = seconds - copy_seconds;
+            out["elements_per_second"] = static_cast<double>(n) * iters / (seconds - copy_seconds);
+            out["sum"] = total;  // how far from 1 the row ended up, which is the accuracy claim
+            out["checksum"] = checksum;
+            return out;
+        },
+        py::arg("n"), py::arg("iters") = 1, py::arg("variant") = "vector",
+        "Time one of the two softmaxes over a row of n floats, less the cost of restoring the row.");
+
+    m.def(
         "accept_or_resample_rows_read",
         [](py::array_t<float, py::array::c_style | py::array::forcecast> p,
            py::array_t<float, py::array::c_style | py::array::forcecast> q,

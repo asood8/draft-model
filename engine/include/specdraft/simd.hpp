@@ -75,6 +75,30 @@ inline float hmax256(__m256 v) {
     return _mm_cvtss_f32(best);
 }
 
+// The scalar softmax this replaced, kept as a named baseline the way `argmax_scalar` is: a claim
+// that the vectorized one is faster is worth only as much as the thing it was measured against, and
+// the row lengths here span four orders of magnitude (129 for an attention row early in a sequence,
+// 151,936 for the vocabulary), so which one wins is a question about n rather than a constant.
+// Nothing in the engine calls this; `bench_softmax` does.
+inline void softmax_scalar(float* values, uint32_t n) {
+    if (n == 0) {
+        return;
+    }
+    float largest = values[0];
+    for (uint32_t i = 1; i < n; ++i) {
+        largest = std::max(largest, values[i]);
+    }
+    float total = 0.0f;  // as it was: every exponential summed into one float
+    for (uint32_t i = 0; i < n; ++i) {
+        values[i] = std::exp(values[i] - largest);
+        total += values[i];
+    }
+    const float inverse = 1.0f / total;
+    for (uint32_t i = 0; i < n; ++i) {
+        values[i] *= inverse;
+    }
+}
+
 // Softmax in place: the largest value subtracted for stability, then exponentials, then one
 // reciprocal applied to all of them. Shared by attention and by the sampling warps, which had a
 // scalar copy each.
