@@ -1793,6 +1793,11 @@ verification and distilled a quantization-matched 0.6B draft, speeding up Qwen3-
   so the temptation is to run it first and then start measuring; it is also 3064 empty all-core
   barriers, which is the most power-hungry thing in this engine and does no work. Read it once, in its
   own process, and let the machine settle before anything whose number matters. See the note below.
+- **To compare against a number from another session, rebuild that commit and measure it alongside.**
+  A stored figure cannot tell a slower machine from a slower engine. Rebuilding the old commit and
+  alternating the two binaries answers in one run what a cross-session comparison only guesses at,
+  and it is cheap: `cmake -S <worktree> -B <dir> -DPython_EXECUTABLE=... -Dpybind11_DIR=...`, then
+  load the built `_engine` by path rather than through the installed package.
 
 > **Measured, 2026-10-24: a sweep in a fixed order reported a v(2) of 0.97, and the machine was not
 > comparable to 2026-10-04 in the first place.** Two rules and one limit, in the order they were
@@ -1818,21 +1823,43 @@ verification and distilled a quantization-matched 0.6B draft, speeding up Qwen3-
 > not move together -- and ends with the instruction: take it cool.
 >
 > *And the limit, which matters more than either rule: tonight's machine cannot be compared with
-> 2026-10-04's.* Per-stage timers at four contexts, two shuffled sweeps, say every weight-streaming
-> stage is uniformly above the quiet run -- qkv 1.23x, attn_out 1.15x, gate_up 1.11x, ffn_down 1.05x,
-> output 1.12x at context 128 -- while **attention, the only stage whose code changed, is unchanged at
-> 1.43 ms against 1.50**. A uniform penalty on the stages that stream weights, and none on the stage
-> that was rewritten, is a machine running slower, not a regression. Read bandwidth still measures
-> **39.0 GB/s**, so it is not memory; it is the clock, with 6.1 GB of 15.7 free and a browser open,
-> where the 2026-10-04 run was taken deliberately quiet. Sweep-to-sweep spread confirms it: context
-> 1024's step read 144.32 then 90.21 ms, and its attention 21.75 then 9.42 ms, minutes apart.
+> 2026-10-04's -- and the reason is not the one this note gave first.* Per-stage timers at four
+> contexts, two shuffled sweeps, put every weight-streaming stage above the quiet run -- qkv 1.23x,
+> attn_out 1.15x, gate_up 1.11x, ffn_down 1.05x, output 1.12x at context 128 -- while attention, the
+> only stage whose code had changed, was unchanged at 1.43 ms against 1.50. That was read as a browser
+> holding both memory and the clock, 6.1 GB of 15.7 being free. **Retested with the browser closed, it
+> was wrong:** pass(1) at context 128 read 78.10 and 80.29 ms in two shuffled passes against 77.10 ms
+> with the browser open, so closing it moved nothing, and all three sit 20-25% above the 64.10 ms of
+> 2026-10-04.
 >
-> So **absolute figures are only comparable against runs taken under the same conditions**, and a
-> cross-session comparison needs the conditions recorded, not just the number. What survives a machine
-> like this is the in-process alternating A/B of this section, which is how every kernel result here was
-> taken. The one cross-session statement tonight's data does support is directional and large enough to
-> clear the noise: attention at context 2048 best-of reads 16.24 ms against 26.88 ms, so the rewrite of
-> 2026-10-05 is worth at least 1.65x there, and v(k)'s dependence on context is correspondingly flatter.
+> *What settled it was rebuilding the old binary.* The 2026-10-04 bench ran on `e33a0b6`, before any
+> attention change. Compiled from that commit with the same MSVC 19.51 and the same `/O2 /arch:AVX2
+> /fp:precise`, then alternated against HEAD across eight fresh processes with the order flipped every
+> round, it gives **head/base = 0.975 on decode**, stage deltas of at most 1.0 ms and 1.6% on the
+> total. The two builds are indistinguishable, and **the baseline source reproduces tonight's figure
+> rather than its own**, so the engine did not regress.
+>
+> *The real difference is the spread, not the speed.* That same unchanged baseline binary read 13.18,
+> 11.49, 12.39 and 12.36 tok/s across the four rounds -- a **15% range from one binary** -- where
+> 2026-10-04's nine samples at six threads spread **0.8%**. Tonight the instrument cannot resolve
+> anything below roughly 15% at context 128, which is most of the 19% that looked like a regression.
+> Conditions recorded alongside: read bandwidth 37.4 GB/s over four fresh processes (0.6% spread)
+> against 39.77; dispatch overhead 0.876 us against 0.702; performance cores sustaining 2.75-2.92 GHz
+> under all-core decode; memory 2x8 GB DDR4-3200 at 3200, and build flags, both unchanged since
+> 2026-10-03; zero page-ins with 3.8 GB in standby. **The mechanism is not established.** Three
+> guesses at it have been wrong, so it stays open rather than getting a fourth.
+>
+> So **absolute figures are only comparable against runs taken under the same conditions**, and the
+> conditions belong with the number rather than being assumed. What survives a machine like this is
+> the in-process alternating A/B of this section, which is how every kernel result here was taken.
+> And one rule more, which is what this episode actually bought: **to compare against a number from
+> another session, rebuild that commit and measure it alongside.** A stored figure on its own cannot
+> tell a slower machine from a slower engine, and the two were confused here in both directions --
+> first blaming the machine for the code, then blaming the attention rewrite for pushing cost into
+> `qkv` and `attn_out`, an 11.95 against 18.60 ms that was two runs taken minutes apart rather than
+> two binaries. The cross-session claim this note previously made for attention, 16.24 ms against
+> 26.88, is **withdrawn**; the in-process shape comparison of section 10.3 carries it instead, 19.87 ms
+> for the old shape against 9.91 for the shipped one, one process and one binary.
 
 > **Measured, 2026-10-01: this laptop is a noisy instrument, and not for want of a setting.** Repeated samples of
 > the *same build* ranged from 40 to 70 tok/s (a 51% spread), and medians taken minutes apart differed by 75%. The
