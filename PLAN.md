@@ -1689,6 +1689,30 @@ verification and distilled a quantization-matched 0.6B draft, speeding up Qwen3-
 
 - **Before timing:** plug in, fix the Windows power mode (Best performance), close other programs, pause
   OneDrive, Windows Update and search indexing, and warm up.
+- **Do not run the dispatch-overhead probe immediately before a timing run.** It is the fitness check,
+  so the temptation is to run it first and then start measuring; it is also 3064 empty all-core
+  barriers, which is the most power-hungry thing in this engine and does no work. Read it once, in its
+  own process, and let the machine settle before anything whose number matters. See the note below.
+
+> **Measured, 2026-10-24: the fitness probe invalidated the measurement it was supposed to qualify.**
+> Ten calls to `measure_dispatch_overhead` (checking a suspicious reading, which turned out to be the
+> probe heating itself) and then straight into a v(k) sweep, contexts in ascending order. The implied
+> one-token pass came out at 110.88 ms against the 64.10 ms of 2026-10-04, and the error decayed in run
+> order -- 1.73x at context 128, 1.16x at 512, 0.99x at 1024, 1.05x at 2048 -- which is a machine
+> cooling down, not four contexts disagreeing. v(2) read **0.97**, i.e. two tokens verified for less
+> than one, which is impossible and is what gave the run away.
+>
+> `measure_vk.time_passes` already carries the reason in its docstring: throttling cuts the clock, which
+> governs arithmetic, and leaves memory bandwidth alone, so a one-token pass (bandwidth-bound) and a
+> k-token pass (compute-bound) are not affected equally and the ratio moves. Interleaving the k values,
+> which that function does, spreads a drift evenly over them but buys no independence from the
+> machine's state. The instruction in that docstring is three words long: take it cool.
+>
+> Two rules follow. **Read the probe once per fresh process** -- three calls in one process read 2.54,
+> 4.65, 7.36 us, and with a 12-second cooldown between them 0.73, 1.82, 2.37, so later calls in a
+> process are measuring the heat the earlier ones made. And **a sweep over contexts must not be run in
+> a fixed order**, because a monotonic drift then looks exactly like a monotonic dependence on context,
+> which is the very thing being measured.
 
 > **Measured, 2026-10-01: this laptop is a noisy instrument, and not for want of a setting.** Repeated samples of
 > the *same build* ranged from 40 to 70 tok/s (a 51% spread), and medians taken minutes apart differed by 75%. The
