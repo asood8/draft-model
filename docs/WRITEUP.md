@@ -156,11 +156,26 @@ Worth separating, because quoting only the first would be the easy dishonesty he
 | Wall clock | **1.07×** (0.94–1.12× by category) | **0.82×** |
 
 The gap is the prompt pass, which is **15–92% of the wall clock** depending on the category and about
-half of it in aggregate. Speculative decoding does nothing
-for it: the prompt is processed in one batched pass whether or not there is a draft model, so a
-technique that only accelerates decoding is diluted by however much of the clock decoding is. On
-long-prompt categories the engine is slower end to end than not speculating, and the honest headline
-is the pair of numbers, not the better one.
+half of it in aggregate. On long-prompt categories the engine is slower end to end than not
+speculating, and the honest headline is the pair of numbers, not the better one.
+
+The obvious reading is Amdahl's law -- speculative decoding accelerates only decoding, so it is
+diluted by however much of the clock decoding is -- and that reading is wrong, which took measuring
+to find out. The engine prefills the prompt **twice**: once into the target's KV cache and once into
+the draft's. Speculative prefill is 1.23-1.24× the target's alone, close to the 1.186× that c = 0.186
+predicts, and that premium is 6.86 s of a 61.83 s short run and 18.99 s of a 99.06 s long one.
+
+| | wall now | wall if the draft's prefill were free | decode |
+|---|---|---|---|
+| short prompts | 1.072× | **1.205×** | 1.200× |
+| long prompts | 0.818× | **1.012×** | 0.949× |
+
+Remove it and the wall figure lands on the decode figure. The prompt pass itself is not the problem:
+the target's is within 12% of its asymptotic floor, and chunk sizes larger than 16 measure *slower*
+rather than faster. Prefilling it twice is the problem, and the cheapest test is a drafter that does
+no model work at all -- prompt-lookup drafting, already implemented, whose draft prefill is zero and
+which may win outright on the categories where the 0.6B only reaches α = 0.44-0.60. [Not yet
+measured.]
 
 ### What the stages cost, and what moved
 

@@ -1127,6 +1127,41 @@ overall and per category.
 > (summarization), about half in aggregate; 45% was the short-run aggregate and 92% a per-category
 > figure from the long run, two different things in one range.
 
+> **Measured 2026-10-24, from the stored runs: the whole gap between the decode speedup and the wall
+> speedup is the draft's prompt pass.** Item 14 of the overnight list assumed the prompt pass to
+> attack was the target's. It is not.
+>
+> | | target total | speculative total | wall | wall if the draft's prefill were free | decode |
+> |---|---|---|---|---|---|
+> | short prompts | 66.25 s | 61.83 s | 1.072x | **1.205x** | 1.200x |
+> | long prompts | 81.05 s | 99.06 s | 0.818x | **1.012x** | 0.949x |
+>
+> The speculative run's prefill is **1.23-1.24x the target's**, because the prompt has to be read into
+> the draft's KV cache as well -- close to the 1.186x that c = 0.186 predicts. That premium is 6.86 s
+> of a 61.83 s short run and **18.99 s of a 99.06 s long one**. Take it away and the wall figure lands
+> on the decode figure: 1.205x against 1.200x short, and long goes from losing 18% to break-even.
+>
+> So **there is no Amdahl problem to explain away.** The prompt pass itself is not the obstacle -- the
+> target's is within 12% of its asymptotic floor by the fitted `34.5 + 18.7k` (20.86 ms a token at
+> chunk 16 against 18.70 as k grows), and the 2026-10-04 measurement that chunk 128 is *slower* than
+> 16 says even that 12% is not available. The obstacle is that the engine prefills the prompt twice.
+>
+> *Not attempted tonight, because each needs measurement the machine could not give:*
+>
+> 1. **Prompt-lookup drafting on the long categories.** It is already implemented and does no model
+>    work at all, so its draft prefill is zero. On rag and summarization, where responses copy from
+>    the prompt and the 0.6B only reaches alpha 0.44-0.60, it may win outright. **No new code --
+>    measure this first.**
+> 2. **A shorter context window for the draft.** The draft needs plausible next tokens, not the whole
+>    prompt; prefilling only its last few hundred positions cuts its prefill proportionally at some
+>    cost in alpha. A config change, with a measurable trade.
+> 3. Overlapping the two prefills is the obvious third idea and probably not a win -- both are
+>    bandwidth-bound over different weights on six cores, so they would contend rather than overlap.
+>
+> This is the largest wall-clock item left, and it is worth more than anything else outstanding:
+> about +0.13x short and +0.19x long, against the +0.06x that all of distillation is projected to
+> buy.
+
 > **Measured, 2026-10-04: predicted against measured across γ, which is this section's done-when --
 > and the case for the whole project.** Same prompt set, same methods, γ = 1, 2, 3, 4, each run
 > re-measuring its own baseline because absolute speeds drifted 7.7 to 8.0 tok/s across the four.
