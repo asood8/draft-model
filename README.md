@@ -42,12 +42,16 @@ comparisons taken inside one process and so independent of the machine's state, 
 attention and the sampling path. The end-to-end figures -- the step time, the 1.20x and the v(k)
 table -- have not, and are still the 2026-10-04 ones.
 
-- Read bandwidth is 37–39 GB/s against a theoretical 51.2, which sets the ceiling on decoding speed.
+- Read bandwidth on the six performance cores is 39.0–39.8 GB/s against a theoretical 51.2, which
+  sets the ceiling on decoding speed. An early run on a worse machine state read 29.5, which is the
+  spread section 13 is about rather than a second figure.
 - Qwen3-4B decodes at 64.1 ms a token, or 15.6 tokens a second, which is 88.7% of that ceiling. The
   k-token kernel reaches 95–105% of the AVX-VNNI issue peak for k ≥ 4 at six threads.
 - Speculative decoding is 1.20× on decoding, measured on Spec-Bench at γ=1 against the same engine
-  without it, at acceptance α = 0.736 and 1.72 tokens a round. Wall-clock speedup is 1.07–1.11× on
-  short prompts and 0.82× on long ones, since the prompt pass is 45–92% of the clock.
+  without it, at acceptance α = 0.736 and 1.72 tokens a round. Wall-clock speedup is 1.07× on short
+  prompts and 0.82× on long ones, since the prompt pass is 15–92% of the clock depending on the
+  category and about half of it in aggregate. By category the short-prompt wall figure runs 0.94×
+  (multi-turn) to 1.12× (math), so two of the four are at or below parity even there.
 - The γ sweep gives 1.20×, 1.01×, 0.95× and 0.88× for γ = 1 to 4, so one guess a round is the best
   choice available. Assuming v(k) = 1 instead predicts 1.69× at γ=3, where the engine measures
   0.95×, which is slower than not speculating at all.

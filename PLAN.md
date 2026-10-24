@@ -1114,9 +1114,18 @@ overall and per category.
 > 64 generated tokens on a 1450-token prompt, prefill *is* the experience, and no decoding speedup
 > rescues it.
 >
-> The honest reading of the wall column: speculative decoding is worth 1.07-1.11x on this machine for
-> short prompts and loses on long ones, while *decoding* is 1.20x faster. Which number belongs in the
-> write-up depends on the claim being made, so §12 should quote both.
+> The honest reading of the wall column: speculative decoding is worth 1.07x in aggregate on this
+> machine for short prompts and loses on long ones, while *decoding* is 1.20x faster. Which number
+> belongs in the write-up depends on the claim being made, so §12 should quote both.
+>
+> **Audited 2026-10-24 against `results/`, and the aggregate was hiding something.** This paragraph
+> said 1.07-1.11x, which took the aggregate for the bottom of the range and math, the best category,
+> for the top. By category the short-prompt wall figures are math **1.119**, qa **1.012**,
+> translation **0.998**, multi-turn **0.941**, against 1.072 for all of them together -- so **two of
+> the four are at or below parity on the wall clock** even on short prompts, which a range written
+> that way conceals. The prefill share was quoted as 45-92% and is 15.2% (qa) to 91.6%
+> (summarization), about half in aggregate; 45% was the short-run aggregate and 92% a per-category
+> figure from the long run, two different things in one range.
 
 > **Measured, 2026-10-04: predicted against measured across γ, which is this section's done-when --
 > and the case for the whole project.** Same prompt set, same methods, γ = 1, 2, 3, 4, each run

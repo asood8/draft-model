@@ -153,9 +153,10 @@ Worth separating, because quoting only the first would be the easy dishonesty he
 | | short prompts | long prompts |
 |---|---|---|
 | Decoding | **1.20×** (math 1.29×, τ = 1.72, α = 0.736) | **0.95×** (α falls to 0.44–0.60) |
-| Wall clock | 1.07–1.11× | **0.82×** |
+| Wall clock | **1.07×** (0.94–1.12× by category) | **0.82×** |
 
-The gap is the prompt pass, which is **45–92% of the wall clock**. Speculative decoding does nothing
+The gap is the prompt pass, which is **15–92% of the wall clock** depending on the category and about
+half of it in aggregate. Speculative decoding does nothing
 for it: the prompt is processed in one batched pass whether or not there is a draft model, so a
 technique that only accelerates decoding is diluted by however much of the clock decoding is. On
 long-prompt categories the engine is slower end to end than not speculating, and the honest headline
@@ -279,7 +280,7 @@ invalid numbers, which is why results are now named by the conditions they were 
 A from-scratch C++ CPU inference engine for Qwen3 reaching 88.7% of its machine's memory-bandwidth
 ceiling and 95–105% of the AVX-VNNI issue-rate peak, used to measure the term the standard
 speculative-decoding speedup formula assumes away. Measured, that term picks one draft token a round
-and delivers **1.20× on decoding, 1.07–1.11× on the wall clock, at context 512**. Assumed away, it
+and delivers **1.20× on decoding, 1.07× on the wall clock, at context 512**. Assumed away, it
 picks three and promises 1.69×, where the engine measures 0.95× — slower than not speculating. The
 cost model predicts the engine to within 2–7% once v(k) and c are measured at the context being used,
 which is the practical form of the result: **on a CPU, the configuration is chosen by the cost of
