@@ -1713,6 +1713,12 @@ engine runs on a stratified subset.
 
 *Estimated time: about a week.*
 
+> **Drafted 2026-10-24: [docs/WRITEUP.md](docs/WRITEUP.md).** It quotes decode and wall-clock speedup
+> as a pair rather than the better of the two, labels every v(k) with the context and the machine
+> conditions it came from, and carries "What I got wrong" as a section of its own rather than a line.
+> Three things in it still need numbers: the trained draft, the llama.cpp baseline, and a v(k) table
+> retaken after the attention and softmax work. Those are marked in brackets in the draft.
+
 - **Headline numbers:** open the README with tokens per second, percentage of the bandwidth ceiling, and speedup.
 - **Plots and tables**
   - the v(k) curve, at several context lengths;
