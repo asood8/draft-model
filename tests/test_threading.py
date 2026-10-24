@@ -192,3 +192,79 @@ def test_byte_counts_match_the_file(weights_file):
         config["num_hidden_layers"] * config["num_key_value_heads"] * config["head_dim"] * 2 * 2
     )
     assert model.kv_bytes_per_token == expected_kv
+
+
+# ------------------------------------------------------- more of the chunk boundary
+
+# Attention cuts positions every 256, and the boundary cases are where the invariant would break:
+# a batch that ends exactly on a boundary, one that starts on it, one that spans two of them, and
+# the transition from the single-region path (one chunk, one barrier) to the four-region one. The
+# last of those is already covered above at 252+18; these are the rest.
+BOUNDARY_SPLITS = [
+    pytest.param(250, 6, id="wholly-inside-one-chunk"),
+    pytest.param(250, 262, id="spans-two-boundaries"),
+    pytest.param(256, 12, id="starts-exactly-on-a-boundary"),
+    pytest.param(500, 12, id="ends-exactly-on-a-boundary"),
+    pytest.param(255, 2, id="straddles-by-one-position"),
+    pytest.param(511, 2, id="straddles-the-second-boundary-by-one"),
+]
+
+
+@pytest.mark.parametrize("prefix_len, tail_len", BOUNDARY_SPLITS)
+def test_batches_at_every_chunk_boundary_match_single_steps(weights_file, prefix_len, tail_len):
+    ids = tokens(prefix_len + tail_len, seed=11)
+    positions = prefix_len + tail_len + 8
+    prefix, tail = ids[:prefix_len], ids[prefix_len:]
+
+    together = cpp.Model(weights_file, max_positions=positions)
+    together.forward(prefix)
+    batched = together.forward(tail, all_logits=True)
+
+    stepwise = cpp.Model(weights_file, max_positions=positions)
+    stepwise.forward(prefix)
+    rows = [stepwise.forward(tail[i : i + 1], all_logits=True)[0] for i in range(len(tail))]
+    assert np.array_equal(batched, np.stack(rows))
+
+
+# ------------------------------------------------------- the group size the 4B runs
+
+# TINY_CONFIG has 4 query heads over 2 key/value heads, so every test above exercises a group of 2.
+# The 4B runs a group of 4, which is a different template instantiation of the grouped kernels and
+# a different accumulator count, and `check_group_kernels` covers it only at the kernel level. This
+# is the same invariant end to end at the size that actually ships.
+@pytest.fixture(scope="module")
+def group_of_four_weights(tmp_path_factory):
+    config = type(TINY_CONFIG)(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=16,
+        rms_norm_eps=1e-6,
+        rope_theta=1_000_000.0,
+        tie_word_embeddings=True,
+    )
+    model = random_reference(config, seed=3)
+    path = tmp_path_factory.mktemp("group4") / "tiny-group4-q4.sdm"
+    write_model(path, model.state_dict(), model.config, weight_format="q4")
+    return str(path)
+
+
+def test_group_of_four_is_bit_exact_across_a_chunk_boundary(group_of_four_weights):
+    model = cpp.Model(group_of_four_weights, max_positions=8)
+    assert model.config["num_attention_heads"] // model.config["num_key_value_heads"] == 4
+
+    ids = tokens(270, seed=12)
+    positions = 288
+    prefix, tail = ids[:252], ids[252:]
+
+    together = cpp.Model(group_of_four_weights, max_positions=positions)
+    together.forward(prefix)
+    batched = together.forward(tail, all_logits=True)
+
+    stepwise = cpp.Model(group_of_four_weights, max_positions=positions)
+    stepwise.forward(prefix)
+    rows = [stepwise.forward(tail[i : i + 1], all_logits=True)[0] for i in range(len(tail))]
+    assert np.array_equal(batched, np.stack(rows))

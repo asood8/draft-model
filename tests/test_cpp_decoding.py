@@ -599,3 +599,43 @@ def test_a_drafter_that_runs_no_model_reports_no_forward_time(paths):
     assert stats["draft_forward_seconds"] == 0.0
     assert stats["draft_sampling_seconds"] == stats["propose_seconds"]
     assert stats["verify_seconds"] > 0.0
+
+
+# ----------------------------------------------------------------- the two softmaxes
+
+# `softmax_scalar` is kept only as a baseline for `bench_softmax`, the way `argmax_scalar` is kept
+# for `bench_argmax`. Nothing in the engine calls it, so what is worth asserting is the claim the
+# plan makes about the pair: both normalize, and the vectorized one that accumulates its total in
+# double is the more accurate over a row the size of the vocabulary.
+@pytest.mark.parametrize("n", [1, 7, 8, 9, 129, 2049, 151936])
+@pytest.mark.parametrize("variant", ["vector", "scalar"])
+def test_both_softmaxes_normalize(n, variant):
+    point = cpp.bench_softmax(n=n, iters=2, variant=variant)
+    assert point["sum"] == pytest.approx(1.0, abs=2e-4)
+    assert point["net_seconds"] >= 0.0
+
+
+def test_double_accumulation_beats_float_over_the_vocabulary():
+    """The reason the shared softmax accumulates in double rather than in float lanes.
+
+    Over 151,936 entries the error is dominated by the summation, not by the exponentials, and the
+    scalar version summed every one of them into a single float. Measured 2026-10-24: 1.00010138
+    against 0.99999996, which is four orders of magnitude. A smaller row should show far less,
+    because there is less to accumulate -- asserted too, so that this test says something about the
+    mechanism rather than only about one length.
+    """
+    vocab = 151936
+    vector = abs(cpp.bench_softmax(n=vocab, iters=2, variant="vector")["sum"] - 1.0)
+    scalar = abs(cpp.bench_softmax(n=vocab, iters=2, variant="scalar")["sum"] - 1.0)
+    assert scalar > 1e-5
+    assert vector < scalar / 100
+
+    short_scalar = abs(cpp.bench_softmax(n=129, iters=2, variant="scalar")["sum"] - 1.0)
+    assert short_scalar < scalar
+
+
+def test_bench_softmax_rejects_an_unknown_variant():
+    with pytest.raises(ValueError):
+        cpp.bench_softmax(n=8, iters=1, variant="neither")
+    with pytest.raises(ValueError):
+        cpp.bench_softmax(n=0, iters=1)
