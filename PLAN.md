@@ -1694,25 +1694,45 @@ verification and distilled a quantization-matched 0.6B draft, speeding up Qwen3-
   barriers, which is the most power-hungry thing in this engine and does no work. Read it once, in its
   own process, and let the machine settle before anything whose number matters. See the note below.
 
-> **Measured, 2026-10-24: the fitness probe invalidated the measurement it was supposed to qualify.**
-> Ten calls to `measure_dispatch_overhead` (checking a suspicious reading, which turned out to be the
-> probe heating itself) and then straight into a v(k) sweep, contexts in ascending order. The implied
-> one-token pass came out at 110.88 ms against the 64.10 ms of 2026-10-04, and the error decayed in run
-> order -- 1.73x at context 128, 1.16x at 512, 0.99x at 1024, 1.05x at 2048 -- which is a machine
-> cooling down, not four contexts disagreeing. v(2) read **0.97**, i.e. two tokens verified for less
-> than one, which is impossible and is what gave the run away.
+> **Measured, 2026-10-24: a sweep in a fixed order reported a v(2) of 0.97, and the machine was not
+> comparable to 2026-10-04 in the first place.** Two rules and one limit, in the order they were
+> established.
 >
-> `measure_vk.time_passes` already carries the reason in its docstring: throttling cuts the clock, which
-> governs arithmetic, and leaves memory bandwidth alone, so a one-token pass (bandwidth-bound) and a
-> k-token pass (compute-bound) are not affected equally and the ratio moves. Interleaving the k values,
-> which that function does, spreads a drift evenly over them but buys no independence from the
-> machine's state. The instruction in that docstring is three words long: take it cool.
+> *The probe is only honest on the first call in a process.* `measure_dispatch_overhead` read 2.54,
+> 4.65 then 7.36 us on three back-to-back calls in one process, and 0.73, 1.82, 2.37 with a 12-second
+> gap between them; one call per fresh process reads 1.01-1.53 us, which is the healthy figure. The
+> mechanism is **not established**: the first guess was heat, but ten calls amount to under 100 ms of
+> spinning, which cannot move a 45 W package, so the better candidate is that the pool's destructor
+> returns before its six spinning workers have exited and the next call's six contend with them -- the
+> oversubscription collapse of section 10.2, at small scale. Not chased, because the rule is the same
+> either way: **read it once, in its own process.**
 >
-> Two rules follow. **Read the probe once per fresh process** -- three calls in one process read 2.54,
-> 4.65, 7.36 us, and with a 12-second cooldown between them 0.73, 1.82, 2.37, so later calls in a
-> process are measuring the heat the earlier ones made. And **a sweep over contexts must not be run in
-> a fixed order**, because a monotonic drift then looks exactly like a monotonic dependence on context,
-> which is the very thing being measured.
+> *A sweep over contexts must not run in a fixed order.* Ascending, the implied one-token pass read
+> 110.88 ms at context 128 against 64.10 ms on 2026-10-04, with the error decaying in run order (1.73x,
+> 1.16x, 0.99x, 1.05x) and **v(2) = 0.97**, two tokens verified for less than one, which is impossible
+> and is what gave it away. Cool and descending, the same sweep gave monotonic values at every context.
+> A monotonic drift is indistinguishable from the monotonic dependence on context that is being
+> measured, so the order has to be shuffled and each context visited twice. `time_passes` explains why
+> the ratio is not self-normalising -- throttling cuts the clock, which governs arithmetic, and leaves
+> memory bandwidth alone, so a one-token pass (bandwidth-bound) and a k-token pass (compute-bound) do
+> not move together -- and ends with the instruction: take it cool.
+>
+> *And the limit, which matters more than either rule: tonight's machine cannot be compared with
+> 2026-10-04's.* Per-stage timers at four contexts, two shuffled sweeps, say every weight-streaming
+> stage is uniformly above the quiet run -- qkv 1.23x, attn_out 1.15x, gate_up 1.11x, ffn_down 1.05x,
+> output 1.12x at context 128 -- while **attention, the only stage whose code changed, is unchanged at
+> 1.43 ms against 1.50**. A uniform penalty on the stages that stream weights, and none on the stage
+> that was rewritten, is a machine running slower, not a regression. Read bandwidth still measures
+> **39.0 GB/s**, so it is not memory; it is the clock, with 6.1 GB of 15.7 free and a browser open,
+> where the 2026-10-04 run was taken deliberately quiet. Sweep-to-sweep spread confirms it: context
+> 1024's step read 144.32 then 90.21 ms, and its attention 21.75 then 9.42 ms, minutes apart.
+>
+> So **absolute figures are only comparable against runs taken under the same conditions**, and a
+> cross-session comparison needs the conditions recorded, not just the number. What survives a machine
+> like this is the in-process alternating A/B of this section, which is how every kernel result here was
+> taken. The one cross-session statement tonight's data does support is directional and large enough to
+> clear the noise: attention at context 2048 best-of reads 16.24 ms against 26.88 ms, so the rewrite of
+> 2026-10-05 is worth at least 1.65x there, and v(k)'s dependence on context is correspondingly flatter.
 
 > **Measured, 2026-10-01: this laptop is a noisy instrument, and not for want of a setting.** Repeated samples of
 > the *same build* ranged from 40 to 70 tok/s (a 51% spread), and medians taken minutes apart differed by 75%. The
