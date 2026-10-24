@@ -12,6 +12,7 @@ their own. Section 17 tracks decisions and open questions.
 
 | Date | Where things stand |
 |---|---|
+| 2026-10-24 | **The sampling path is worth 4.9-6.0x and attention is 12% off its floor, but the machine was too busy to re-measure v(k) -- and finding that out cost most of the night.** The vectorized softmax had been asserted, never measured; against a `softmax_scalar` baseline kept the way `argmax_scalar` is, alternating in one process, it is **4.86x at a 129-element row, 5.70x at 2049, 6.00x over the 151,936 vocabulary**. Per decode step: **0.549 ms a token at context 128, 8.894 ms at 2048** over 1152 attention rows, plus 0.587 ms a sampling warp. It is more accurate as well -- the scalar row sums to 1.00010138 against 0.99999996 -- so the usual trade did not apply. argmax reconfirmed at 9.16x. `bench_attention` at context 2048 puts the shipped shape at **9.91 ms against an 8.88 ms scan floor, 12% off**, so the remaining attention headroom is ~1% of a step and **not worth the risk to the chunk-order invariant**; the same table reproduces the 1.35x from chunking a second way, since `scan` gets *worse* when split (34.0 to 19.5 GB/s) while `grouped` goes 18.1 to 30.5. **What failed:** a v(k) sweep run straight after ten calls of the fitness probe, contexts ascending, reported **v(2) = 0.97** -- two tokens verified for less than one -- with the error decaying in run order (1.73x, 1.16x, 0.99x, 1.05x). Cool and descending it was monotonic, but per-stage timers then showed every weight-streaming stage 1.05-1.25x above 2026-10-05 while **attention, the only stage whose code changed, was unchanged at 1.43 ms against 1.50**: a slower clock, not a regression, with bandwidth still 39.0 GB/s and 5.6 GB of 15.7 free with a browser open. Since v(k) is a ratio, an inflated pass(1) flattens the curve for free, so "v(k) no longer depends on context" is **not** established. Three wrong calls of my own, all caught by measurement: heat blamed for the probe's drift (ten calls are under 100 ms of spinning), the shared softmax blamed for the 13 ms (it saves 8.9), and a pass(5) cliff read as a kernel tiling boundary (it was thermal and vanished). The invalid run also **overwrote three 2026-10-05 result files**, recovered from git; results are now named by the conditions they were taken under, with `results/README.md` saying which are comparable. Items left for a quiet machine: the v(k) table, the γ sweep that depends on it, and the suite, which the harness reaped mid-run for memory. |
 | 2026-10-04 | **v(k) decides γ, measured: the original formula would have picked γ=3 and lost 21%.** A γ sweep on Spec-Bench, each run re-measuring its own baseline: γ=1 gives **1.20x on decoding**, then 1.01x, 0.95x, 0.88x. Assuming v = 1 predicts 1.69x at γ=3, where this engine measures 0.95x -- slower than not speculating. Best γ is 1, which is where v(k) says it is, so the term this project adds is not a correction but the thing that chooses the configuration. The cost model predicts the engine **to within 2-7%** once v(k) and c are measured at the context being run at: v(2) goes 1.12 to 1.46 and c goes 0.186 to 0.268 between context 128 and 2048, which is a rule worth more than the numbers -- **v(k) is a function of context**. By 2k context speculation stops paying at all (1.01x predicted), which is the quantitative form of the 0.95x measured on rag and summarization. The cause is attention: flat matmuls but attention going 1.50 to 26.88 ms a token between context 128 and 2048, **27% of the step**, reading the KV cache at 11.3 GB/s where the machine streams 39.8. That is the next thing to fix, after a micro-benchmark says why -- two guesses today were wrong when measured. Also found by accident: asking for more threads than the selection has cores collapses decoding 5.6x, since spinning workers fight over a core rather than share it; the pool now clamps. 841 tests pass. |
 | 2026-10-04 | **The kernel is done, and speculation pays: 1.20x on decoding, measured end to end.** A quiet-machine sweep says the 4B runs at **64.10 ms a step (15.6 tok/s), 88.7% of the measured bandwidth ceiling**, and the k-token kernel reaches **95-105% of the AVX-VNNI issue peak** for k >= 4 at six threads -- 0.030 issue slots per multiply-accumulate where a pure dpbusd stream is 0.031. The fitted pass is now **34.5 + 18.7k ms** against 32 + 34k on 2026-10-01: the per-token slope fell 1.82x while the intercept stayed put, which is the shape a kernel change should have, and it agrees with the 1.65-1.77x the kernel sweep measures independently. v(2) = 1.12 against the 1.13 that §10.1 projected for the bandwidth floor, so there is no second factor of two left in this kernel. c = 0.186, o = 0.007. Predicted speedup at the measured α = 0.711 went **0.98x to 1.31x**, and Spec-Bench measures **1.20x on decoding** (math 1.29x, τ = 1.72, α = 0.736) -- 92% of prediction, with the gap explained by c rising with context. On long prompts it is 0.95x, where α falls to 0.44-0.60. Wall-clock is 1.07-1.11x short and 0.82x long, because the prompt pass is 45-92% of the clock. Also: the argmax was 9x slower than it needed to be and was the whole of o (8.71 ms a round to 0.57); two reporting bugs in my own benchmark produced 0.82x and 9.91x before the baseline was measured like everything else; and the prefill chunk size wants to be 16, not gamma+1 and not 128. 838 tests pass. Next: distillation, which is now worth 1.42-1.5x. |
 | 2026-10-02 | **Three kernel changes, and the kernel's own v(2) falls from 2.02 to 1.12.** The scales now apply eight blocks at a time instead of one; the sign trick is gone, replaced by sum((q-z)x) = sum(qx) - z sum(x) with one precomputed integer a block subtracted after the reduction; and one 32-byte load covers two blocks, whose nibbles are already adjacent, landing them in separate halves of a single accumulator so that eight blocks need four accumulators and the reduction is three hadds and a vpermd. 43 instructions per eight blocks per row against 64, and the share doing multiply-accumulates goes 9.9% to 23.6%. Measured in one process with the variants alternating -- the only comparison this machine supports -- pair-packing alone is 1.09x at k=1 rising to 1.28x at k=8. Activation quantization, the last serial piece of a forward pass at 5.1 ms a token, now spreads over the workers. Also retired change 3: register blocking over output rows needs 16 accumulators at G=8 and costs more than it saves at G=4, which is what counting instructions is for. The projection in §10.1 says the remaining distance is the bandwidth floor: past it v(2) reaches 1.13 and, with distillation, 1.33-1.41x. 814 tests pass. |
@@ -1242,6 +1243,20 @@ overall and per category.
 > made attention slow, and the ten-physical-core test that looked like it refuted imbalance was measuring
 > E-cores, not balance.
 >
+> > **Re-measured 2026-10-24, at context 2048 instead of 1024, and attention is now 12% off its floor.**
+> > `scan` 8.88 ms at 34.0 GB/s against the shipped `grouped` at 9.91 ms and 30.5 GB/s, in one process,
+> > best of three, so the machine's state does not enter it. The old shape is 19.87 ms on the same run.
+> >
+> > The table also says the split's value a second way, by accident. `scan` gets **worse** when it is
+> > cut finer -- 34.0 GB/s at one job a head, 19.5 at three -- because pure streaming has nothing to
+> > balance and pays the barriers anyway, while `grouped` goes 18.1 to 30.5 GB/s over the same change,
+> > because 8 jobs over 6 workers cannot balance and splitting is the only fix. One mechanism, two
+> > signs, which is the kind of agreement worth more than either number.
+> >
+> > **So attention is finished.** 1 ms a token of headroom is about 1% of a decode step, and collecting
+> > it means touching the code that carries the fixed chunk-order invariant greedy speculative decoding
+> > rests on. Wrong trade; not attempted.
+>
 > **Landed: the grouped math, 1.25x on attention, bit-exact, 845 tests pass.**
 >
 > **Then the position split, 2026-10-05.** Attention is now four parallel regions a layer -- scores,
@@ -1366,6 +1381,33 @@ overall and per category.
 > `gamma*c + v(gamma+1)` is the denominator that matters, and what is left to win is the kernel and the
 > acceptance rate. (That run also reported 200.6 ms per verification pass against the ~130 ms this pair
 > should take, so its absolute speeds are drift, not data -- the shares are what it was for. Section 13.)
+
+> **Measured, 2026-10-24: the softmax is 4.9-6.0x, and it is the attention rows that make that matter,
+> not the vocabulary.** The vectorized softmax of 2026-10-05 had been asserted and never measured, so
+> there was nothing to measure it against -- the scalar one had been deleted when attention and the
+> sampling warps were given a single shared implementation. `softmax_scalar` is now kept as a named
+> baseline the way `argmax_scalar` is, and `bench_softmax` alternates the two in one process, timing
+> and subtracting the cost of restoring the row because softmax works in place.
+>
+> | row | vector | scalar | | the scalar row's probabilities sum to |
+> |---|---|---|---|---|
+> | 129 (attention, context 128) | 0.123 us | 0.600 us | 4.86x | 0.99999951 |
+> | 2049 (attention, context 2048) | 1.644 us | 9.365 us | 5.70x | 1.00000002 |
+> | 151,936 (one sampling warp) | 117.5 us | 704.8 us | **6.00x** | **1.00010138** |
+>
+> There are **1152 attention rows in a token** -- 32 heads over 36 layers -- against one vocabulary row
+> per sampled token, so the saving is **0.549 ms a token at context 128 and 8.894 ms at 2048**, where
+> the warp saves 0.587 ms a round. The change was made for the vocabulary, where the accuracy argument
+> is, and most of its value turned out to be in attention, where there is no accuracy argument at all.
+> It is also part of why attention fell from 26.88 ms to about 16 at context 2048.
+>
+> **No trade, which is the unusual part.** The double accumulation was adopted to stop 151,936 float32
+> exponentials summing to 1.00003, and the same measurement shows the scalar version it replaced -- all
+> of them into a single float -- reaching 1.00010138 where this one reaches 0.99999996. Six times faster
+> and four orders of magnitude closer to 1.
+>
+> argmax, re-measured the same way for the first time since the section above: **9.16x**, 0.058 ms
+> against 0.534 ms over the vocabulary. The 9x this section claimed on 2026-10-03 holds.
 
 ### 10.5 Stretch goals
 
