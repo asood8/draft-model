@@ -76,7 +76,7 @@ and which is not yet explained.
   parity on wall clock as soon as γ=2 (0.99×), where stopping early holds 1.05× at γ=2 and 1.01× at
   γ=3, and posts the best decoding figure of the sweep at γ=1 (1.20×). The best single wall-clock
   number is still plain speculation at γ=1.
-- v(k) and c are functions of context. Between context 128 and 2048, v(2) rises from 1.13 to 1.25
+- v(k) and c are functions of context. Between context 128 and 2048, v(2) rises from 1.125 to 1.245
   and c from 0.182 to 0.245. Measured at the context actually being used, the cost model predicts
   the order-cancelled γ sweep to 5.0% mean error at context 512 and 5.6% at 2048. The direction is
   solid — c is monotonic in every pass ever taken — but the magnitude of v(2)'s context dependence
