@@ -54,28 +54,83 @@ def finish(figure, axes, out: Path, name: str, title: str) -> None:
     print(f"  wrote {path}")
 
 
-# The one session whose conditions were measured at both ends and held: read bandwidth drifted 0.12%
-# across every run in it. Figures are drawn from this session alone, because mixing it with earlier
-# ones is the stitching error plan section 13 exists to prevent.
-SESSION = "2026-10-25_quiet"
-
-# results/specbench_gamma{1..4}.json ran strictly ascending and back to back on 2026-10-05, so every
-# larger gamma inherited the heat of the runs before it. Three of its four entries are 11-19% low.
-# See results/README.md.
-CONFOUNDED = ("specbench_gamma1.json", "specbench_gamma2.json",
-              "specbench_gamma3.json", "specbench_gamma4.json")
+PASS_SWEEP = "specbench_*_pass*_gamma*.json"
+FIXED_SWEEP = "specbench_gamma*.json"
 
 
-def usable(path: Path) -> bool:
-    """False for a stored run that results/README.md says must not be quoted.
+def _gamma_of(path: Path) -> int | None:
+    name = path.stem
+    marker = name.rfind("gamma")
+    if marker < 0:
+        return None
+    digits = "".join(c for c in name[marker + 5:] if c.isdigit())
+    return int(digits) if digits else None
 
-    Two groups. The 2026-10-05 sweep is confounded by its ascending visit order. The 2026-10-24
-    Spec-Bench files are an order-aware attempt that was reaped three runs into eight, so they are a
-    single pass with no reverse order to cancel against -- which is the one thing they were for.
+
+def quotable_sweep(results: Path) -> set[Path]:
+    """The gamma-sweep files in `results` that may be drawn, by two methodological rules.
+
+    A sweep that visits gamma in one fixed order cannot separate drift from the effect it is
+    measuring: results/specbench_gamma{1..4}.json ran ascending and back to back, and three of its
+    four entries read 11-19% low against the same sweep re-measured with the order cancelled. So a
+    fixed-order sweep is superseded -- **but only once an order-cancelled one exists beside it**,
+    because in a directory nobody has re-measured it is still the best data there is.
+
+    An order-cancelled sweep in turn needs *both* passes at a gamma, since cancelling the order is
+    the whole point of running two. A gamma with a single pass is dropped, which is what happened to
+    the 2026-10-24 attempt: it was reaped three runs into eight.
+
+    Both rules read the directory rather than a date, so a results tree that has never been
+    re-measured and one that was re-measured last night each get the right answer.
     """
-    if path.name in CONFOUNDED:
-        return False
-    return "2026-10-24" not in path.name
+    # Group by (session, gamma). Grouping by gamma alone would let a single-pass session ride along
+    # on another session's second pass, and averaging across sessions is the stitching error in the
+    # first place.
+    by_key: dict[tuple[str, int], list[Path]] = {}
+    for path in sorted(results.glob(PASS_SWEEP)):
+        gamma = _gamma_of(path)
+        if gamma is None:
+            continue
+        marker = path.stem.find("_pass")
+        session = path.stem[:marker] if marker > 0 else path.stem
+        by_key.setdefault((session, gamma), []).append(path)
+
+    covered: dict[str, set[int]] = {}
+    for (session, gamma), paths in by_key.items():
+        if len(paths) >= 2:
+            covered.setdefault(session, set()).add(gamma)
+    if covered:
+        # One session only, and the one that covers the most gammas; ties go to the later name,
+        # which for a dated session is the newer measurement.
+        best = max(sorted(covered), key=lambda s: len(covered[s]))
+        return {p for (session, gamma), paths in by_key.items() if session == best
+                and gamma in covered[best] for p in paths}
+    return set(results.glob(FIXED_SWEEP))
+
+
+def mean_blob(blobs: list[dict]) -> dict:
+    """Average the shuffled passes of one measurement into the figure that should be drawn.
+
+    A single pass is not the number: every context and every gamma is run twice in different orders
+    precisely so that drift cannot masquerade as the effect, and the average over the passes is what
+    PLAN.md quotes.
+    """
+    out = dict(blobs[0])
+    n = len(blobs)
+    for key in ("c", "target_step_seconds", "draft_step_seconds"):
+        vals = [b[key] for b in blobs if isinstance(b.get(key), (int, float))]
+        if vals:
+            out[key] = sum(vals) / len(vals)
+    if all("v" in b for b in blobs):
+        keys = set(blobs[0]["v"])
+        out["v"] = {k: sum(float(b["v"][k]) for b in blobs) / n
+                    for k in keys if all(k in b["v"] for b in blobs)}
+    overheads = [b.get("overhead", {}).get("o_per_round") for b in blobs]
+    if all(isinstance(o, (int, float)) for o in overheads):
+        out["overhead"] = dict(blobs[0].get("overhead", {}))
+        out["overhead"]["o_per_round"] = sum(overheads) / n
+    out["passes_averaged"] = n
+    return out
 
 
 def mean_blob(blobs: list[dict]) -> dict:
@@ -102,8 +157,7 @@ def mean_blob(blobs: list[dict]) -> dict:
     out["passes_averaged"] = n
     return out
 
-def measured_runs(results: Path,
-                  pattern: str = f"specbench_{SESSION}_pass*_gamma*.json") -> list[dict]:
+def measured_runs(results: Path, pattern: str | None = None) -> list[dict]:
     """Spec-Bench runs that form a gamma sweep, newest-sorted, with the numbers to compare.
 
     Only the sweep files by default: they are one prompt set measured at several gamma, which is what
@@ -114,8 +168,9 @@ def measured_runs(results: Path,
     with a prediction: gamma*c + v(gamma+1) + o says nothing about a prompt pass, which is 45-92% of
     the wall clock here, and which speculative decoding pays for twice.
     """
+    paths = sorted(results.glob(pattern)) if pattern else sorted(quotable_sweep(results))
     runs = []
-    for path in sorted(results.glob(pattern)):
+    for path in paths:
         blob = load(path)
         if blob is None or blob.get("gamma") is None:
             continue
@@ -194,8 +249,8 @@ def plot_vk_by_context(results: Path, out: Path) -> None:
     context and applying it to long prompts over-predicts the speedup, which is exactly the mistake
     section 10.4 records.
     """
-    paths = sorted(results.glob(f"vk_{SESSION}_pass*/vk_*.json"))
-    if not paths:  # before the canonical session existed
+    paths = sorted(results.glob("vk_*_pass*/vk_*.json"))
+    if not paths:  # a results tree with no order-cancelled v(k) sweep in it
         paths = sorted(list(results.glob("vk_*.json"))
                        + list(results.glob("vk_context*/vk_*.json")))
 
@@ -230,7 +285,7 @@ def plot_vk_by_context(results: Path, out: Path) -> None:
 
 
 def plot_speedup_vs_gamma(results: Path, out: Path) -> None:
-    for path in sorted(list(results.glob(f"vk_{SESSION}_pass*/vk_*.json"))
+    for path in sorted(list(results.glob("vk_*_pass*/vk_*.json"))
                        or list(results.glob("vk_*.json"))):
         blob = load(path)
         if blob is None or not blob.get("predictions"):
@@ -344,9 +399,10 @@ def plot_specbench(results: Path, out: Path) -> None:
     figure carries both rather than picking one. Decoding is what the cost model predicts; the whole
     call is what a user waits for, and on a 1450-token prompt most of that is the prompt pass.
     """
+    quotable = quotable_sweep(results)
     for path in sorted(results.glob("specbench*.json")):
-        if not usable(path):
-            continue
+        if _gamma_of(path) is not None and path not in quotable:
+            continue  # a superseded sweep; see quotable_sweep
         blob = load(path)
         if blob is None or "speedups" not in blob:
             continue
@@ -385,8 +441,9 @@ def plot_predicted_vs_measured(results: Path, out: Path) -> None:
     describes rounds, and a prompt pass is neither a round nor affected by any of this.
     """
     offline = [load(path) for path in sorted(results.glob("offline_*.json"))]
+    quotable = quotable_sweep(results)
     bench = [load(path) for path in sorted(results.glob("specbench*.json"))
-             if usable(path)]
+             if _gamma_of(path) is None or path in quotable]
     pairs = []
     for measured in bench:
         if measured is None or "speedups" not in measured:

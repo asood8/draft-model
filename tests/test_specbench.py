@@ -351,3 +351,109 @@ def test_the_prediction_uses_v_at_gamma_plus_one():
     assert plots.predict(blob, 1, 1.72) == pytest.approx(1.72 / (0.186 + 1.12 + 0.007))
     assert plots.predict(blob, 2, 2.28) == pytest.approx(2.28 / (2 * 0.186 + 1.34 + 0.007))
     assert plots.predict({"c": 0.2}, 1, 1.7) is None  # no v(k) measured, no prediction
+
+
+def test_a_fixed_order_sweep_is_used_until_an_order_cancelled_one_exists(tmp_path):
+    """The fixed-order sweep is superseded, but only once there is something to supersede it.
+
+    Visiting gamma in one order makes drift indistinguishable from the effect: the sweep stored on
+    2026-10-05 ran ascending and back to back and read 11-19% low in three of its four entries. That
+    is a reason to prefer an order-cancelled sweep, not a reason to draw nothing -- a results tree
+    nobody has re-measured still has the fixed-order files as its best available data.
+    """
+    plots = load_make_plots()
+    write_run(tmp_path / "specbench_gamma1.json", 1, 1.20, 1.72, decode=True)
+    write_run(tmp_path / "specbench_gamma2.json", 2, 1.01, 2.28, decode=True)
+
+    assert {p.name for p in plots.quotable_sweep(tmp_path)} == {
+        "specbench_gamma1.json", "specbench_gamma2.json"}
+
+    # Now add an order-cancelled sweep beside it: two passes at each gamma.
+    for label in ("A", "B"):
+        write_run(tmp_path / f"specbench_2026-10-25_quiet_pass{label}_gamma1.json",
+                  1, 1.19, 1.76, decode=True)
+    assert {p.name for p in plots.quotable_sweep(tmp_path)} == {
+        "specbench_2026-10-25_quiet_passA_gamma1.json",
+        "specbench_2026-10-25_quiet_passB_gamma1.json"}
+
+
+def test_a_single_pass_sweep_does_not_count_as_order_cancelled(tmp_path):
+    """One pass is not a cancelled order, which is the only thing running two passes buys.
+
+    The 2026-10-24 attempt was reaped three runs into eight, leaving pass A alone. Carrying a pass
+    marker in the filename is not the same as having a reverse order to cancel against.
+    """
+    plots = load_make_plots()
+    write_run(tmp_path / "specbench_gamma1.json", 1, 1.20, 1.72, decode=True)
+    write_run(tmp_path / "specbench_2026-10-24_quiet_passA_gamma1.json", 1, 1.11, 1.70, decode=True)
+
+    # Falls back to the fixed-order sweep rather than trusting a lone pass.
+    assert {p.name for p in plots.quotable_sweep(tmp_path)} == {"specbench_gamma1.json"}
+
+
+def test_passes_are_not_pooled_across_sessions(tmp_path):
+    """A lone pass must not ride along on a different session's second pass.
+
+    Grouping by gamma alone counts pass A of one night and both passes of another as three passes at
+    that gamma, which both admits the lone run and averages across machine states -- the stitching
+    error plan section 13 exists to prevent.
+    """
+    plots = load_make_plots()
+    write_run(tmp_path / "specbench_2026-10-24_quiet_passA_gamma1.json", 1, 1.11, 1.70, decode=True)
+    for label in ("A", "B"):
+        write_run(tmp_path / f"specbench_2026-10-25_quiet_pass{label}_gamma1.json",
+                  1, 1.19, 1.76, decode=True)
+
+    chosen = {p.name for p in plots.quotable_sweep(tmp_path)}
+    assert chosen == {"specbench_2026-10-25_quiet_passA_gamma1.json",
+                      "specbench_2026-10-25_quiet_passB_gamma1.json"}
+    assert all("2026-10-24" not in name for name in chosen)
+
+
+def test_the_session_covering_more_gammas_wins(tmp_path):
+    """Between two order-cancelled sessions, the one that swept further is the sweep."""
+    plots = load_make_plots()
+    for label in ("A", "B"):
+        write_run(tmp_path / f"specbench_2026-10-20_quiet_pass{label}_gamma1.json",
+                  1, 1.19, 1.76, decode=True)
+        for gamma in (1, 2, 3):
+            write_run(tmp_path / f"specbench_2026-10-25_quiet_pass{label}_gamma{gamma}.json",
+                      gamma, 1.19, 1.76, decode=True)
+
+    chosen = {p.name for p in plots.quotable_sweep(tmp_path)}
+    assert len(chosen) == 6
+    assert all("2026-10-25" in name for name in chosen)
+
+
+def test_measured_runs_averages_the_passes_sharing_a_gamma(tmp_path):
+    """Two passes at one gamma are one measurement, so the curve plots their average.
+
+    Taking either pass alone reports whichever one happened to run on the cooler machine, which is
+    how the 2026-10-24 reading that gamma=2 beat gamma=1 was produced.
+    """
+    plots = load_make_plots()
+    write_run(tmp_path / "specbench_2026-10-25_quiet_passA_gamma1.json", 1, 1.10, 1.70, decode=True)
+    write_run(tmp_path / "specbench_2026-10-25_quiet_passB_gamma1.json", 1, 1.30, 1.80, decode=True)
+
+    runs = plots.measured_runs(tmp_path)
+    assert len(runs) == 1
+    assert runs[0]["gamma"] == 1
+    assert runs[0]["decode"] == pytest.approx(1.20)  # not 1.10 and not 1.30
+    assert runs[0]["tau"] == pytest.approx(1.75)
+    assert runs[0]["passes_averaged"] == 2
+
+
+def test_mean_blob_averages_v_c_and_o(tmp_path):
+    """v(k) is averaged per k, and c and o with it, so a figure shows the measurement not a pass."""
+    plots = load_make_plots()
+    a = {"context": 512, "c": 0.20, "v": {"1": 1.0, "2": 1.10},
+         "overhead": {"o_per_round": 0.006}}
+    b = {"context": 512, "c": 0.22, "v": {"1": 1.0, "2": 1.30},
+         "overhead": {"o_per_round": 0.008}}
+
+    out = plots.mean_blob([a, b])
+    assert out["c"] == pytest.approx(0.21)
+    assert out["v"]["2"] == pytest.approx(1.20)
+    assert out["overhead"]["o_per_round"] == pytest.approx(0.007)
+    assert out["passes_averaged"] == 2
+    assert out["context"] == 512  # not averaged; it identifies the measurement
