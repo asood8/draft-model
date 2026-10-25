@@ -143,16 +143,31 @@ def main() -> None:
               f"{('lookup' if pl > pm else 'model'):>11}")
 
     # Break-even: the prefill share at which a zero-cost drafter overtakes a model draft.
-    gamma1 = [b for n, b in runs if b.get("gamma") == 1 and "lookup" in b.get("summary", {})]
-    if gamma1:
-        s_l = sum(b["decode_speedups"]["lookup"]["all"] for b in gamma1) / len(gamma1)
-        s_m = sum(b["decode_speedups"]["speculative"]["all"] for b in gamma1) / len(gamma1)
+    #
+    # It is a function of the two decode speedups, and those depend on the workload's acceptance
+    # rate -- so it is reported per prompt set rather than over a pool of them. Averaging the short
+    # and long sets together with the four-category subset mixes three different alphas and gives a
+    # break-even belonging to none of them.
+    print("\nbreak-even prefill share, per prompt set, at gamma=1")
+    print(f"{'prompt set':<40}{'S_lookup':>10}{'S_model':>9}{'f*':>8}{'f':>8}{'side':>8}")
+    for name, blob in runs:
+        s = blob["summary"]
+        if blob.get("gamma") != 1 or "lookup" not in s or "speculative" not in s:
+            continue
+        s_l = blob["decode_speedups"]["lookup"]["all"]
+        s_m = blob["decode_speedups"]["speculative"]["all"]
+        f = s["target"]["all"]["prefill_share"]
         gap = 1 / s_l - 1 / s_m
+        if gap <= 0:  # lookup already wins on decode, so there is no prompt pass to repay
+            print(f"{name:<40}{s_l:>10.3f}{s_m:>9.3f}{'n/a':>8}{f:>8.3f}{'lookup':>8}")
+            continue
         star = gap / (gap + k["speculative"] - k["lookup"])
-        print(f"\nbreak-even prefill share at gamma=1: f* = {star:.3f}"
-              f"   (S_lookup {s_l:.3f}, S_model {s_m:.3f}, k {k['speculative']:.3f})")
-        print("Above it, prefer a drafter that needs no prompt pass of its own, even though it"
-              " accepts far less often.")
+        print(f"{name:<40}{s_l:>10.3f}{s_m:>9.3f}{star:>8.3f}{f:>8.3f}"
+              f"{('lookup' if f > star else 'model'):>8}")
+    print("\nAbove f*, prefer a drafter that needs no prompt pass of its own, even though it"
+          " accepts far less often.")
+    print("f* moves with the workload, because it depends on both decode speedups and those depend"
+          " on acceptance.")
 
 
 if __name__ == "__main__":

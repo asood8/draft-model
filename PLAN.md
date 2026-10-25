@@ -412,12 +412,27 @@ Setting the two predictions equal gives the break-even share at which a zero-cos
 draft:
 
 ```
-f* = (1/S_lookup − 1/S_model) / (1/S_lookup − 1/S_model + k) = 0.429   at γ=1
+f* = (1/S_lookup − 1/S_model) / (1/S_lookup − 1/S_model + k)
 ```
 
-and the measurements bracket it: the model draft wins at f = 0.272, lookup wins at f = 0.450. That is the
-practical rule to hand a reader -- **measure your prefill share; above about 0.43 a drafter that needs no
-prompt pass of its own wins, even though it accepts less than half as often.**
+It depends on both decode speedups, and those depend on the workload's acceptance rate, so it is a per-set
+quantity rather than a constant -- pooling the prompt sets to get one number mixes three different α and
+reports a break-even belonging to none of them. Per set, at γ=1:
+
+| prompt set | S_lookup | S_model | f\* | measured f | wins |
+|---|---|---|---|---|---|
+| four-category, pass A | 1.016 | 1.196 | **0.440** | 0.270 | model |
+| four-category, pass B | 1.034 | 1.191 | **0.404** | 0.275 | model |
+| short | 1.018 | 1.200 | **0.442** | 0.450 | lookup |
+| long | 0.973 | 0.949 | n/a | 0.875 | lookup |
+
+The short set is the sharp test: its measured prefill share sits **0.008 above its own break-even**, and
+lookup wins there by 1.117 against 1.072. On the long set the question does not arise, because lookup is
+already ahead on decode (0.973 against 0.949) and so has no second prompt pass to repay.
+
+So the practical rule to hand a reader is **measure your prefill share; above about 0.4 a drafter that needs
+no prompt pass of its own wins, even though it accepts less than half as often** -- with the caveat that the
+threshold itself moves with acceptance and is worth computing rather than assuming.
 
 **Two limitations, both honest leads rather than noise.** The error grows with γ, to 12.7% at γ = 2-4, where
 at γ=1 it is 0.1%. And the short set is a systematic miss: all three methods underpredict there by 5.8-9.8%,
