@@ -1,0 +1,136 @@
+{
+  "when": "2026-10-25T07:12:36.337854+00:00",
+  "label": "2026-10-25 quiet, two shuffled sweeps, ms a token, 24 tokens each after 4 warm",
+  "model": "models/Qwen3-4B-q4.sdm",
+  "sweep_orders": [
+    [
+      1024,
+      128,
+      512,
+      2048
+    ],
+    [
+      128,
+      512,
+      2048,
+      1024
+    ]
+  ],
+  "sweeps": [
+    {
+      "128": {
+        "total": 73.29,
+        "qkv": 13.21,
+        "attention": 1.18,
+        "attn_out": 6.57,
+        "gate_up": 30.76,
+        "ffn_down": 15.29,
+        "output": 6.29
+      },
+      "512": {
+        "total": 76.38,
+        "qkv": 13.17,
+        "attention": 4.49,
+        "attn_out": 6.51,
+        "gate_up": 30.79,
+        "ffn_down": 15.17,
+        "output": 6.24
+      },
+      "1024": {
+        "total": 79.35,
+        "qkv": 13.2,
+        "attention": 7.14,
+        "attn_out": 6.84,
+        "gate_up": 30.65,
+        "ffn_down": 15.13,
+        "output": 6.39
+      },
+      "2048": {
+        "total": 85.11,
+        "qkv": 13.57,
+        "attention": 12.49,
+        "attn_out": 6.56,
+        "gate_up": 31.03,
+        "ffn_down": 15.25,
+        "output": 6.21
+      }
+    },
+    {
+      "128": {
+        "total": 74.14,
+        "qkv": 13.35,
+        "attention": 1.23,
+        "attn_out": 6.7,
+        "gate_up": 31.17,
+        "ffn_down": 15.4,
+        "output": 6.29
+      },
+      "512": {
+        "total": 79.98,
+        "qkv": 13.95,
+        "attention": 5.07,
+        "attn_out": 6.91,
+        "gate_up": 31.73,
+        "ffn_down": 15.73,
+        "output": 6.59
+      },
+      "1024": {
+        "total": 82.85,
+        "qkv": 14.04,
+        "attention": 8.83,
+        "attn_out": 6.76,
+        "gate_up": 31.36,
+        "ffn_down": 15.55,
+        "output": 6.31
+      },
+      "2048": {
+        "total": 89.2,
+        "qkv": 14.21,
+        "attention": 14.47,
+        "attn_out": 6.76,
+        "gate_up": 31.71,
+        "ffn_down": 15.77,
+        "output": 6.27
+      }
+    }
+  ],
+  "baseline_2026_10_04": {
+    "128": {
+      "step": 70.32,
+      "qkv": 11.84,
+      "attention": 1.5,
+      "attn_out": 6.25,
+      "gate_up": 29.39,
+      "ffn_down": 15.64,
+      "output": 5.7
+    },
+    "512": {
+      "step": 78.38,
+      "qkv": 13.74,
+      "attention": 7.17,
+      "attn_out": 6.49,
+      "gate_up": 30.14,
+      "ffn_down": 15.08,
+      "output": 5.76
+    },
+    "1024": {
+      "step": 83.31,
+      "qkv": 13.35,
+      "attention": 13.32,
+      "attn_out": 6.57,
+      "gate_up": 29.38,
+      "ffn_down": 14.73,
+      "output": 5.97
+    },
+    "2048": {
+      "step": 98.97,
+      "qkv": 13.76,
+      "attention": 26.88,
+      "attn_out": 6.97,
+      "gate_up": 29.91,
+      "ffn_down": 14.79,
+      "output": 6.67
+    }
+  },
+  "note": "Stage timers carry instrumentation overhead, so a stage total is not comparable to a measure_vk pass(1). Tonight the two agree at context 128 (73.29 against 72.62, 0.9%); on 2026-10-04 they did not (70.32 against 64.10, 9.7%)."
+}
