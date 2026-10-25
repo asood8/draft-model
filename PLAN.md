@@ -32,6 +32,7 @@ their own. Section 17 tracks decisions and open questions.
 1. [Goal, deliverables, success criteria](#1-goal-deliverables-success-criteria)
 2. [How the pieces fit](#2-how-the-pieces-fit)
 3. [The speedup model](#3-the-speedup-model)
+   - [3.1 From decode to wall clock](#31-from-decode-to-wall-clock-added-2026-10-25)
 4. [Additions to the idea](#4-additions-to-the-idea)
 5. [Setup](#5-setup)
 6. [Milestone 0: Feasibility](#6-milestone-0-feasibility)
@@ -347,6 +348,80 @@ bandwidth-bound c is:
 
 A float32 KV cache would make this worse: at 2k context the draft's KV bytes would exceed its 4-bit weights. So
 the KV cache is stored in fp16, and 8-bit KV for the draft is a stretch goal.
+
+### 3.1 From decode to wall clock (added 2026-10-25)
+
+Everything above predicts **decoding**. It is silent about the prompt pass, which is 27-88% of the clock in
+the runs this project reports and which speculative decoding pays for **twice**, once into each model's KV
+cache. Two consequences had been showing up as unexplained results for weeks:
+
+- The headline number is a wall-clock number the model could not predict.
+- The model could not say **which drafting strategy to use**. Prompt lookup *loses* on decode in every run
+  measured and *wins* the clock in two of three prompt sets, and nothing in `γ·c + v(γ+1) + o` can express
+  that, because a drafter that needs no prompt pass of its own is identical in this formula to one that does.
+
+Greedy speculative decoding emits exactly the tokens the target would, so both runs generate the same N
+tokens and only the rates differ. Writing P for the prompt pass, D for the decode phase, **f = P_t / (P_t +
+D_t)** for the target's prefill share and **k = P_d / P_t** for the draft's prompt pass relative to the
+target's:
+
+```
+target:       T_t = P_t + D_t
+speculative:  T_s = P_t + P_d + D_t / S_decode
+
+S_wall = 1 / [ (1 + k)·f + (1 − f) / S_decode ]                                       (1)
+```
+
+**k is not a new free parameter, which is the point.** `run_specbench.py` records `prefill_seconds` per
+method, so k is measured directly as `(P_method − P_target) / P_target`:
+
+| method | k, mean over 10 runs | range |
+|---|---|---|
+| `lookup` | **−0.005** | −0.027 to 0.013 |
+| `speculative` | **0.183** | 0.152 to 0.236 |
+| `speculative+stop` | 0.205 | 0.179 to 0.259 |
+
+Lookup's k is zero to within noise, which its structure demands: it runs no model, so there is no second
+prompt pass. And the model draft's 0.183 sits on top of **c, which is 0.182 at context 128 rising to 0.245 at
+2048** -- the draft's prompt pass costs the same fraction of the target's as its decode step does. So (1)
+evaluates from quantities section 3 already measures, and adds no measurement burden.
+
+Scored against every usable Spec-Bench run -- four gammas × two passes, plus the short and long prompt sets,
+29 method-runs in all:
+
+| method | mean abs. error | worst |
+|---|---|---|
+| `lookup` | 2.6% | 9.4% |
+| `speculative+stop` | 3.1% | 9.8% |
+| `speculative` | 6.0% | 12.7% |
+| **overall** | **3.9%** | 12.7% |
+
+At γ=1, the configuration this project recommends, plain speculative predicts to **+0.1% and −0.1%** across
+the two passes.
+
+**What it buys.** Equation (1) picks the winning drafting strategy in **10 of 10** cases, including both
+reversals, which the decode-only model cannot do even in principle:
+
+| prompt set | prefill share f | `lookup` | model draft | winner | (1) predicts |
+|---|---|---|---|---|---|
+| four-category subset | 0.272 | 1.021 | **1.073** | model | model |
+| short | 0.450 | **1.117** | 1.072 | lookup | lookup |
+| long | 0.875 | **0.972** | 0.818 | lookup | lookup |
+
+Setting the two predictions equal gives the break-even share at which a zero-cost drafter overtakes a model
+draft:
+
+```
+f* = (1/S_lookup − 1/S_model) / (1/S_lookup − 1/S_model + k) = 0.429   at γ=1
+```
+
+and the measurements bracket it: the model draft wins at f = 0.272, lookup wins at f = 0.450. That is the
+practical rule to hand a reader -- **measure your prefill share; above about 0.43 a drafter that needs no
+prompt pass of its own wins, even though it accepts less than half as often.**
+
+**Two limitations, both honest leads rather than noise.** The error grows with γ, to 12.7% at γ = 2-4, where
+at γ=1 it is 0.1%. And the short set is a systematic miss: all three methods underpredict there by 5.8-9.8%,
+in the same direction, which says something is wrong with f or with N on that set rather than with (1).
 
 ---
 
