@@ -54,7 +54,56 @@ def finish(figure, axes, out: Path, name: str, title: str) -> None:
     print(f"  wrote {path}")
 
 
-def measured_runs(results: Path, pattern: str = "specbench_gamma*.json") -> list[dict]:
+# The one session whose conditions were measured at both ends and held: read bandwidth drifted 0.12%
+# across every run in it. Figures are drawn from this session alone, because mixing it with earlier
+# ones is the stitching error plan section 13 exists to prevent.
+SESSION = "2026-10-25_quiet"
+
+# results/specbench_gamma{1..4}.json ran strictly ascending and back to back on 2026-10-05, so every
+# larger gamma inherited the heat of the runs before it. Three of its four entries are 11-19% low.
+# See results/README.md.
+CONFOUNDED = ("specbench_gamma1.json", "specbench_gamma2.json",
+              "specbench_gamma3.json", "specbench_gamma4.json")
+
+
+def usable(path: Path) -> bool:
+    """False for a stored run that results/README.md says must not be quoted.
+
+    Two groups. The 2026-10-05 sweep is confounded by its ascending visit order. The 2026-10-24
+    Spec-Bench files are an order-aware attempt that was reaped three runs into eight, so they are a
+    single pass with no reverse order to cancel against -- which is the one thing they were for.
+    """
+    if path.name in CONFOUNDED:
+        return False
+    return "2026-10-24" not in path.name
+
+
+def mean_blob(blobs: list[dict]) -> dict:
+    """Average the shuffled passes of one measurement into the figure that should be drawn.
+
+    A single pass is not the number: 2026-10-25 ran every context and every gamma twice in different
+    orders precisely so that drift could not masquerade as the effect, and the average over the
+    passes is what PLAN.md quotes.
+    """
+    out = dict(blobs[0])
+    n = len(blobs)
+    for key in ("c", "target_step_seconds", "draft_step_seconds"):
+        vals = [b[key] for b in blobs if isinstance(b.get(key), (int, float))]
+        if vals:
+            out[key] = sum(vals) / len(vals)
+    if all("v" in b for b in blobs):
+        keys = set(blobs[0]["v"])
+        out["v"] = {k: sum(float(b["v"][k]) for b in blobs) / n
+                    for k in keys if all(k in b["v"] for b in blobs)}
+    overheads = [b.get("overhead", {}).get("o_per_round") for b in blobs]
+    if all(isinstance(o, (int, float)) for o in overheads):
+        out["overhead"] = dict(blobs[0].get("overhead", {}))
+        out["overhead"]["o_per_round"] = sum(overheads) / n
+    out["passes_averaged"] = n
+    return out
+
+def measured_runs(results: Path,
+                  pattern: str = f"specbench_{SESSION}_pass*_gamma*.json") -> list[dict]:
     """Spec-Bench runs that form a gamma sweep, newest-sorted, with the numbers to compare.
 
     Only the sweep files by default: they are one prompt set measured at several gamma, which is what
@@ -85,7 +134,25 @@ def measured_runs(results: Path, pattern: str = "specbench_gamma*.json") -> list
             "alpha": float(row.get("alpha", 0.0)),
             "target": str(blob.get("target", "")),
         })
-    return sorted(runs, key=lambda run: run["gamma"])
+
+    # Two passes share each gamma, by design. Averaging them is what makes the curve the measured
+    # one rather than whichever pass happened to run on the cooler machine.
+    merged: dict[int, list[dict]] = {}
+    for run in runs:
+        merged.setdefault(run["gamma"], []).append(run)
+    averaged = []
+    for gamma, group in merged.items():
+        n = len(group)
+        averaged.append({
+            "gamma": gamma,
+            "decode": sum(r["decode"] for r in group) / n,
+            "decode_only": group[0]["decode_only"],
+            "tau": sum(r["tau"] for r in group) / n,
+            "alpha": sum(r["alpha"] for r in group) / n,
+            "target": group[0]["target"],
+            "passes_averaged": n,
+        })
+    return sorted(averaged, key=lambda run: run["gamma"])
 
 
 def predict(blob: dict, gamma: int, tau: float) -> float | None:
@@ -127,13 +194,23 @@ def plot_vk_by_context(results: Path, out: Path) -> None:
     context and applying it to long prompts over-predicts the speedup, which is exactly the mistake
     section 10.4 records.
     """
-    by_target: dict[str, list[tuple[int, dict]]] = {}
-    paths = list(results.glob("vk_*.json")) + list(results.glob("vk_context*/vk_*.json"))
-    for path in sorted(paths):
+    paths = sorted(results.glob(f"vk_{SESSION}_pass*/vk_*.json"))
+    if not paths:  # before the canonical session existed
+        paths = sorted(list(results.glob("vk_*.json"))
+                       + list(results.glob("vk_context*/vk_*.json")))
+
+    # Collect every pass for each (target, context), then average them.
+    grouped: dict[tuple[str, int], list[dict]] = {}
+    for path in paths:
         blob = load(path)
         if blob is None or "v" not in blob or blob.get("context") is None:
             continue
-        by_target.setdefault(path.stem.replace("vk_", ""), []).append((int(blob["context"]), blob))
+        name = path.stem.replace("vk_", "")
+        grouped.setdefault((name, int(blob["context"])), []).append(blob)
+
+    by_target: dict[str, list[tuple[int, dict]]] = {}
+    for (name, context), blobs in grouped.items():
+        by_target.setdefault(name, []).append((context, mean_blob(blobs)))
 
     for name, runs in by_target.items():
         if len(runs) < 2:
@@ -153,7 +230,8 @@ def plot_vk_by_context(results: Path, out: Path) -> None:
 
 
 def plot_speedup_vs_gamma(results: Path, out: Path) -> None:
-    for path in sorted(results.glob("vk_*.json")):
+    for path in sorted(list(results.glob(f"vk_{SESSION}_pass*/vk_*.json"))
+                       or list(results.glob("vk_*.json"))):
         blob = load(path)
         if blob is None or not blob.get("predictions"):
             continue
@@ -267,6 +345,8 @@ def plot_specbench(results: Path, out: Path) -> None:
     call is what a user waits for, and on a 1450-token prompt most of that is the prompt pass.
     """
     for path in sorted(results.glob("specbench*.json")):
+        if not usable(path):
+            continue
         blob = load(path)
         if blob is None or "speedups" not in blob:
             continue
@@ -305,7 +385,8 @@ def plot_predicted_vs_measured(results: Path, out: Path) -> None:
     describes rounds, and a prompt pass is neither a round nor affected by any of this.
     """
     offline = [load(path) for path in sorted(results.glob("offline_*.json"))]
-    bench = [load(path) for path in sorted(results.glob("specbench*.json"))]
+    bench = [load(path) for path in sorted(results.glob("specbench*.json"))
+             if usable(path)]
     pairs = []
     for measured in bench:
         if measured is None or "speedups" not in measured:
