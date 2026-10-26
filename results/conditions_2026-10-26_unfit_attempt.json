@@ -1,0 +1,124 @@
+{
+  "taken_at": "2026-10-26T06:55:45.611210+00:00",
+  "label": "2026-10-26 before the full Spec-Bench run, gamma=1, four methods",
+  "dispatch_overhead_us": 5.0267000000000005e-06,
+  "dispatch_healthy_range": [
+    1.0,
+    1.8
+  ],
+  "dispatch_verdict": "fit",
+  "read_bandwidth_gb_s": {
+    "performance": 38.27724608490751,
+    "all": "error: unknown core selection"
+  },
+  "kernel_path": "vnni",
+  "core_topology": [
+    {
+      "logical_index": 0,
+      "core_index": 0,
+      "efficiency_class": 1,
+      "primary": true
+    },
+    {
+      "logical_index": 1,
+      "core_index": 0,
+      "efficiency_class": 1,
+      "primary": false
+    },
+    {
+      "logical_index": 2,
+      "core_index": 2,
+      "efficiency_class": 1,
+      "primary": true
+    },
+    {
+      "logical_index": 3,
+      "core_index": 2,
+      "efficiency_class": 1,
+      "primary": false
+    },
+    {
+      "logical_index": 4,
+      "core_index": 4,
+      "efficiency_class": 1,
+      "primary": true
+    },
+    {
+      "logical_index": 5,
+      "core_index": 4,
+      "efficiency_class": 1,
+      "primary": false
+    },
+    {
+      "logical_index": 6,
+      "core_index": 6,
+      "efficiency_class": 1,
+      "primary": true
+    },
+    {
+      "logical_index": 7,
+      "core_index": 6,
+      "efficiency_class": 1,
+      "primary": false
+    },
+    {
+      "logical_index": 8,
+      "core_index": 8,
+      "efficiency_class": 1,
+      "primary": true
+    },
+    {
+      "logical_index": 9,
+      "core_index": 8,
+      "efficiency_class": 1,
+      "primary": false
+    },
+    {
+      "logical_index": 10,
+      "core_index": 10,
+      "efficiency_class": 1,
+      "primary": true
+    },
+    {
+      "logical_index": 11,
+      "core_index": 10,
+      "efficiency_class": 1,
+      "primary": false
+    },
+    {
+      "logical_index": 12,
+      "core_index": 12,
+      "efficiency_class": 0,
+      "primary": true
+    },
+    {
+      "logical_index": 13,
+      "core_index": 13,
+      "efficiency_class": 0,
+      "primary": true
+    },
+    {
+      "logical_index": 14,
+      "core_index": 14,
+      "efficiency_class": 0,
+      "primary": true
+    },
+    {
+      "logical_index": 15,
+      "core_index": 15,
+      "efficiency_class": 0,
+      "primary": true
+    }
+  ],
+  "host": {
+    "free_gb": 8.1,
+    "total_gb": 15.73,
+    "clock_mhz": 2400,
+    "max_clock_mhz": 2400,
+    "load_pct": 3,
+    "page_ins": 0,
+    "standby_mb": 1524
+  },
+  "platform": "Intel64 Family 6 Model 186 Stepping 2, GenuineIntel",
+  "python": "3.14.2"
+}
