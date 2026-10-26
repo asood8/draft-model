@@ -77,11 +77,18 @@ def load_questions(
     limit_per_category: int | None = None,
     seed: int = 0,
     group_multi_turn: bool = True,
+    offset_per_category: int = 0,
 ) -> list[Question]:
     """Read the benchmark file, optionally taking a stratified subset.
 
     A subset is drawn per category with a fixed seed, so a short run is still balanced and is the
     same short run next time.
+
+    `offset_per_category` skips that many questions per category before taking the limit, which is
+    what makes a long run resumable: the shuffle is seeded, so consecutive offsets carve the same
+    deterministic order into disjoint chunks, and a run killed partway through can be restarted from
+    the chunk it died on rather than from the beginning. It has no effect unless
+    `limit_per_category` is set.
     """
     questions: list[Question] = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
@@ -119,7 +126,7 @@ def load_questions(
         for category in sorted(by_category):
             rows = by_category[category]
             random.Random(seed).shuffle(rows)
-            picked.extend(rows[:limit_per_category])
+            picked.extend(rows[offset_per_category:offset_per_category + limit_per_category])
         questions = picked
 
     return questions

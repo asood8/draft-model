@@ -457,3 +457,58 @@ def test_mean_blob_averages_v_c_and_o(tmp_path):
     assert out["overhead"]["o_per_round"] == pytest.approx(0.007)
     assert out["passes_averaged"] == 2
     assert out["context"] == 512  # not averaged; it identifies the measurement
+
+
+def test_the_offset_carves_disjoint_chunks_that_cover_the_set(tmp_path):
+    """A long run has to be resumable, and that means chunks that neither overlap nor skip.
+
+    The shuffle is seeded, so consecutive offsets cut the same deterministic order into disjoint
+    pieces. Without this, a 12-hour sweep killed at hour 10 -- which the harness on this machine has
+    done twice -- has to start over.
+    """
+    path = tmp_path / "questions.jsonl"
+    rows = [{"question_id": i, "category": "qa" if i < 12 else "math", "prompt": f"q{i}"}
+            for i in range(24)]
+    path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+    chunks = [load_questions(path, limit_per_category=3, offset_per_category=k)
+              for k in (0, 3, 6, 9)]
+    ids = [[q.question_id for q in chunk] for chunk in chunks]
+
+    for chunk in chunks:
+        assert len(chunk) == 6  # 3 per category, two categories
+    flat = [i for chunk in ids for i in chunk]
+    assert len(flat) == len(set(flat)), "chunks overlap"
+    assert set(flat) == {r["question_id"] for r in rows}, "chunks do not cover the set"
+
+
+def test_the_offset_is_stable_across_calls(tmp_path):
+    """The same offset must return the same questions, or a resumed run measures something else."""
+    path = tmp_path / "questions.jsonl"
+    rows = [{"question_id": i, "category": "qa", "prompt": f"q{i}"} for i in range(20)]
+    path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+    first = [q.question_id for q in
+             load_questions(path, limit_per_category=4, offset_per_category=8)]
+    again = [q.question_id for q in
+             load_questions(path, limit_per_category=4, offset_per_category=8)]
+    assert first == again
+    assert len(first) == 4
+
+
+def test_the_offset_does_nothing_without_a_limit(tmp_path):
+    """Backwards compatibility: an offset alone must not silently drop questions."""
+    path = tmp_path / "questions.jsonl"
+    rows = [{"question_id": i, "category": "qa", "prompt": f"q{i}"} for i in range(10)]
+    path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+    assert len(load_questions(path, offset_per_category=5)) == 10
+
+
+def test_an_offset_past_the_end_returns_nothing(tmp_path):
+    """The driver uses this to know it has reached the end of a category."""
+    path = tmp_path / "questions.jsonl"
+    rows = [{"question_id": i, "category": "qa", "prompt": f"q{i}"} for i in range(6)]
+    path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+    assert load_questions(path, limit_per_category=3, offset_per_category=6) == []

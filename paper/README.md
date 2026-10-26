@@ -24,7 +24,8 @@ are read from `../results/figures/` via `\graphicspath`, so regenerate them with
 
 ## What is still missing
 
-Six `\pending{...}` markers, which render in red so they cannot be missed in a draft:
+Five `\pending{...}` markers, which render in red so they cannot be missed in a draft (six
+occurrences — the second machine is cited twice):
 
 | marker | what it needs |
 |---|---|

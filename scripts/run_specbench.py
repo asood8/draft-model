@@ -45,6 +45,9 @@ def main() -> None:
     parser.add_argument("--gamma", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--per-category", type=int, default=None, help="subset size")
+    parser.add_argument("--offset-per-category", type=int, default=0,
+                        help="skip this many questions per category first, so a long "
+                             "run can be carved into resumable chunks")
     parser.add_argument("--categories", nargs="*", default=None)
     parser.add_argument("--temperature", type=float, default=0.0, help="0 is greedy")
     parser.add_argument("--top-k", type=int, default=0)
@@ -65,7 +68,8 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     questions = load_questions(
-        args.questions, args.categories, args.per_category, seed=args.seed
+        args.questions, args.categories, args.per_category, seed=args.seed,
+        offset_per_category=args.offset_per_category,
     )
     if not questions:
         raise SystemExit(f"no questions loaded from {args.questions}")
@@ -174,6 +178,8 @@ def main() -> None:
             "cores": args.cores,
             "cpu": platform.processor(),
             "questions": len(questions),
+            "offset_per_category": args.offset_per_category,
+            "per_category": args.per_category,
             "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         },
     )
