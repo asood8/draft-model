@@ -206,8 +206,12 @@ bandwidth, which is higher now; not clock, since the per-round overhead $o$ is a
 non-streaming work and did not move; and not source, since rebuilding the earlier commit with the
 same compiler and flags and alternating it against the current one inside a single process gives a
 ratio of 0.975. It is spread across the weight-streaming stages with no single stage responsible.
-Second, we do not yet have a llama.cpp baseline on this machine \pending{llama.cpp comparison}; the
-absolute argument above is what we rely on instead.
+Second, we deliberately do not report a llama.cpp comparison. A relative figure is only as
+informative as the program it is relative to, and establishing that llama.cpp is running
+bit-identical weights --- the same model, the same block quantization, the same numbers --- is
+difficult enough that a comparison we could not fully defend would be worse than none. The absolute
+argument is also the stronger one: that the engine sits within a few percent of what the hardware can
+do bounds how much faster \emph{any} implementation could be, which no pairwise comparison does.
 
 \subsection{$v(k)$ is a function of context}
 \label{sec:vk}
@@ -342,8 +346,14 @@ $+0.1\%$ and $-0.1\%$ in the two passes.
 
 What it buys is the selection of a drafting strategy, which the decode-only model cannot express at
 all: prompt lookup loses on decoding in \emph{every} run measured here, so a decode-only reading ranks
-it last everywhere. Table~\ref{tab:reversal} shows it winning the clock in two of three prompt sets,
-and~\eqref{eq:wall} predicting the winner in all ten comparisons.
+it last everywhere. Table~\ref{tab:reversal} shows it winning the clock at two of the three operating
+points, and~\eqref{eq:wall} predicting the winner at all of them.
+
+The three points come from two prompt sets, not three: the four-category rows and the short row are
+the \emph{same eight prompts} at different generation lengths (152 against 54 tokens a turn), which
+is a legitimate way to vary $f$ --- the prefill share is what the model claims decides this --- but it
+is a weaker test than three distinct prompt distributions would be, and we say so in
+Section~\ref{sec:limits}.
 
 \begin{table}[t]
 \caption{Wall-clock speedup at $\gamma=1$ for a model draft and for prompt lookup, against the
@@ -406,15 +416,26 @@ step      & 73.29 & 85.11 & 98.97 \\
 \end{table}
 
 \section{Limitations}
+\label{sec:limits}
+
+\textbf{A small evaluation.} The Spec-Bench subset used here is eight prompts over four categories
+(ten turns, 1520 generated tokens) plus two long-prompt questions, against the benchmark's 480
+questions. The wall-clock model's strategy selection is validated at three operating points drawn
+from two prompt sets, and eight of its ten correct predictions are the same eight prompts at
+different $\gamma$, so they are not independent samples. The mechanism behind~\eqref{eq:wall} rests
+on ten independent measurements of $k$ and is solid; the strategy-selection claim needs the full
+benchmark \pending{full Spec-Bench evaluation}.
 
 \textbf{One machine.} Every number here comes from one laptop. $v(k)$'s shape should depend on the
 ratio of memory bandwidth to arithmetic throughput, and a machine with more bandwidth per core should
 show a \emph{steeper} $v(k)$; that is a falsifiable prediction we have not yet tested
 \pending{second-machine replication}.
 
-\textbf{No external baseline.} We compare the engine against measured hardware limits rather than
-against llama.cpp, because obtaining matching quantized weights there is unresolved
-\pending{llama.cpp comparison}.
+\textbf{No external baseline, by choice.} We compare the engine against measured hardware limits
+rather than against another implementation. This is a deliberate decision rather than an omission:
+a relative number requires establishing that the other program runs bit-identical weights, and a
+comparison we could not fully defend would be weaker evidence than the absolute bound. A reader who
+wants the relative figure will not find it here.
 
 \textbf{No distilled draft.} The draft is an off-the-shelf Qwen3-0.6B. Our own model, evaluated at the
 context the engine runs at, puts distillation to $\alpha = 0.85$ at about $+0.08\times$ on decoding,
@@ -425,7 +446,16 @@ for a reason no amount of $\alpha$ touches \pending{distilled draft}.
 \textbf{Unexplained absolute shift.} The 13\% step-time difference between sessions noted in
 Section~\ref{sec:method} is reproducible and unexplained. It does not affect $v(k)$, $c$ or $o$, all
 of which are ratios and all of which reproduce, nor the speedup figures, which are ratios measured
-within a run.
+within a run. It is, however, more constrained than a single number suggests. Re-running the
+identical prompts through the prompt pass --- a batch-16, compute-heavy phase, unlike the
+bandwidth-bound single-token step --- gives $1.143\times$, against $1.133\times$ for the decode step.
+Meanwhile $o$, which is pure non-model work, is unchanged at $1.008\times$, and the synthetic
+read-bandwidth kernel is \emph{faster} at $1.011\times$. So all model work slowed by the same
+$\approx 14\%$ while non-model work on the same cores did not, which rules out a clock or a
+scheduling effect and rules out raw sequential bandwidth. A page-locality or TLB explanation would
+fit all four observations --- the model walks 2.26\,GB of scattered tensors where the bandwidth probe
+streams one contiguous gigabyte --- but we have not tested it and record it only as the first
+hypothesis consistent with the constraints.
 
 \textbf{Greedy only.} All speedups are greedy. The sampling path is implemented and tested against the
 target's distribution, but the sweeps reported here are at temperature zero.

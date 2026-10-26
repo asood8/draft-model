@@ -357,8 +357,13 @@ cache. Two consequences had been showing up as unexplained results for weeks:
 
 - The headline number is a wall-clock number the model could not predict.
 - The model could not say **which drafting strategy to use**. Prompt lookup *loses* on decode in every run
-  measured and *wins* the clock in two of three prompt sets, and nothing in `γ·c + v(γ+1) + o` can express
-  that, because a drafter that needs no prompt pass of its own is identical in this formula to one that does.
+  measured and *wins* the clock at two of the three operating points, and nothing in `γ·c + v(γ+1) + o` can
+  express that, because a drafter that needs no prompt pass of its own is identical in this formula to one
+  that does. (Those three points come from **two** prompt sets, not three: the four-category subset and
+  `specbench_short` are the *same eight prompts* at different generation lengths, 152 against 54 tokens a
+  turn. Varying the generation length is a legitimate way to vary the prefill share, which is the quantity
+  the model says decides this -- but it is weaker than three distinct prompt distributions, and the full
+  Spec-Bench run is what fixes it.)
 
 Greedy speculative decoding emits exactly the tokens the target would, so both runs generate the same N
 tokens and only the rates differ. Writing P for the prompt pass, D for the decode phase, **f = P_t / (P_t +

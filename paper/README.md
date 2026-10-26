@@ -28,11 +28,14 @@ Six `\pending{...}` markers, which render in red so they cannot be missed in a d
 
 | marker | what it needs |
 |---|---|
-| llama.cpp comparison | a decision on how to obtain matching quantized weights there |
+| full Spec-Bench evaluation | ~12 h of machine time. The single biggest gain available: the current figures use 8 prompts against the benchmark's 480, and the wall-clock model's strategy selection rests on three operating points drawn from two prompt sets |
 | second-machine replication | ×2 — a second x86 machine, which also tests the paper's one falsifiable prediction: a machine with more bandwidth per core should show a *steeper* v(k) |
 | distilled draft | 14–19 GPU-hours; the plan's §11.7 budgets it and recommends against it for this paper |
 | repository URL | the public repository link |
 | Zenodo DOI | a tagged release, for the artifact citation |
+
+The llama.cpp comparison was a marker here until 2026-10-25 and is now **decided against** rather
+than pending; §VII states the reasoning.
 
 `make pending` lists them with line numbers.
 

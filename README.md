@@ -111,7 +111,16 @@ and which is not yet explained.
   context 512 and 0.730 at 1024 against a measured α of 0.768 — but not on wall clock, where γ=2
   trails γ=1 by 9% for a reason no amount of α touches: the engine prefills the prompt into both
   models, and that cost does not care what γ is.
-- **A llama.cpp baseline**, which needs a decision on how to obtain matching weights there.
+- **A llama.cpp baseline** — decided against, 2026-10-25. A relative speed figure is only as
+  informative as the program it is relative to, and establishing that llama.cpp runs bit-identical
+  weights (same model, same block quantization, same numbers) is difficult enough that a comparison
+  that could not be fully defended would be worse than none. The absolute argument is also stronger:
+  sitting within a few percent of what the hardware can do bounds how much faster *any*
+  implementation could be, which no pairwise comparison does.
+- **The full Spec-Bench evaluation.** The figures above use 8 prompts over 4 categories, plus 2
+  long-prompt questions, against the benchmark's 480 questions. The cost model's *mechanism* rests on
+  10 independent measurements and is solid, but its drafting-strategy selection is validated at three
+  operating points drawn from two prompt sets, and that needs the full set.
 - **The write-up**, section 12 of the plan.
 
 ## Layout
