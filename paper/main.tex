@@ -1,9 +1,8 @@
 %% What Speculative Decoding Costs on a CPU
 %%
-%% Draft. Build with `make` in this directory; see README.md for the toolchain and for the list of
-%% numbers still marked \pending. Every measured figure in this paper carries the context length and
-%% the machine state it was taken under, because on the hardware used here a figure without them is
-%% not a figure -- see Section~\ref{sec:method}.
+%% Build with `make` in this directory; see README.md for the toolchain. Every measured figure in
+%% this paper carries the context length and the machine state it was taken under, because on the
+%% hardware used here a figure without them is not a figure -- see Section~\ref{sec:method}.
 \documentclass[conference]{IEEEtran}
 
 \usepackage{cite}
@@ -15,9 +14,6 @@
 \usepackage{url}
 
 \graphicspath{{../results/figures/}}
-
-% A number that has not been measured yet. Every one of these is listed in README.md.
-\newcommand{\pending}[1]{\textcolor{red}{[#1]}}
 
 \begin{document}
 
@@ -43,10 +39,13 @@ monotonically from $1.23\times$ at $\gamma=1$ to $1.83\times$ at $\gamma=4$. We 
 from decoding to wall clock with a single term for the prompt pass, which speculative decoding pays
 for twice, and show that the extension needs no new free parameter: the draft's prompt pass costs the
 same fraction of the target's that its decode step does. The extended model predicts measured
-wall-clock speedup to 3.9\% mean absolute error over 29 runs and, unlike the decode-only model,
-correctly selects the better of two drafting strategies in all ten cases where they are compared,
-including both of the reversals in which a drafter that accepts less than half as often nonetheless
-wins the clock.
+wall-clock speedup to 1.2\% mean absolute error across all 480 questions of Spec-Bench from a
+single pooled parameter per method, and, unlike the decode-only model, selects the better of two
+drafting strategies in five of six categories. The reversal it captures --- a drafter that accepts
+less than half as often nonetheless winning the clock --- turns out to be the common case rather
+than a corner: over the whole benchmark speculative decoding is $1.11\times$ on decoding but
+$0.98\times$ on the clock, and prompt lookup, which runs no model at all, is the only method we
+measure above parity.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -262,7 +261,7 @@ We are more confident in the direction than the magnitude. $c$ is monotonic in c
 we have taken, in this session and in two earlier ones. The magnitude of $v(2)$'s context dependence
 is not pinned: the two passes of this session read spreads of $1.04\times$ and $1.18\times$ across the
 same four contexts, so long-context $v(k)$ is the noisy half of the table. A second machine would
-settle this \pending{second-machine replication}.
+settle it; we report the direction as established and the magnitude as provisional.
 
 \subsection{$v(k)$ selects $\gamma$; assuming $v=1$ selects wrong}
 \label{sec:gamma}
@@ -271,7 +270,10 @@ Table~\ref{tab:gamma} gives the measured sweep against both models.
 
 \begin{table}[t]
 \caption{Measured speedup by $\gamma$, against the model with measured $v(k)$ and the classic model
-with $v = 1$. Each $\gamma$ visited in two orders; decode figures are the average.}
+with $v = 1$. Each $\gamma$ visited in two orders; decode figures are the average. Measured on an
+eight-prompt subset over four categories, \emph{not} the full benchmark, which is why the
+$\gamma=1$ row reads above Table~\ref{tab:full}'s $1.113$ and $0.984$: the subset contains no
+long-prompt category. Section~\ref{sec:limits} treats this as a limitation of the sweep.}
 \label{tab:gamma}
 \centering
 \begin{tabular}{@{}rrrrrr@{}}
@@ -297,6 +299,13 @@ $1.06\times$ on decoding and $0.95\times$ on the clock, which is slower than not
 The practical consequence is the selection, not the correction. $\gamma=1$ is the best available
 choice, and it is the choice the measured model makes. The classic model's maximum is at $\gamma=3$,
 where this engine loses.
+
+The absolute figures in this table are higher than the benchmark-wide ones in
+Table~\ref{tab:full} because they come from a subset with no long-prompt category, as the caption
+notes. What the table is used for here is the \emph{ordering} of $\gamma$ and the size of the $v=1$
+error, both of which are internal comparisons within one prompt set and are unaffected by its
+composition. The claim that does inherit the subset's bias --- that $\gamma=1$ is the best setting
+benchmark-wide --- is flagged in Section~\ref{sec:limits}.
 
 \begin{figure}[t]
 \centering
@@ -339,8 +348,11 @@ $0.236$) for the model draft, against $c = 0.182$ at context 128 rising to $0.24
 draft's prompt pass costs about the same fraction of the target's that its decode step does, so
 \eqref{eq:wall} is evaluable from quantities~\eqref{eq:vk} already needs.
 
-Scored against the whole benchmark --- 480 questions, 2240 turns, six categories at $\gamma=1$ ---
-\eqref{eq:wall} predicts all 18 category-method pairs to \textbf{1.20\% mean absolute error} from a
+Table~\ref{tab:full} gives the whole benchmark: 480 questions, 2240 turns, six categories at
+$\gamma=1$. Speculative decoding is $1.113\times$ on decoding and $0.984\times$ on the clock, so on
+the measurement a user actually waits for \emph{it loses}, and prompt lookup at $1.016\times$ is the
+only method above parity. Scored against that table, \eqref{eq:wall} predicts all 18
+category-method pairs to \textbf{1.20\% mean absolute error} from a
 single pooled $k$ per method: $+0.203$ for a model draft, $+0.008$ for prompt lookup, and $+0.204$ for
 early stopping. Per method the error is $0.79\%$ for speculation, $0.87\%$ for early stopping and
 $1.94\%$ for lookup, whose worst case --- $6.99\%$ at multi-turn --- is the only entry in the table
@@ -358,7 +370,45 @@ where its two predictions differ by $0.9\%$ and the model resolves a near-tie th
 Section~\ref{sec:limits} returns to it. Table~\ref{tab:reversal} shows the same reversal on three
 smaller operating points, where it predicts the winner at all of them.
 
-Those three points come from two prompt sets, not three: the four-category rows and the short row are
+\begin{table*}[t]
+\caption{All 480 Spec-Bench questions (2240 turns) at $\gamma=1$, by category, ordered by the
+target's prefill share $f$. Decode speedup is over the target's decode phase alone; wall is over the
+whole call, prompt pass included. Bold marks the best wall-clock method in each row. The winner is
+monotonic in $f$: above $f \approx 0.37$ it is prompt lookup, the drafter that runs no model and
+loses on decoding everywhere. Aggregate acceptance is $\alpha = 0.717$ at 1.713 tokens per target
+forward pass.}
+\label{tab:full}
+\centering
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+& & \multicolumn{2}{c}{speculative} & \multicolumn{2}{c}{prompt lookup}
+& \multicolumn{2}{c}{speculative + stop} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
+category & $f$ & decode & wall & decode & wall & decode & wall \\
+\midrule
+qa            & 0.053 & 1.098 & 1.058 & 1.019 & 1.002 & 1.116 & \textbf{1.072} \\
+math          & 0.136 & 1.215 & \textbf{1.140} & 1.075 & 1.053 & 1.214 & 1.138 \\
+multi\_turn   & 0.309 & 1.146 & 1.015 & 1.028 & \textbf{1.093} & 1.143 & 1.016 \\
+translation   & 0.489 & 1.174 & 0.973 & 0.992 & \textbf{0.994} & 1.171 & 0.970 \\
+summarization & 0.617 & 1.041 & 0.895 & 1.002 & \textbf{1.000} & 1.050 & 0.899 \\
+rag           & 0.659 & 1.068 & 0.898 & 1.022 & \textbf{0.987} & 1.075 & 0.894 \\
+\midrule
+all           & 0.445 & 1.113 & 0.984 & 1.015 & \textbf{1.016} & 1.120 & 0.988 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.76\textwidth]{prefill_crossover.png}
+\caption{Wall-clock speedup against the target's prefill share, by Spec-Bench category, with
+\eqref{eq:wall}'s predictions alongside. The categories are ordered by a quantity nobody tuned, the
+crossing falls near $f = 0.37$, and the single mis-called category (\texttt{multi\_turn}) is the one
+place a measured series departs from its prediction.}
+\label{fig:crossover}
+\end{figure*}
+
+Figure~\ref{fig:crossover} draws it. Those three points come from two prompt sets, not three: the four-category rows and the short row are
 the \emph{same eight prompts} at different generation lengths (152 against 54 tokens a turn), which
 is a legitimate way to vary $f$ --- the prefill share is what the model claims decides this --- but it
 is a weaker test than distinct prompt distributions would be. The six categories above are that
@@ -427,18 +477,35 @@ step      & 73.29 & 85.11 & 98.97 \\
 \section{Limitations}
 \label{sec:limits}
 
-\textbf{A small evaluation.} The Spec-Bench subset used here is eight prompts over four categories
-(ten turns, 1520 generated tokens) plus two long-prompt questions, against the benchmark's 480
-questions. The wall-clock model's strategy selection is validated at three operating points drawn
-from two prompt sets, and eight of its ten correct predictions are the same eight prompts at
-different $\gamma$, so they are not independent samples. The mechanism behind~\eqref{eq:wall} rests
-on ten independent measurements of $k$ and is solid; the strategy-selection claim needs the full
-benchmark \pending{full Spec-Bench evaluation}.
+\textbf{The $\gamma$ sweep rests on a subset we have ourselves discredited.} The headline figures and
+the wall-clock model are measured on all 480 questions. Table~\ref{tab:gamma} is not: $\gamma=1$ is
+the full benchmark, while $\gamma = 2, 3$ and $4$ are an eight-prompt subset over four categories.
+That subset is precisely the one whose composition we show to be misleading --- it contains no
+\texttt{rag} or \texttt{summarization}, reads $1.19\times$ where the full benchmark reads
+$1.11\times$, and overstates wall clock by $0.09\times$. So the claim that $\gamma=1$ is the best
+setting sets one well-measured point against three poorly-measured ones. We expect it to survive,
+because the decode-side argument for it runs through $v(k)$ and $\tau(\gamma)$ rather than through
+composition, and because the wall-clock penalty for a larger $\gamma$ can only grow as the prefill
+share does. But we have not measured it, and we would rather name that than let the table imply we
+had.
 
 \textbf{One machine.} Every number here comes from one laptop. $v(k)$'s shape should depend on the
-ratio of memory bandwidth to arithmetic throughput, and a machine with more bandwidth per core should
-show a \emph{steeper} $v(k)$; that is a falsifiable prediction we have not yet tested
-\pending{second-machine replication}.
+ratio of arithmetic throughput to memory bandwidth, and a kernel that spends more arithmetic per
+token should show a \emph{steeper} $v(k)$; that is a falsifiable prediction we have not tested.
+Testing it does not strictly require different hardware --- the engine selects its kernel at runtime
+and can be forced onto a slower path on the same machine, holding memory traffic fixed while
+changing only compute cost --- and that experiment is the cheaper half of the replication this paper
+needs.
+
+\textbf{One mis-called category.} Of the six categories, \eqref{eq:wall} predicts the wall-clock
+winner in five. It misses \texttt{multi\_turn}, where prompt lookup measures $1.093\times$ against a
+predicted $1.017\times$: a $7.0\%$ underprediction and the only error in the table above $2.3\%$. The
+miss sits immediately above the crossing, where the two predictions differ by $0.9\%$, so the model
+resolves a near-tie the wrong way rather than mistaking the regime --- but the error is one-sided and
+has a plausible mechanism we have not tested. \texttt{multi\_turn} is the only category whose second
+turn can copy from the model's \emph{own first answer}, which should raise lookup's acceptance above
+what its first-turn decode speedup implies. Scoring the two turns separately would settle it, and the
+stored per-turn records already allow it.
 
 \textbf{No external baseline, by choice.} We compare the engine against measured hardware limits
 rather than against another implementation. This is a deliberate decision rather than an omission:
@@ -450,7 +517,11 @@ wants the relative figure will not find it here.
 context the engine runs at, puts distillation to $\alpha = 0.85$ at about $+0.08\times$ on decoding,
 and the crossover at which two guesses beat one falls inside reach at 0.818 (context 512) and 0.730
 (context 1024) against the measured 0.768 --- but $\gamma=2$ trails $\gamma=1$ by 8.9\% on the clock
-for a reason no amount of $\alpha$ touches \pending{distilled draft}.
+for a reason no amount of $\alpha$ touches. Inverting~\eqref{eq:wall} at the measured $f = 0.445$ and
+$k = 0.203$ puts wall-clock parity for a model draft at a decode speedup of $1.152\times$, only
+$+0.04\times$ above the $1.113\times$ measured here, so that $+0.08\times$ would clear parity with
+roughly a factor of two to spare while being worth about $+0.03\times$ on the clock itself. It is the
+only lever we quantify that crosses parity at all, and it is untested.
 
 \textbf{Unexplained absolute shift.} The 13\% step-time difference between sessions noted in
 Section~\ref{sec:method} is reproducible and unexplained. It does not affect $v(k)$, $c$ or $o$, all
@@ -485,9 +556,9 @@ all.
 
 \section*{Artifacts}
 
-The engine, the measurement scripts, the stored results with their machine conditions, and the test
-suite are available at \pending{repository URL}; a tagged release with a DOI will accompany
-publication \pending{Zenodo DOI}.
+The engine, the measurement scripts, the stored results with the machine conditions they were taken
+under, the figures in this paper and the test suite that checks every number quoted here against the
+stored results are available at \url{https://github.com/asood8/draft-model}.
 
 \bibliographystyle{IEEEtran}
 \bibliography{refs}

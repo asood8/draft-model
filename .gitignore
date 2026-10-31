@@ -25,3 +25,16 @@ Thumbs.db
 
 # Someone else's dataset, fetched by scripts/fetch_specbench.py
 data/spec_bench/
+
+# LaTeX build products. main.pdf is deliberately NOT ignored: the compiled paper is
+# published from this repository, so it is a tracked artifact rather than build output.
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.spl
+paper/*.toc
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz

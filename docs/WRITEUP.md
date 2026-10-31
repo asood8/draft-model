@@ -1,8 +1,16 @@
 # What speculative decoding costs on a CPU
 
-*Draft, 2026-10-24. Numbers in square brackets are not yet measured; everything else carries the
-context and the machine conditions it was taken under, because on this hardware a figure without
-them is not a figure (see "Measuring on a laptop" below).*
+*Draft, 2026-10-24. Everything here carries the context and the machine conditions it was taken
+under, because on this hardware a figure without them is not a figure (see "Measuring on a laptop"
+below).*
+
+> **Superseded in part, 2026-10-27.** The headline figures below were measured on an eight-prompt
+> subset of Spec-Bench. All 480 questions have since been run, and the result changed: speculative
+> decoding is **1.11x on decoding and 0.98x on the wall clock**, where the subset read 1.19x and
+> 1.07x. The difference is the subset's composition, not the engine -- it contained neither of the
+> two long-prompt categories. The per-subset tables below remain accurate *for their subsets* and
+> are kept because the mechanism they establish is unchanged, but the benchmark-wide numbers are in
+> [the paper](../paper/main.pdf), which supersedes this document as the thing to quote.
 
 ## The claim this started from
 
@@ -294,9 +302,18 @@ invalid numbers, which is why results are now named by the conditions they were 
 
 A from-scratch C++ CPU inference engine for Qwen3 reaching 88.7% of its machine's memory-bandwidth
 ceiling and 95–105% of the AVX-VNNI issue-rate peak, used to measure the term the standard
-speculative-decoding speedup formula assumes away. Measured, that term picks one draft token a round
-and delivers **1.20× on decoding, 1.07× on the wall clock, at context 512**. Assumed away, it
-picks three and promises 1.69×, where the engine measures 0.95× — slower than not speculating. The
-cost model predicts the engine to within 2–7% once v(k) and c are measured at the context being used,
-which is the practical form of the result: **on a CPU, the configuration is chosen by the cost of
-verification, not by the acceptance rate.**
+speculative-decoding speedup formula assumes away. Measured, that term picks one draft token a
+round; assumed away, it picks three and promises 1.69×, where the engine measures 0.95× — slower
+than not speculating.
+
+Over all 480 Spec-Bench questions that configuration delivers **1.11× on decoding and 0.98× on the
+wall clock**. The second number is below parity, and the reason is not the decode loop: the engine
+prefills the prompt into both models, and **44.5% of the clock is that prompt pass**. Prompt lookup,
+which drafts by copying from earlier text and runs no model at all, is the only method measured
+above parity, at 1.016× — despite losing on decoding everywhere. Which of the two wins is
+**monotonic in the prompt pass's share of the clock** across six categories, and the cost model,
+extended with one term for that share and no new free parameter, predicts all 18 category-method
+pairs to 1.2%.
+
+That is the practical form of the result: **on a CPU the configuration is chosen by the cost of
+verification and the size of the prompt pass, not by the acceptance rate.**

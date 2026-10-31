@@ -118,7 +118,10 @@ def main() -> None:
     args = parser.parse_args()
 
     problems = check(args.tex, args.bib)
-    pending = len(re.findall(r"\\pending\{", args.tex.read_text(encoding="utf-8"))) - 1  # minus def
+    # Uses of \pending, not counting the \newcommand that defines it -- which is itself gone once
+    # the last marker is resolved, so subtracting a definition unconditionally would report -1.
+    source = args.tex.read_text(encoding="utf-8")
+    pending = len(re.findall(r"\\pending\{", source)) - source.count(r"\newcommand{\pending}")
 
     hard = [p for p in problems if "harmless" not in p]
     for p in problems:

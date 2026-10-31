@@ -17,6 +17,17 @@ speedup(γ) = τ(γ) / (γ·c + v(γ+1)),    τ(γ) = (1 − α^(γ+1)) / (1 −
 v(k) is the cost of verifying k tokens in a single pass. The standard formula sets v(k) = 1; this
 project measures it. See [PLAN.md](PLAN.md) for the full plan and the open questions.
 
+## The paper
+
+**[What Speculative Decoding Costs on a CPU: Measuring the Verification Term](paper/main.pdf)** is
+the write-up: the cost model, the measurements behind it, and what it still cannot account for. The
+source is in [`paper/`](paper/), its figures are generated from the stored results by
+`scripts/make_plots.py`, and every number it quotes in prose is checked against `results/` by
+`tests/test_documented_numbers.py` rather than by rereading.
+
+It is published here rather than at a preprint server, which keeps the text, the figures, the raw
+measurements and the tests that tie them together at one revision.
+
 ## What works now
 
 | Piece | State |
@@ -134,7 +145,6 @@ and which is not yet explained.
 - **A γ sweep on the full benchmark.** γ=1 is now measured on all 480 questions; γ=2, 3 and 4 are
   still the 8-question subset, so the claim that γ=1 is the best choice rests on the subset for the
   comparison even though its own value is now solid.
-- **The write-up**, section 12 of the plan.
 
 ## Layout
 

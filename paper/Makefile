@@ -2,7 +2,7 @@
 #
 #   make          build main.pdf
 #   make check    structural checks that do not need a toolchain
-#   make clean    remove build products
+#   make clean    remove intermediates (NOT main.pdf, which is a tracked artifact)
 
 LATEX ?= pdflatex
 BIBTEX ?= bibtex
@@ -14,14 +14,10 @@ main.pdf: main.tex refs.bib
 	$(LATEX) -interaction=nonstopmode -halt-on-error main.tex
 	$(LATEX) -interaction=nonstopmode -halt-on-error main.tex
 
-.PHONY: check clean pending
+.PHONY: check clean
 
 check:
 	$(PYTHON) check.py
 
-# Every number still to be measured, so the draft can be swept for them.
-pending:
-	@grep -n '\\pending{' main.tex | grep -v newcommand
-
 clean:
-	rm -f main.pdf main.aux main.bbl main.blg main.log main.out main.spl
+	rm -f main.aux main.bbl main.blg main.log main.out main.spl
