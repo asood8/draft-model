@@ -226,3 +226,8 @@ python scripts/export_model.py models/Qwen3-0.6B --format q4
 python scripts/bench_engine.py models/Qwen3-0.6B-q4.sdm --quick
 python scripts/measure_vk.py models/Qwen3-0.6B-q4.sdm
 ```
+
+## License
+
+[MIT](LICENSE). The Qwen3 weights are Alibaba's and carry their own licence; Spec-Bench is its
+authors' and is fetched rather than vendored.
