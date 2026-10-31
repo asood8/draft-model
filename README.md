@@ -28,7 +28,7 @@ project measures it. See [PLAN.md](PLAN.md) for the full plan and the open quest
 | Speculative decoding | Inside the engine; greedy output matches plain decoding token for token |
 | Prompt lookup drafting | Copies from earlier text, needs no model work, output still exact |
 | Distillation pipeline | Five losses, a trainable draft, the training loop and the data pipeline, tested end to end on a miniature model |
-| 939 tests | Statistical, bit-exactness and end-to-end |
+| 944 tests | Statistical, bit-exactness and end-to-end |
 
 ## Measured so far
 
@@ -115,7 +115,12 @@ and which is not yet explained.
   is budgeted in section 11.7 of the plan. The full-benchmark result raises its value: speculation
   now loses on wall clock at α = 0.717, so a distilled draft is what would bring it back above
   parity rather than merely improving on it. Recomputed at the context the engine is evaluated at,
-  distillation is worth about +0.08× on decoding rather than the +0.25× estimated earlier. It could
+  distillation is worth about +0.08× on decoding rather than the +0.25× estimated earlier -- and
+  the cost model says parity on the clock needs only **+0.04× on decoding** at the measured prefill
+  share, so that prize clears the bar with about a factor of two to spare. It is worth far less on
+  the clock than on decoding, roughly +0.03×, because 44.5% of the clock is a prompt pass that no
+  amount of draft quality touches; it is nonetheless the only lever measured here that crosses
+  parity at all. It could
   now move the best γ on decoding, since the crossover where two guesses beat one fell to 0.818 at
   context 512 and 0.730 at 1024 against a measured α of 0.768 — but not on wall clock, where γ=2
   trails γ=1 by 9% for a reason no amount of α touches: the engine prefills the prompt into both
@@ -137,7 +142,7 @@ and which is not yet explained.
 engine/      C++: weights file, forward pass, kernels, thread pool, sampling, the round loop
 python/      reference model, quantization twin, export, offline metrics, distillation
 scripts/     fetch, export, benchmark, measure v(k), generate data, train
-tests/       939 tests, all runnable on a CPU
+tests/       944 tests, all runnable on a CPU
 results/     measurements, as JSON
 ```
 

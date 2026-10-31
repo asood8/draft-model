@@ -12,6 +12,7 @@ their own. Section 17 tracks decisions and open questions.
 
 | Date | Where things stand |
 |---|---|
+| 2026-10-27 | **The whole of Spec-Bench -- 480 questions, 2240 turns, four methods, no failures -- and the headline falls below parity: speculative decoding is 1.113x on decode and 0.984x on the clock, where the 8-question subset read 1.193x and 1.073x.** Run in 16 resumable chunks from 2026-10-26 08:13 to 2026-10-27 12:24 at gamma=1. **The difference is the benchmark's composition, not the engine.** The subset held no `rag` and no `summarization`, the two long-prompt categories, whose prefill shares are **0.659 and 0.617** against the subset's 0.272; weighted over the real benchmark the target's prefill share is **0.445**, and a second prompt pass cannot be repaid out of a decode phase that is barely half the clock. Full table: `speculative` **1.1132 decode / 0.9839 wall**, `lookup` 1.0149 / **1.0161**, `speculative+stop` 1.1198 / 0.9875, at **alpha = 0.7166** and **1.7128 tokens a target forward pass**. **Prompt lookup is the only method measured above parity on the clock** -- the method that loses on decode in every run ever taken here -- which is §3.1's prediction arriving as a result rather than a derivation. **The per-category wall-clock winner is monotonic in prefill share**, over six categories measured independently: qa (f = 0.053) `speculative+stop` 1.072, math (0.136) `speculative` 1.140, multi_turn (0.309) `lookup` 1.093, translation (0.489) `lookup` 0.994, summarization (0.617) `lookup` 1.000, rag (0.659) `lookup` 0.987. Speculation ranges **1.140x on math down to 0.894x on summarization**. **The wall-clock model got sharper on real data, not looser.** k measures **+0.2030** for a model draft, **+0.0075** for lookup -- zero within noise, as a drafter that runs no model requires -- and +0.2036 for early stopping, and equation (1) predicts all 18 category-method pairs to **1.20% mean absolute error** from one pooled k per method. Six per-category k values do *worse*, at 1.38%, which is the useful way round: one parameter covering six workloads beats six fitted ones, so (1) is a model and not a curve fit. It picks the winner in **5 of 6** categories; the miss is multi_turn, where lookup measures 1.093 against 1.017 predicted, **-7.0%**, the only error above 2.3% and the one lead worth chasing. Aggregate break-even is **f\* = 0.300** against a measured f of 0.445, which is the same statement as lookup winning overall. **A comparability check earned its keep.** Target decode rose from 13.31-13.61 tok/s over chunks 1-10 to **14.32-14.48 over chunks 11-16, 7.3% faster with non-overlapping ranges**, so the run spans two machine states and **absolute tok/s from it must not be quoted**. The speedups survive: split-half gives 1.0865 decode / 0.9909 wall over chunks 1-10 against 1.1043 / 0.9779 over 11-16, agreeing to **1.3-2.4%**, because every speedup is a ratio of methods measured inside one chunk -- the §13 rule holding up under exactly the change it was written to survive. **What I had wrong:** I estimated twelve hours from the subset and it took **15.2**, because the subset held no `rag` or `summarization`, which decode at 5-6 tok/s against ~13; and I smoke-tested the driver with `--chunk-size 1` thinking it meant one chunk, when it means one question a category a chunk -- 80 chunks, the whole benchmark -- and started a long run on the machine by accident, so the driver now prints its plan in questions before it measures anything. The fitness gate refused the machine **three times** (5.027 and 6.663 µs a job, both settling under 0.9 after ~15 minutes; a third read 1.441 and passed), and the harness reaped the run once at chunk 8 for memory pressure with all seven finished chunks intact. **Still open:** gamma = 2, 3 and 4 are still 8-question-subset figures, so the claim that gamma=1 is best now sets a 480-question measurement against three subset ones. |
 | 2026-10-25 | **Three of the four stored γ figures were wrong, because the sweep they came from was confounded by its own visit order -- and the short-context step time really has regressed 13%, which four wrong guesses had kept me from accepting.** This is the first session in which every number comes from one machine state: read bandwidth drifted **40.19 to 40.14 GB/s, 0.12%**, across eight v(k) runs, eight Spec-Bench runs, two stage sweeps and 900 tests, with the dispatch probe reading better at the end (1.192 µs) than the start (1.474) and zero page-ins throughout. **v(k) reproduces 2026-10-04** at context 128 -- v(2) 1.130/1.120 against 1.122, v(4) 1.616/1.632 against 1.636, c 0.182 against 0.186, o 0.00707/0.00729 against 0.00712 -- which kills the 2026-10-24 reading that the curve had flattened, exactly as that row suspected it would. **The γ sweep was order-confounded:** `results/specbench_gamma{1..4}.json` ran strictly ascending and back to back at 01:38:38, 01:41:31, 01:44:15 and 01:47:01, so every larger γ inherited the heat of the runs before it. Re-measured with the order cancelled, γ=1 reproduces to within 1.6% while γ=2 reads **+19.1%**, γ=3 **+11.6%** and γ=4 **+11.3%**. The corrected sweep is **1.193, 1.200, 1.062, 0.982 on decode and 1.073, 0.986, 0.951, 0.844 on wall clock**: γ=1 is still the right choice, but *on wall clock* -- **on decode γ=1 and γ=2 are tied**, and in each pass whichever γ ran first won it, which is the order effect shown directly rather than argued. **α is 0.768, not 0.736**, matching 2026-10-24's partial sweep to three decimals, so two sessions agree. The cost model predicts the corrected sweep to **5.0% mean error** at context 512 and 5.6% at 2048, so the 2-7% claim holds against a sweep that is no longer confounded; **v(k)=1 overshoots by 1.23x at γ=1 rising to 1.83x at γ=4**, predicting 1.79x at γ=3 where the engine measures 1.062x. The central claim is therefore intact and better supported, but the line about γ=3 being *slower than not speculating* now holds only on wall clock or at γ=4. **Attention is 1.27x, 1.60x, 1.87x and 2.15x faster** at contexts 128/512/1024/2048, against the "at least 1.65x" §13 could previously claim from a comparison it withdrew; the step total follows at 1.04x, 0.97x, 0.95x and **0.86x**, so the rewrite costs 4% at short context and buys **14% at 2048**. **The regression is real at short context and is not the machine.** A slower machine is slower everywhere, and tonight is *faster* at 1024 and 2048, so the busy-machine story is finished -- but the step at context 128 genuinely went **64.1 to 72.6 ms, 13.3%**, and it is corroborated on both sides: 2026-10-04 measured it twice independently, `bench_engine` at 15.59 tok/s = 64.13 ms with share_of_ceiling 0.8869 and `measure_vk` at 64.10 ms, agreeing to **0.05%**, while tonight `measure_vk` reads 72.62/73.06 and the stage timer 73.29/74.14. I had first called that baseline a cherry-picked low reading, on the grounds that the 2026-10-04 stage timer said 70.32 ms -- **wrong, and the fifth bad guess about this gap**: I argued from two harnesses when that day ran three, and the instrumented one reading high is what instrumentation does. What stays unexplained is boxed in on three sides: not bandwidth (40.19 GB/s, the highest yet recorded), not the clock (`o` is an absolute cost of non-streaming work, unchanged at 0.00707/0.00729 against 0.00712), and not 13% of code (the rebuilt `e33a0b6` A/B put head/base at 0.975). It is spread over the weight-streaming stages -- qkv 1.12x, output 1.10x, gate_up 1.05x, attn_out 1.05x, ffn_down 0.98x -- with no single culprit, and I am leaving it there rather than guessing a sixth time. The crossover α where two guesses overtake one fell from **0.864 to 0.818** at context 512 and to **0.730-0.732** at contexts 1024 and 128, so it now **straddles the measured α = 0.768** rather than sitting out of reach, which is the same statement as γ=1 and γ=2 being measured as tied. New finding: **confidence-based early stopping is what makes a larger γ survivable** -- plain speculative drops below parity on wall clock as soon as γ=2 (0.986), where `speculative+stop` holds **1.049 at γ=2 and 1.011 at γ=3** and posts the sweep's best decode figure at γ=1 (1.201). **900 tests pass**, including all 40 slow ones, in 2m34s. |
 | 2026-10-24 | **The sampling path is worth 4.9-6.0x and attention is 12% off its floor, but the machine was too busy to re-measure v(k) -- and finding that out cost most of the night.** The vectorized softmax had been asserted, never measured; against a `softmax_scalar` baseline kept the way `argmax_scalar` is, alternating in one process, it is **4.86x at a 129-element row, 5.70x at 2049, 6.00x over the 151,936 vocabulary**. Per decode step: **0.549 ms a token at context 128, 8.894 ms at 2048** over 1152 attention rows, plus 0.587 ms a sampling warp. It is more accurate as well -- the scalar row sums to 1.00010138 against 0.99999996 -- so the usual trade did not apply. argmax reconfirmed at 9.16x. `bench_attention` at context 2048 puts the shipped shape at **9.91 ms against an 8.88 ms scan floor, 12% off**, so the remaining attention headroom is ~1% of a step and **not worth the risk to the chunk-order invariant**; the same table reproduces the 1.35x from chunking a second way, since `scan` gets *worse* when split (34.0 to 19.5 GB/s) while `grouped` goes 18.1 to 30.5. **What failed:** a v(k) sweep run straight after ten calls of the fitness probe, contexts ascending, reported **v(2) = 0.97** -- two tokens verified for less than one -- with the error decaying in run order (1.73x, 1.16x, 0.99x, 1.05x). Cool and descending it was monotonic, but per-stage timers then showed every weight-streaming stage 1.05-1.25x above 2026-10-05 while **attention, the only stage whose code changed, was unchanged at 1.43 ms against 1.50**: which I read as a slower clock -- **wrong, and corrected on 2026-10-25**: bandwidth was 39.0 GB/s then and 40.19 on the quiet retest, `o` is an absolute cost of non-streaming work and did not move, and the step is *faster* at long context, so no uniform slowdown accounts for it; the long-context half is the attention rewrite, and the short-context half is a real 13.3% that remains unexplained. Since v(k) is a ratio, an inflated pass(1) flattens the curve for free, so "v(k) no longer depends on context" is **not** established. Three wrong calls of my own, all caught by measurement: heat blamed for the probe's drift (ten calls are under 100 ms of spinning), the shared softmax blamed for the 13 ms (it saves 8.9), and a pass(5) cliff read as a kernel tiling boundary (it was thermal and vanished). The invalid run also **overwrote three 2026-10-05 result files**, recovered from git; results are now named by the conditions they were taken under, with `results/README.md` saying which are comparable. Items left for a quiet machine: the v(k) table, the γ sweep that depends on it, and the suite, which the harness reaped mid-run for memory -- **all three done on 2026-10-25**, which reproduced the v(k) table, found the stored γ sweep confounded by its own visit order, and passed 900 tests. |
 | 2026-10-04 | **v(k) decides γ, measured: the original formula would have picked γ=3 and lost 21%.** A γ sweep on Spec-Bench, each run re-measuring its own baseline: γ=1 gives **1.20x on decoding**, then 1.01x, 0.95x, 0.88x. Assuming v = 1 predicts 1.69x at γ=3, where this engine measures 0.95x -- slower than not speculating. Best γ is 1, which is where v(k) says it is, so the term this project adds is not a correction but the thing that chooses the configuration. The cost model predicts the engine **to within 2-7%** once v(k) and c are measured at the context being run at: v(2) goes 1.12 to 1.46 and c goes 0.186 to 0.268 between context 128 and 2048, which is a rule worth more than the numbers -- **v(k) is a function of context**. By 2k context speculation stops paying at all (1.01x predicted), which is the quantitative form of the 0.95x measured on rag and summarization. The cause is attention: flat matmuls but attention going 1.50 to 26.88 ms a token between context 128 and 2048, **27% of the step**, reading the KV cache at 11.3 GB/s where the machine streams 39.8. That is the next thing to fix, after a micro-benchmark says why -- two guesses today were wrong when measured. Also found by accident: asking for more threads than the selection has cores collapses decoding 5.6x, since spinning workers fight over a core rather than share it; the pool now clamps. 841 tests pass. |
@@ -391,27 +392,50 @@ prompt pass. And the model draft's 0.183 sits on top of **c, which is 0.182 at c
 2048** -- the draft's prompt pass costs the same fraction of the target's as its decode step does. So (1)
 evaluates from quantities section 3 already measures, and adds no measurement burden.
 
-Scored against every usable Spec-Bench run -- four gammas × two passes, plus the short and long prompt sets,
-29 method-runs in all:
+**Scored on the whole benchmark, 2026-10-27: 480 questions, 2240 turns, six categories at γ=1.** k is
+measured at **+0.2030** for a model draft, **+0.0075** for lookup and +0.2036 for early stopping, and (1)
+predicts every category-method pair from them:
 
-| method | mean abs. error | worst |
-|---|---|---|
-| `lookup` | 2.6% | 9.4% |
-| `speculative+stop` | 3.1% | 9.8% |
-| `speculative` | 6.0% | 12.7% |
-| **overall** | **3.9%** | 12.7% |
+| method | mean abs. error | worst | worst at |
+|---|---|---|---|
+| `speculative` | **0.79%** | 2.14% | qa |
+| `speculative+stop` | **0.87%** | 2.21% | qa |
+| `lookup` | 1.94% | 6.99% | multi_turn |
+| **overall, 18 points** | **1.20%** | 6.99% | multi_turn |
 
-At γ=1, the configuration this project recommends, plain speculative predicts to **+0.1% and −0.1%** across
-the two passes.
+Those use **one pooled k** per method across all six categories. Letting k vary per category -- six
+parameters in place of one -- makes the fit *worse*, at **1.38%** overall, which is the useful way round: k
+is close enough to constant across workloads that measuring it once beats measuring it six times, and that
+is what makes (1) a model rather than a curve fit.
 
-**What it buys.** Equation (1) picks the winning drafting strategy in **10 of 10** cases, including both
-reversals, which the decode-only model cannot do even in principle:
+The earlier scorecard, 29 method-runs over the two 8-prompt sets, read 3.9% overall and 12.7% worst. The
+full benchmark is **three times tighter** while being the harder test, because that error was concentrated
+in the γ = 2-4 runs and in the short set's systematic miss; at γ=1, which this project recommends and which
+the full run uses, the model was already predicting to ±0.1%.
 
-| prompt set | prefill share f | `lookup` | model draft | winner | (1) predicts |
-|---|---|---|---|---|---|
-| four-category subset | 0.272 | 1.021 | **1.073** | model | model |
-| short | 0.450 | **1.117** | 1.072 | lookup | lookup |
-| long | 0.875 | **0.972** | 0.818 | lookup | lookup |
+**What it buys.** Equation (1) picks the winning drafting strategy, which the decode-only model cannot do
+even in principle. On the full benchmark the measured winner is **monotonic in prefill share** across six
+categories that were never selected for this property, and (1) calls **5 of the 6**:
+
+| category | prefill share f | `lookup` | model draft | `+stop` | winner | (1) predicts |
+|---|---|---|---|---|---|---|
+| qa | 0.053 | 1.002 | 1.058 | **1.072** | model | model |
+| math | 0.136 | 1.053 | **1.140** | 1.138 | model | model |
+| multi_turn | 0.309 | **1.093** | 1.015 | 1.016 | lookup | model -- **miss** |
+| translation | 0.489 | **0.994** | 0.973 | 0.970 | lookup | lookup |
+| summarization | 0.617 | **1.000** | 0.895 | 0.899 | lookup | lookup |
+| rag | 0.659 | **0.987** | 0.898 | 0.894 | lookup | lookup |
+| **all** | **0.445** | **1.016** | 0.984 | 0.988 | lookup | lookup |
+
+The crossing falls between f = 0.136 and f = 0.309, and the one miss sits immediately above it: at
+multi_turn the two predictions are 1.017 and 1.026, a gap of 0.9%, so the model resolves a near-tie the
+wrong way rather than mistaking the regime. It is still a miss and it is still the largest error in the
+table.
+
+The earlier version of this table scored **10 of 10** over the two 8-prompt sets and their γ sweep. Those
+sets are kept below because they hold the only *reversal inside one prompt distribution* measured here, but
+their prefill shares -- 0.272, 0.450, 0.875 -- came partly from varying the generation length, where the six
+categories above vary the prompt itself, which is the quantity the model names.
 
 Setting the two predictions equal gives the break-even share at which a zero-cost drafter overtakes a model
 draft:
@@ -431,6 +455,26 @@ reports a break-even belonging to none of them. Per set, at γ=1:
 | short | 1.018 | 1.200 | **0.442** | 0.450 | lookup |
 | long | 0.973 | 0.949 | n/a | 0.875 | lookup |
 
+And per category on the full benchmark, where f varies over an order of magnitude rather than by a factor
+of three:
+
+| category | S_lookup | S_model | f\* | measured f | wins |
+|---|---|---|---|---|---|
+| qa | 1.019 | 1.098 | 0.260 | 0.053 | model |
+| math | 1.075 | 1.215 | 0.346 | 0.136 | model |
+| multi_turn | 1.028 | 1.146 | 0.330 | 0.309 | lookup |
+| translation | 0.992 | 1.174 | 0.435 | 0.489 | lookup |
+| summarization | 1.002 | 1.041 | 0.155 | 0.617 | lookup |
+| rag | 1.022 | 1.068 | 0.171 | 0.659 | lookup |
+| **all** | 1.015 | 1.113 | **0.300** | **0.445** | lookup |
+
+Every category lands on the correct side of its own break-even except multi_turn, which sits **0.021
+below** f\* = 0.330 and goes to lookup anyway -- the same near-tie as the table above, seen from the other
+side. And f\* is emphatically **not** a constant: summarization's is 0.155 because its two decode speedups
+are 1.002 and 1.041 and nearly equal speedups leave the prefill term deciding on its own, while
+translation's is 0.435 because a model draft is genuinely 1.17x there. Quoting a single threshold would
+misprice four of these six categories.
+
 The short set is the sharp test: its measured prefill share sits **0.008 above its own break-even**, and
 lookup wins there by 1.117 against 1.072. On the long set the question does not arise, because lookup is
 already ahead on decode (0.973 against 0.949) and so has no second prompt pass to repay.
@@ -439,9 +483,16 @@ So the practical rule to hand a reader is **measure your prefill share; above ab
 no prompt pass of its own wins, even though it accepts less than half as often** -- with the caveat that the
 threshold itself moves with acceptance and is worth computing rather than assuming.
 
-**Two limitations, both honest leads rather than noise.** The error grows with γ, to 12.7% at γ = 2-4, where
-at γ=1 it is 0.1%. And the short set is a systematic miss: all three methods underpredict there by 5.8-9.8%,
-in the same direction, which says something is wrong with f or with N on that set rather than with (1).
+**Limitations, all honest leads rather than noise.** The error grows with γ, to 12.7% at γ = 2-4 where at
+γ=1 it is 0.1-1.2%; (1) carries no γ-dependent prefill term and the prefill batch is tuned for γ=1, so this
+is expected, and it is not yet separable from the γ sweep's own subset problem. The short set is a
+systematic miss: all three methods underpredict there by 5.8-9.8% in the same direction, which says
+something is wrong with f or with N on that set rather than with (1). And on the full benchmark
+**multi_turn is the one mis-called category**: lookup measures 1.093 where (1) predicts 1.017, a 7.0%
+underprediction and the only error above 2.3%. The mechanism is plausible and untested -- multi_turn is the
+only category whose second turn can copy from the model's *own first answer*, which should lift lookup's
+acceptance above what its first-turn decode speedup implies -- and scoring the two turns separately would
+settle it, which the stored per-turn records already allow.
 
 ---
 
@@ -1792,9 +1843,27 @@ numbers that get published. So:
 
 ### 11.7 Grid (budget-aware)
 
-Sized against **one week of Kaggle's free quota, 30 GPU-hours**, and against a prize of about +0.06x
-(the note at the head of this section). The budget is spent on one corpus, a ranking stage that is
-deliberately short, and one curve.
+Sized against **one week of Kaggle's free quota, 30 GPU-hours**, and against a prize of about +0.08x on
+decode (the note at the head of this section; the +0.06x this line used to quote was the 2026-10-05 figure
+and was superseded on 2026-10-25). The budget is spent on one corpus, a ranking stage that is deliberately
+short, and one curve.
+
+> **Revalued 2026-10-27, and the case got stronger for a different reason.** The full Spec-Bench run puts
+> speculation at **0.984x on the clock** at the off-the-shelf alpha of 0.717, so a distilled draft is no
+> longer an improvement to something that already works -- it is what would carry a model draft **back
+> above parity**. The decode prize is unchanged at about +0.08x, and so is the caveat beside it: section
+> 11's head table is a decode table, gamma=2 trails gamma=1 by 8.9% on the clock, and the prefill cost
+> behind that does not care what alpha is.
+>
+> Equation (1) in §3.1 is what converts a decode gain into a wall-clock one, and it says **the gap to
+> parity is smaller than the prize**. Inverting (1) at the measured f = 0.445 and k = 0.203, a model draft
+> breaks even on the clock at a decode speedup of **1.152x** -- only **+0.038x** above the 1.113x measured
+> today. Distillation's +0.08x is about twice that, landing decode near 1.19x and the clock at **1.016x**
+> once (1) is calibrated on the measured point (it reads 1.7% low there, predicting 0.967 against 0.984).
+> The honest form of the claim is therefore not that distillation is worth a large wall-clock gain -- it is
+> worth about **+0.03x on the clock against +0.08x on decode**, because f = 0.445 of the clock is prefill
+> that no draft quality can touch -- but that it is the **only lever measured here that crosses parity at
+> all**, and it clears the bar with roughly a factor of two to spare rather than scraping it.
 
 | Stage | Runs | GPU-h | Purpose |
 |---|---|---|---|
@@ -2103,9 +2172,9 @@ If you'd rather do one thing at a time, run Milestone 5 after Milestone 4 and ad
    needs the Milestone 4 measurements of c and α to settle.
 3. **Primary compiler:** MSVC or clang-cl? Try both in Milestone 3 and keep the faster.
 4. **Distillation track:** in parallel with the engine (default), or after Milestone 4? *Answered by events:
-   it runs after, because the engine work landed first. Scope settled 2026-10-05 -- see 11.7, sized to one
-   week of quota against a recomputed prize of +0.06x. What is still open is only the long-context slice's
-   source.*
+   it runs after, because the engine work landed first. Scope settled 2026-10-05 and resized 2026-10-25 --
+   see 11.7, sized to one week of quota against a recomputed prize of +0.08x on decode, which §3.1 converts
+   to about +0.08x on the clock as well. What is still open is only the long-context slice's source.*
 5. **Stretch goals in scope:** vocabulary trimming, quantization-aware training, layer pruning, 8-bit draft KV
    cache, prompt lookup?
 6. **Weekly time budget:** adjust the milestones once Milestone 0 shows the real pace.

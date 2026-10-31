@@ -133,30 +133,6 @@ def mean_blob(blobs: list[dict]) -> dict:
     return out
 
 
-def mean_blob(blobs: list[dict]) -> dict:
-    """Average the shuffled passes of one measurement into the figure that should be drawn.
-
-    A single pass is not the number: 2026-10-25 ran every context and every gamma twice in different
-    orders precisely so that drift could not masquerade as the effect, and the average over the
-    passes is what PLAN.md quotes.
-    """
-    out = dict(blobs[0])
-    n = len(blobs)
-    for key in ("c", "target_step_seconds", "draft_step_seconds"):
-        vals = [b[key] for b in blobs if isinstance(b.get(key), (int, float))]
-        if vals:
-            out[key] = sum(vals) / len(vals)
-    if all("v" in b for b in blobs):
-        keys = set(blobs[0]["v"])
-        out["v"] = {k: sum(float(b["v"][k]) for b in blobs) / n
-                    for k in keys if all(k in b["v"] for b in blobs)}
-    overheads = [b.get("overhead", {}).get("o_per_round") for b in blobs]
-    if all(isinstance(o, (int, float)) for o in overheads):
-        out["overhead"] = dict(blobs[0].get("overhead", {}))
-        out["overhead"]["o_per_round"] = sum(overheads) / n
-    out["passes_averaged"] = n
-    return out
-
 def measured_runs(results: Path, pattern: str | None = None) -> list[dict]:
     """Spec-Bench runs that form a gamma sweep, newest-sorted, with the numbers to compare.
 
@@ -479,6 +455,126 @@ def plot_predicted_vs_measured(results: Path, out: Path) -> None:
            "Does the cost model predict the engine?")
 
 
+FULL_BENCHMARK = "specbench_full/specbench_full_gamma*.json"
+
+
+def full_benchmark(results: Path) -> list[tuple[Path, dict]]:
+    """The merged whole-benchmark runs, which live in their own directory.
+
+    They are kept apart from the sweep files on purpose. A merged run is 480 questions pooled from 16
+    chunks measured over 28 hours, so its *ratios* are quotable -- every speedup is a ratio of methods
+    measured inside one chunk -- while its absolute rates are not, because the machine sped up 7.3%
+    between chunk 10 and chunk 11. Nothing here reads an absolute rate.
+    """
+    found = []
+    for path in sorted(results.glob(FULL_BENCHMARK)):
+        blob = load(path)
+        if blob is not None and "speedups" in blob and "decode_speedups" in blob:
+            found.append((path, blob))
+    return found
+
+
+def plot_full_benchmark(results: Path, out: Path) -> None:
+    """Per category on all 480 questions, both speedups, categories ordered by prefill share.
+
+    Ordering the x axis by prefill share rather than alphabetically is the whole point of the figure:
+    it turns the claim "the winner is monotonic in prefill share" into something a reader checks by
+    looking, instead of taking on trust from a table.
+    """
+    for path, blob in full_benchmark(results):
+        decode, wall = blob["decode_speedups"], blob["speedups"]
+        summary = blob.get("summary", {}).get("target", {})
+        categories = [c for c in decode[next(iter(decode))] if c != "all"]
+        shares = {c: summary.get(c, {}).get("prefill_share") for c in categories}
+        if not all(isinstance(s, (int, float)) for s in shares.values()):
+            print(f"  {path.name}: no per-category prefill share, skipping")
+            continue
+        categories.sort(key=lambda c: shares[c])
+        methods = [m for m in decode if m != "target"]
+
+        figure, axes = plt.subplots(figsize=(8.4, 4.6))
+        width = 0.8 / max(1, len(methods))
+        # Bars grow from parity rather than from zero. These are ratios against the target, so the
+        # quantity a reader wants the bar length to mean is the gain or loss over not speculating;
+        # anchored at zero, every bar is 90% identical shaft and the differences vanish.
+        for index, method in enumerate(methods):
+            offsets = [i + index * width for i in range(len(categories))]
+            axes.bar(offsets, [decode[method].get(c, 1.0) - 1.0 for c in categories], width,
+                     bottom=1.0, label=method)
+            axes.bar(offsets, [wall[method].get(c, 1.0) - 1.0 for c in categories], width,
+                     bottom=1.0, fill=False, edgecolor="black", linewidth=0.8,
+                     label="same, whole call" if index == 0 else None)
+        axes.axhline(1.0, color="black", linewidth=1, label="target alone")
+        axes.set_xticks([i + 0.4 - width / 2 for i in range(len(categories))])
+        axes.set_xticklabels([f"{c}\nf = {shares[c]:.2f}" for c in categories],
+                             rotation=20, ha="right", fontsize=8)
+        axes.set_ylabel("speedup over the target alone, decoding")
+        axes.legend(fontsize=8, loc="upper right", ncol=2)
+        finish(figure, axes, out, "specbench_full_speedup.png",
+               f"All of Spec-Bench, {blob.get('questions', '?')} questions, "
+               f"gamma={blob.get('gamma', '?')}")
+
+
+def plot_prefill_crossover(results: Path, out: Path) -> None:
+    """Wall-clock speedup against prefill share: the figure the wall-clock model exists to draw.
+
+    Section 3.1's claim is that a drafter needing no prompt pass of its own overtakes a model draft
+    once the prefill share passes a break-even that depends on both decode speedups. That is a
+    statement about a crossing, so it wants a figure with a crossing in it. Six categories measured
+    independently, ordered by a quantity nobody tuned, with the predictions drawn alongside so that
+    the one miss is visible rather than buried.
+    """
+    for _, blob in full_benchmark(results):
+        decode, wall = blob["decode_speedups"], blob["speedups"]
+        summary = blob.get("summary", {})
+        target = summary.get("target", {})
+        categories = [c for c in decode[next(iter(decode))] if c != "all"]
+        shares = {c: target.get(c, {}).get("prefill_share") for c in categories}
+        if not all(isinstance(s, (int, float)) for s in shares.values()):
+            return
+        categories.sort(key=lambda c: shares[c])
+
+        def pooled_k(method: str) -> float | None:
+            """k from the aggregate prefill times, which is the fit 3.1 reports."""
+            base = target.get("all", {}).get("prefill_seconds")
+            mine = summary.get(method, {}).get("all", {}).get("prefill_seconds")
+            if not isinstance(base, (int, float)) or not isinstance(mine, (int, float)) or not base:
+                return None
+            return (mine - base) / base
+
+        figure, axes = plt.subplots(figsize=(7.4, 4.6))
+        colours = {"speculative": "tab:blue", "lookup": "tab:orange",
+                   "speculative+stop": "tab:green"}
+        for method in [m for m in decode if m != "target"]:
+            k = pooled_k(method)
+            xs = [shares[c] for c in categories]
+            axes.plot(xs, [wall[method].get(c, 0.0) for c in categories],
+                      marker="o", color=colours.get(method), label=f"{method}, measured")
+            if k is not None:
+                predicted = [1.0 / ((1 + k) * shares[c] + (1 - shares[c]) / decode[method][c])
+                             for c in categories]
+                axes.plot(xs, predicted, marker="x", linestyle="--", alpha=0.7,
+                          color=colours.get(method),
+                          label=f"{method}, predicted (k = {k:+.3f})")
+
+        axes.axhline(1.0, color="black", linewidth=1)
+        axes.margins(x=0.08)
+        # Headroom above the curves so the category names sit clear of both data and legend.
+        low, high = axes.get_ylim()
+        axes.set_ylim(low, high + 0.30 * (high - low))
+        for category in categories:
+            axes.annotate(category, (shares[category], high + 0.03 * (high - low)),
+                          rotation=90, fontsize=7, ha="center", va="bottom", alpha=0.6)
+        axes.axhline(1.0, color="black", linewidth=1)
+        axes.text(axes.get_xlim()[0] + 0.005, 1.004, "parity with the target alone",
+                  fontsize=7, va="bottom")
+        axes.set_xlabel("the target's prefill share f, measured per category")
+        axes.set_ylabel("wall-clock speedup over the target alone")
+        axes.legend(fontsize=7, loc="lower left", framealpha=0.9)
+        finish(figure, axes, out, "prefill_crossover.png",
+               "Who wins the clock is decided by the prefill share")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=Path, default=Path("results"))
@@ -489,7 +585,8 @@ def main() -> None:
     print(f"reading {args.results}, writing {args.out}")
     for draw in (plot_vk, plot_vk_by_context, plot_speedup_vs_gamma, plot_tokens_per_pass,
                  plot_threads,
-                 plot_token_classes, plot_specbench, plot_predicted_vs_measured):
+                 plot_token_classes, plot_specbench, plot_predicted_vs_measured,
+                 plot_full_benchmark, plot_prefill_crossover):
         try:
             draw(args.results, args.out)
         except Exception as exc:  # one broken result file should not stop the rest

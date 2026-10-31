@@ -512,3 +512,109 @@ def test_an_offset_past_the_end_returns_nothing(tmp_path):
     path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
 
     assert load_questions(path, limit_per_category=3, offset_per_category=6) == []
+
+
+# --------------------------------------------------- the full-benchmark figures
+
+
+def write_merged(directory: Path, shares: dict[str, float] | None = None,
+                 decode: bool = True) -> Path:
+    """A merged whole-benchmark result, shaped like run_specbench_full.py writes one."""
+    shares = {"qa": 0.05, "rag": 0.66, "math": 0.14} if shares is None else shares
+    categories = list(shares)
+    directory.mkdir(parents=True, exist_ok=True)
+    blob = {
+        "gamma": 1,
+        "questions": 480,
+        "speedups": {
+            "speculative": {**{c: 1.05 for c in categories}, "all": 0.98},
+            "lookup": {**{c: 1.01 for c in categories}, "all": 1.02},
+        },
+        "summary": {
+            "target": {
+                **{c: {"prefill_share": s, "prefill_seconds": 100.0} for c, s in shares.items()},
+                "all": {"prefill_share": 0.44, "prefill_seconds": 100.0},
+            },
+            "speculative": {"all": {"prefill_seconds": 120.0}},
+            "lookup": {"all": {"prefill_seconds": 100.5}},
+        },
+    }
+    if decode:
+        blob["decode_speedups"] = {
+            "speculative": {**{c: 1.11 for c in categories}, "all": 1.11},
+            "lookup": {**{c: 1.02 for c in categories}, "all": 1.01},
+        }
+    path = directory / "specbench_full_gamma1.json"
+    path.write_text(json.dumps(blob), encoding="utf-8")
+    return path
+
+
+def test_the_full_benchmark_is_found_in_its_own_directory(tmp_path):
+    """The merged runs are kept apart from the sweep files, so they need their own glob."""
+    plots = load_make_plots()
+    write_merged(tmp_path / "specbench_full")
+
+    found = plots.full_benchmark(tmp_path)
+    assert [path.name for path, _ in found] == ["specbench_full_gamma1.json"]
+    assert found[0][1]["questions"] == 480
+
+
+def test_a_run_without_decode_speedups_is_not_treated_as_a_full_benchmark(tmp_path):
+    """Both figures read the decode column; a file lacking it would plot the wrong quantity."""
+    plots = load_make_plots()
+    write_merged(tmp_path / "specbench_full", decode=False)
+
+    assert plots.full_benchmark(tmp_path) == []
+
+
+def test_the_full_benchmark_figure_orders_categories_by_prefill_share(tmp_path, monkeypatch):
+    """The ordering *is* the claim.
+
+    The result the figure exists to show is that the wall-clock winner is monotonic in prefill
+    share. Drawn alphabetically that is invisible, and a reader has no way to check it; drawn in
+    share order it is the shape of the picture. So the order is worth a test rather than a habit.
+    """
+    plots = load_make_plots()
+    write_merged(tmp_path / "specbench_full")
+    captured = {}
+    monkeypatch.setattr(plots, "finish",
+                        lambda fig, axes, out, name, title: captured.update(
+                            labels=[t.get_text() for t in axes.get_xticklabels()], name=name))
+
+    plots.plot_full_benchmark(tmp_path, tmp_path)
+
+    assert captured["name"] == "specbench_full_speedup.png"
+    assert [label.split()[0] for label in captured["labels"]] == ["qa", "math", "rag"]
+
+
+def test_the_crossover_figure_plots_against_an_ascending_prefill_share(tmp_path, monkeypatch):
+    """A crossing is only readable if the x axis runs in the order the model says decides it."""
+    plots = load_make_plots()
+    write_merged(tmp_path / "specbench_full")
+    captured = {}
+    monkeypatch.setattr(plots, "finish",
+                        lambda fig, axes, out, name, title: captured.update(
+                            xs=[list(line.get_xdata()) for line in axes.get_lines()], name=name))
+
+    plots.plot_prefill_crossover(tmp_path, tmp_path)
+
+    assert captured["name"] == "prefill_crossover.png"
+    drawn = [xs for xs in captured["xs"] if len(xs) == 3]
+    assert drawn, "expected a series over the three categories"
+    for xs in drawn:
+        assert xs == sorted(xs) == [0.05, 0.14, 0.66]
+
+
+def test_neither_figure_raises_when_the_prefill_share_is_missing(tmp_path):
+    """Older merged results predate the per-category share; they are skipped, not fatal."""
+    plots = load_make_plots()
+    path = write_merged(tmp_path / "specbench_full")
+    blob = json.loads(path.read_text(encoding="utf-8"))
+    for category in ("qa", "rag", "math"):
+        del blob["summary"]["target"][category]["prefill_share"]
+    path.write_text(json.dumps(blob), encoding="utf-8")
+
+    plots.plot_full_benchmark(tmp_path, tmp_path)
+    plots.plot_prefill_crossover(tmp_path, tmp_path)
+
+    assert not list(tmp_path.glob("*.png"))
