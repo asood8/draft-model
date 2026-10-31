@@ -339,21 +339,30 @@ $0.236$) for the model draft, against $c = 0.182$ at context 128 rising to $0.24
 draft's prompt pass costs about the same fraction of the target's that its decode step does, so
 \eqref{eq:wall} is evaluable from quantities~\eqref{eq:vk} already needs.
 
-Scored against 29 method-runs --- four $\gamma$ values in two passes, plus the short- and long-prompt
-sets --- \eqref{eq:wall} gives 3.9\% mean absolute error (2.6\% for lookup, 3.1\% for early stopping,
-6.0\% for plain speculation; worst case 12.7\%). At $\gamma=1$ it predicts plain speculation to
-$+0.1\%$ and $-0.1\%$ in the two passes.
+Scored against the whole benchmark --- 480 questions, 2240 turns, six categories at $\gamma=1$ ---
+\eqref{eq:wall} predicts all 18 category-method pairs to \textbf{1.20\% mean absolute error} from a
+single pooled $k$ per method: $+0.203$ for a model draft, $+0.008$ for prompt lookup, and $+0.204$ for
+early stopping. Per method the error is $0.79\%$ for speculation, $0.87\%$ for early stopping and
+$1.94\%$ for lookup, whose worst case --- $6.99\%$ at multi-turn --- is the only entry in the table
+above $2.3\%$. Letting $k$ vary per category, six parameters in place of one, makes the fit
+\emph{worse} at $1.38\%$: $k$ is close enough to constant across workloads that measuring it once is
+better than measuring it six times, which is what distinguishes~\eqref{eq:wall} from a curve fit.
 
 What it buys is the selection of a drafting strategy, which the decode-only model cannot express at
 all: prompt lookup loses on decoding in \emph{every} run measured here, so a decode-only reading ranks
-it last everywhere. Table~\ref{tab:reversal} shows it winning the clock at two of the three operating
-points, and~\eqref{eq:wall} predicting the winner at all of them.
+it last everywhere. On the full benchmark the measured wall-clock winner is \emph{monotonic in prefill
+share} across six categories that were not chosen for this property --- a model draft wins at
+$f=0.053$ and $f=0.136$, prompt lookup at $0.309$, $0.489$, $0.617$ and $0.659$ --- and
+\eqref{eq:wall} calls five of the six. The miss falls immediately above the crossing, at multi-turn,
+where its two predictions differ by $0.9\%$ and the model resolves a near-tie the wrong way;
+Section~\ref{sec:limits} returns to it. Table~\ref{tab:reversal} shows the same reversal on three
+smaller operating points, where it predicts the winner at all of them.
 
-The three points come from two prompt sets, not three: the four-category rows and the short row are
+Those three points come from two prompt sets, not three: the four-category rows and the short row are
 the \emph{same eight prompts} at different generation lengths (152 against 54 tokens a turn), which
 is a legitimate way to vary $f$ --- the prefill share is what the model claims decides this --- but it
-is a weaker test than three distinct prompt distributions would be, and we say so in
-Section~\ref{sec:limits}.
+is a weaker test than distinct prompt distributions would be. The six categories above are that
+stronger test, and they vary $f$ over an order of magnitude rather than by a factor of three.
 
 \begin{table}[t]
 \caption{Wall-clock speedup at $\gamma=1$ for a model draft and for prompt lookup, against the

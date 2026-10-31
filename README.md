@@ -28,7 +28,7 @@ project measures it. See [PLAN.md](PLAN.md) for the full plan and the open quest
 | Speculative decoding | Inside the engine; greedy output matches plain decoding token for token |
 | Prompt lookup drafting | Copies from earlier text, needs no model work, output still exact |
 | Distillation pipeline | Five losses, a trainable draft, the training loop and the data pipeline, tested end to end on a miniature model |
-| 900 tests | Statistical, bit-exactness and end-to-end |
+| 939 tests | Statistical, bit-exactness and end-to-end |
 
 ## Measured so far
 
@@ -58,13 +58,18 @@ and which is not yet explained.
   commit and alternating it against HEAD inside one process put head/base at 0.975. It is spread
   across the weight-streaming stages with no single culprit, and it is open. The k-token kernel
   reaches 95–105% of the AVX-VNNI issue peak for k ≥ 4 at six threads.
-- Speculative decoding is 1.19× on decoding and 1.07× on wall clock, measured on Spec-Bench at γ=1
-  against the same engine without it, at acceptance α = 0.768 and 1.76 tokens a target forward pass,
-  over four categories whose prompt pass is 27% of the clock. On the short- and long-prompt sets
-  measured 2026-10-05, wall clock is 1.07× short and 0.82× long, since the prompt pass is 15–92% of
-  the clock depending on the category and about half of it in aggregate. By category the
-  short-prompt wall figure runs 0.94× (multi-turn) to 1.12× (math), so two of the four are at or
-  below parity even there.
+- **Speculative decoding is 1.11× on decoding and 0.98× on wall clock** over the whole of
+  Spec-Bench — 480 questions, 2240 turns, γ=1, at acceptance α = 0.717 and 1.71 tokens a target
+  forward pass, with the target's prompt pass 44.5% of the clock. **On wall clock it loses.** Prompt
+  lookup, at 1.016×, is the only method measured above parity.
+- That is a worse result than this repository used to report, and the difference is the benchmark
+  subset rather than the engine. An 8-question subset read 1.19× and 1.07×, because it contained no
+  `rag` or `summarization` — the two long-prompt categories, where the prompt pass is 62–66% of the
+  clock and a second prefill cannot be repaid. The figures here supersede it.
+- By category the wall-clock winner is **monotonic in prefill share**, which is what the cost model
+  in section 3.1 of the plan predicts: a model draft wins at qa (f = 0.053) and math (0.136), prompt
+  lookup wins at multi-turn (0.309), translation (0.489), summarization (0.617) and rag (0.659).
+  Speculation ranges 1.14× on math down to 0.90× on rag.
 - The γ sweep, with each γ visited in two different orders so that drift cannot masquerade as the
   effect, gives **1.19×, 1.20×, 1.06× and 0.98× on decoding** and **1.07×, 0.99×, 0.95× and 0.84× on
   wall clock** for γ = 1 to 4. One guess a round is the best choice available, and on wall clock the
@@ -76,6 +81,8 @@ and which is not yet explained.
   parity on wall clock as soon as γ=2 (0.99×), where stopping early holds 1.05× at γ=2 and 1.01× at
   γ=3, and posts the best decoding figure of the sweep at γ=1 (1.20×). The best single wall-clock
   number is still plain speculation at γ=1.
+- The γ sweep below, v(k), c and the per-stage costs are from the 8-question subset and the
+  2026-10-25 session; only the γ=1 figures above have been re-measured on the full benchmark.
 - v(k) and c are functions of context. Between context 128 and 2048, v(2) rises from 1.125 to 1.245
   and c from 0.182 to 0.245. Measured at the context actually being used, the cost model predicts
   the order-cancelled γ sweep to 5.0% mean error at context 512 and 5.6% at 2048. The direction is
@@ -105,7 +112,9 @@ and which is not yet explained.
 
 - **A distilled draft model**, the part the repository is named after. The losses, trainable draft,
   training loop and data pipeline are written and tested, but no draft has been trained. The scope
-  is budgeted in section 11.7 of the plan. Recomputed at the context the engine is evaluated at,
+  is budgeted in section 11.7 of the plan. The full-benchmark result raises its value: speculation
+  now loses on wall clock at α = 0.717, so a distilled draft is what would bring it back above
+  parity rather than merely improving on it. Recomputed at the context the engine is evaluated at,
   distillation is worth about +0.08× on decoding rather than the +0.25× estimated earlier. It could
   now move the best γ on decoding, since the crossover where two guesses beat one fell to 0.818 at
   context 512 and 0.730 at 1024 against a measured α of 0.768 — but not on wall clock, where γ=2
@@ -117,10 +126,9 @@ and which is not yet explained.
   that could not be fully defended would be worse than none. The absolute argument is also stronger:
   sitting within a few percent of what the hardware can do bounds how much faster *any*
   implementation could be, which no pairwise comparison does.
-- **The full Spec-Bench evaluation.** The figures above use 8 prompts over 4 categories, plus 2
-  long-prompt questions, against the benchmark's 480 questions. The cost model's *mechanism* rests on
-  10 independent measurements and is solid, but its drafting-strategy selection is validated at three
-  operating points drawn from two prompt sets, and that needs the full set.
+- **A γ sweep on the full benchmark.** γ=1 is now measured on all 480 questions; γ=2, 3 and 4 are
+  still the 8-question subset, so the claim that γ=1 is the best choice rests on the subset for the
+  comparison even though its own value is now solid.
 - **The write-up**, section 12 of the plan.
 
 ## Layout
@@ -129,7 +137,7 @@ and which is not yet explained.
 engine/      C++: weights file, forward pass, kernels, thread pool, sampling, the round loop
 python/      reference model, quantization twin, export, offline metrics, distillation
 scripts/     fetch, export, benchmark, measure v(k), generate data, train
-tests/       900 tests, all runnable on a CPU
+tests/       939 tests, all runnable on a CPU
 results/     measurements, as JSON
 ```
 

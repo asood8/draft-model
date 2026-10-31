@@ -89,11 +89,77 @@ def test_the_readme_gamma_sweep_matches_the_stored_runs(gammas):
         f"README's wall sweep is stale; results say {quoted_wall}")
 
 
-def test_the_readme_acceptance_rate_matches(gammas):
-    alpha = mean(r["summary"]["speculative"]["all"]["alpha"] for r in gammas[1])
-    assert f"α = {alpha:.3f}" in read("README.md"), (
-        f"README's alpha is stale; results say {alpha:.3f}")
-    assert "0.736" not in read("README.md"), "the retired 0.736 acceptance rate is back"
+def full_benchmark() -> dict:
+    """The 480-question run, which supersedes the 8-question subset for gamma=1."""
+    return json.loads(
+        (RESULTS / "specbench_full" / "specbench_full_gamma1.json").read_text(encoding="utf-8"))
+
+
+def test_the_readme_acceptance_rate_comes_from_the_full_benchmark():
+    """alpha is quoted from all 480 questions, not the subset.
+
+    The subset read 0.768 and the full benchmark 0.717. Both are real measurements; only the second
+    is representative, and quoting the flattering one is the error this file exists to prevent.
+    """
+    readme = read("README.md")
+    alpha = full_benchmark()["summary"]["speculative"]["all"]["alpha"]
+    assert f"α = {alpha:.3f}" in readme, (
+        f"README's alpha is stale; the full benchmark says {alpha:.3f}")
+    for retired in ("0.736", "α = 0.768"):
+        assert retired not in readme, f"the retired acceptance rate {retired} is back"
+
+
+def test_the_readme_headline_speedups_come_from_the_full_benchmark():
+    """The gamma=1 decode and wall figures, and that the wall figure is still reported as a loss.
+
+    Speculation measures 0.98x on wall clock over the whole benchmark. If a future edit quietly
+    restores a figure above parity without the measurement changing, this fails.
+    """
+    readme = read("README.md")
+    blob = full_benchmark()
+    decode = blob["decode_speedups"]["speculative"]["all"]
+    wall = blob["speedups"]["speculative"]["all"]
+    lookup_wall = blob["speedups"]["lookup"]["all"]
+
+    assert f"{decode:.2f}× on decoding" in readme, (
+        f"README's decode headline is stale; results say {decode:.2f}")
+    assert f"{wall:.2f}× on wall clock" in readme, (
+        f"README's wall headline is stale; results say {wall:.2f}")
+    assert wall < 1.0, "the measurement no longer shows a wall-clock loss; update the prose"
+    assert "it loses" in readme.lower(), "the README no longer states the wall-clock loss plainly"
+    assert f"{lookup_wall:.3f}×" in readme, (
+        f"README's lookup figure is stale; results say {lookup_wall:.3f}")
+
+
+def test_the_full_benchmark_really_is_the_full_benchmark():
+    """480 questions over six categories, or the figures above are not what they claim."""
+    blob = full_benchmark()
+    assert blob["questions"] == 480, f"only {blob['questions']} questions merged"
+    assert blob["chunks_merged"] == 16
+    assert blob["turns_merged"] == 2240
+    cats = {c for c in blob["summary"]["target"] if c != "all"}
+    assert cats == {"math", "multi_turn", "qa", "rag", "summarization", "translation"}, cats
+
+
+def test_the_wall_clock_winner_is_monotonic_in_prefill_share():
+    """The paper's practical rule: a model draft wins at low prefill share, a zero-prefill one high.
+
+    Measured over six independent categories. If this ordering breaks, the rule in section 3.1 is
+    wrong and the paper has to say so.
+    """
+    blob = full_benchmark()
+    rows = []
+    for cat in (c for c in blob["summary"]["target"] if c != "all"):
+        rows.append((
+            blob["summary"]["target"][cat]["prefill_share"],
+            blob["speedups"]["speculative"][cat],
+            blob["speedups"]["lookup"][cat],
+        ))
+    rows.sort()
+    winners = ["lookup" if lw > sw else "model" for _, sw, lw in rows]
+    # Sorted by prefill share, every "model" must precede every "lookup".
+    assert winners == sorted(winners, key=lambda w: w == "lookup"), (
+        f"winner is not monotonic in prefill share: {list(zip([r[0] for r in rows], winners))}")
 
 
 def test_the_readme_v2_and_c_range_matches(vk):
